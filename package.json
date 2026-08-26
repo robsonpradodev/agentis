@@ -49,12 +49,12 @@
     "db:migrate": "pnpm --filter @agentis/db migrate"
   },
   "devDependencies": {
-    "@playwright/test": "^1.59.1",
+    "@playwright/test": "^1.62.1",
     "@types/node": "^20.14.10",
     "concurrently": "^9.0.1",
-    "knip": "^6.25.0",
-    "prettier": "^3.3.3",
-    "tsx": "^4.19.0",
+    "knip": "^6.32.2",
+    "prettier": "^3.9.6",
+    "tsx": "^4.23.12",
     "typescript": "^5.5.4"
   },
   "pnpm": {

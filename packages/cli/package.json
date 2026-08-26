@@ -64,13 +64,13 @@
     "prepack": "node scripts/prepack.mjs"
   },
   "dependencies": {
-    "@audio/decode": "3.11.3",
+    "@audio/decode": "3.12.0",
     "@huggingface/transformers": "4.2.0",
     "better-sqlite3": "^12.4.1",
     "node-cron": "^3.0.3",
-    "onnxruntime-node": "1.24.3",
-    "playwright": "^1.60.0",
-    "sharp": "^0.35.0"
+    "onnxruntime-node": "1.27.0",
+    "playwright": "^1.62.1",
+    "sharp": "^0.35.3"
   },
   "devDependencies": {
     "@agentis/api": "workspace:*",
@@ -79,7 +79,7 @@
     "@agentis/sdk": "workspace:*",
     "@agentis/web": "workspace:*",
     "tsup": "^8.5.1",
-    "tsx": "^4.19.0",
+    "tsx": "^4.23.12",
     "typescript": "^5.5.4"
   }
 }
