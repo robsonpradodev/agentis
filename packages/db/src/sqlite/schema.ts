@@ -1193,6 +1193,9 @@ export const conversations = sqliteTable('conversations', {
     .references((): AnySQLiteColumn => channelConnections.id, { onDelete: 'set null' }),
   /** Provider chat/thread id used with channelConnectionId to isolate external conversations. */
   channelChatId: text('channel_chat_id'),
+  /** Canonical provider peer. Multiple legacy PN/LID conversations may share one peer. */
+  channelPeerIdentityId: text('channel_peer_identity_id')
+    .references((): AnySQLiteColumn => channelPeerIdentities.id, { onDelete: 'set null' }),
   /** When set, this thread belongs to an Agentic App — the agent answers in App context (Living Apps Phase 0, migration v95). */
   appId: text('app_id').references((): AnySQLiteColumn => apps.id, { onDelete: 'set null' }),
   /** null | human. Human ownership is conversation-scoped and survives restarts. */
@@ -1272,6 +1275,32 @@ export const conversationMessages = sqliteTable('conversation_messages', {
   deliveryStatus: text('delivery_status').notNull().default('sent'),
   createdAt: text('created_at').notNull().default(isoNow() as unknown as string),
 });
+
+/** Durable, sanitized operator-facing activity for workflow runs. */
+export const runActivityEvents = sqliteTable('run_activity_events', {
+  id: text('id').primaryKey(),
+  workspaceId: text('workspace_id').notNull().references(() => workspaces.id, { onDelete: 'cascade' }),
+  runId: text('run_id').notNull().references(() => workflowRuns.id, { onDelete: 'cascade' }),
+  nodeId: text('node_id'),
+  agentId: text('agent_id'),
+  activityId: text('activity_id').notNull(),
+  event: text('event').notNull(),
+  kind: text('kind'),
+  phase: text('phase'),
+  status: text('status'),
+  title: text('title'),
+  detail: text('detail'),
+  transport: text('transport'),
+  attempt: integer('attempt'),
+  startedAt: text('started_at'),
+  completedAt: text('completed_at'),
+  durationMs: integer('duration_ms'),
+  payload: text('payload_json', { mode: 'json' }).notNull().default(sql`'{}'`),
+  ...baseTimestamps(),
+}, (table) => ({
+  owner: uniqueIndex('uq_run_activity_owner').on(table.runId, table.activityId),
+  timeline: index('idx_run_activity_timeline').on(table.workspaceId, table.runId, table.createdAt),
+}));
 
 // Durable, operator-private agent consultations. Unlike room messages these
 // records are never projected into a customer transcript; they correlate the
@@ -1383,6 +1412,75 @@ export const conversationTurnEvents = sqliteTable(
   (table) => ({
     turnSequence: uniqueIndex('uq_conversation_turn_events_sequence').on(table.turnId, table.seq),
     workspaceTurn: index('idx_conversation_turn_events_turn').on(table.workspaceId, table.turnId, table.seq),
+  }),
+);
+
+/** Content-addressed, compressed row snapshots used by chat-turn Undo/Redo. */
+export const conversationTurnChangePayloads = sqliteTable(
+  'conversation_turn_change_payloads',
+  {
+    id: text('id').primaryKey(),
+    workspaceId: text('workspace_id').notNull().references(() => workspaces.id, { onDelete: 'cascade' }),
+    hash: text('hash').notNull(),
+    encoding: text('encoding').notNull().default('gzip-json'),
+    payload: text('payload').notNull(),
+    byteLength: integer('byte_length').notNull(),
+    createdAt: text('created_at').notNull().default(isoNow() as unknown as string),
+  },
+  (table) => ({
+    workspaceHash: uniqueIndex('uq_conversation_turn_change_payloads_hash').on(table.workspaceId, table.hash),
+  }),
+);
+
+/** One durable, reversible local change set per operator chat turn. */
+export const conversationTurnChangeSets = sqliteTable(
+  'conversation_turn_change_sets',
+  {
+    id: text('id').primaryKey(),
+    workspaceId: text('workspace_id').notNull().references(() => workspaces.id, { onDelete: 'cascade' }),
+    conversationId: text('conversation_id').notNull().references(() => conversations.id, { onDelete: 'cascade' }),
+    turnId: text('turn_id').notNull().references(() => conversationTurns.id, { onDelete: 'cascade' }),
+    state: text('state').notNull().default('recording'),
+    version: integer('version').notNull().default(1),
+    reversibleCount: integer('reversible_count').notNull().default(0),
+    sensitiveCount: integer('sensitive_count').notNull().default(0),
+    externalEffectCount: integer('external_effect_count').notNull().default(0),
+    affectedResources: text('affected_resources', { mode: 'json' }).notNull().default(sql`'[]'`),
+    lastError: text('last_error'),
+    ...baseTimestamps(),
+  },
+  (table) => ({
+    turn: uniqueIndex('uq_conversation_turn_change_sets_turn').on(table.turnId),
+    conversation: index('idx_conversation_turn_change_sets_conversation').on(table.workspaceId, table.conversationId, table.updatedAt),
+  }),
+);
+
+/** Ordered row-level mutations captured around successful or partially-successful tool calls. */
+export const conversationTurnChanges = sqliteTable(
+  'conversation_turn_changes',
+  {
+    id: text('id').primaryKey(),
+    workspaceId: text('workspace_id').notNull().references(() => workspaces.id, { onDelete: 'cascade' }),
+    changeSetId: text('change_set_id').notNull().references(() => conversationTurnChangeSets.id, { onDelete: 'cascade' }),
+    turnId: text('turn_id').notNull().references(() => conversationTurns.id, { onDelete: 'cascade' }),
+    toolCallId: text('tool_call_id').notNull(),
+    toolId: text('tool_id').notNull(),
+    commitOrdinal: integer('commit_ordinal').notNull(),
+    resourceKind: text('resource_kind').notNull(),
+    resourceId: text('resource_id').notNull(),
+    resourceLabel: text('resource_label').notNull(),
+    operation: text('operation').notNull(),
+    rowKey: text('row_key', { mode: 'json' }),
+    beforePayloadId: text('before_payload_id').references(() => conversationTurnChangePayloads.id, { onDelete: 'set null' }),
+    afterPayloadId: text('after_payload_id').references(() => conversationTurnChangePayloads.id, { onDelete: 'set null' }),
+    sensitive: integer('sensitive', { mode: 'boolean' }).notNull().default(false),
+    reversible: integer('reversible', { mode: 'boolean' }).notNull().default(true),
+    externalEffect: integer('external_effect', { mode: 'boolean' }).notNull().default(false),
+    createdAt: text('created_at').notNull().default(isoNow() as unknown as string),
+  },
+  (table) => ({
+    ordered: uniqueIndex('uq_conversation_turn_changes_order').on(table.changeSetId, table.commitOrdinal),
+    byTurn: index('idx_conversation_turn_changes_turn').on(table.workspaceId, table.turnId, table.commitOrdinal),
   }),
 );
 
@@ -1687,7 +1785,7 @@ export const channelTurnQueue = sqliteTable('channel_turn_queue', {
 
 /**
  * Cross-surface peer identity (OMNICHANNEL §5.2). One row per
- * (workspace, channelKind, handle). `userId` + `peerKey` are opt-in: linking a
+ * (workspace, connection, channelKind, handle). `userId` + `peerKey` are opt-in: linking a
  * handle to a workspace user assigns a stable `peerKey` so the same human is
  * recognized across WhatsApp / Telegram / Slack.
  */
@@ -1697,18 +1795,108 @@ export const channelPeerIdentities = sqliteTable('channel_peer_identities', {
     .notNull()
     .references(() => workspaces.id, { onDelete: 'cascade' }),
   channelKind: text('channel_kind').notNull(),
+  /** Identity is connection-scoped: the same handle on two accounts is not automatically the same principal. */
+  connectionId: text('connection_id').references(() => channelConnections.id, { onDelete: 'cascade' }),
   /** Channel-side stable address for the sender (DM chat id / Slack user id). */
   handle: text('handle').notNull(),
   displayName: text('display_name'),
   userId: text('user_id').references(() => users.id, { onDelete: 'set null' }),
   /** Stable cross-channel identity key once linked (e.g. `user:<id>`). */
   peerKey: text('peer_key'),
+  /** Durable Subject grounding this principal's long-term relationship state. */
+  groundingEntityId: text('grounding_entity_id').references((): AnySQLiteColumn => durableEntities.id, { onDelete: 'set null' }),
+  /** external | owner | delegate. Never inferred from defaultChatId. */
+  authorityRole: text('authority_role').notNull().default('external'),
+  authorityMethod: text('authority_method'),
+  verifiedAt: text('verified_at'),
+  grantExpiresAt: text('grant_expires_at'),
   /** Operator-blocked sender: inbound turns from this handle are silently ignored. */
   blocked: integer('blocked', { mode: 'boolean' }).notNull().default(false),
   messageCount: integer('message_count').notNull().default(0),
   firstSeenAt: text('first_seen_at').notNull().default(isoNow() as unknown as string),
   lastSeenAt: text('last_seen_at').notNull().default(isoNow() as unknown as string),
-});
+}, (table) => ({
+  uniquePrincipal: uniqueIndex('uq_channel_peer_principal').on(table.workspaceId, table.connectionId, table.channelKind, table.handle),
+  byPeer: index('idx_channel_peer_key').on(table.workspaceId, table.peerKey),
+  byAuthority: index('idx_channel_peer_authority').on(table.workspaceId, table.connectionId, table.authorityRole),
+}));
+
+/** Provider-specific addresses that resolve to one canonical channel peer. */
+export const channelPeerAliases = sqliteTable('channel_peer_aliases', {
+  id: text('id').primaryKey(),
+  workspaceId: text('workspace_id').notNull().references(() => workspaces.id, { onDelete: 'cascade' }),
+  connectionId: text('connection_id').notNull().references(() => channelConnections.id, { onDelete: 'cascade' }),
+  channelKind: text('channel_kind').notNull(),
+  peerIdentityId: text('peer_identity_id').notNull().references(() => channelPeerIdentities.id, { onDelete: 'cascade' }),
+  alias: text('alias').notNull(),
+  /** primary | pn | lid | phone | username | provider */
+  aliasKind: text('alias_kind').notNull().default('provider'),
+  source: text('source').notNull().default('observed'),
+  verified: integer('verified', { mode: 'boolean' }).notNull().default(false),
+  displayName: text('display_name'),
+  lastSeenAt: text('last_seen_at').notNull().default(isoNow() as unknown as string),
+  ...baseTimestamps(),
+}, (table) => ({
+  uniqueAlias: uniqueIndex('uq_channel_peer_alias').on(table.workspaceId, table.connectionId, table.channelKind, table.alias),
+  byPeer: index('idx_channel_peer_alias_peer').on(table.workspaceId, table.peerIdentityId),
+}));
+
+/** Durable, resumable outbound action. It is the at-most-once delivery ledger. */
+export const channelActionIntents = sqliteTable('channel_action_intents', {
+  id: text('id').primaryKey(),
+  workspaceId: text('workspace_id').notNull().references(() => workspaces.id, { onDelete: 'cascade' }),
+  appId: text('app_id').references((): AnySQLiteColumn => apps.id, { onDelete: 'set null' }),
+  agentId: text('agent_id').references(() => agents.id, { onDelete: 'set null' }),
+  requesterIdentityId: text('requester_identity_id').references(() => channelPeerIdentities.id, { onDelete: 'set null' }),
+  connectionId: text('connection_id').notNull().references(() => channelConnections.id, { onDelete: 'cascade' }),
+  peerIdentityId: text('peer_identity_id').notNull().references(() => channelPeerIdentities.id, { onDelete: 'cascade' }),
+  conversationId: text('conversation_id').references(() => conversations.id, { onDelete: 'set null' }),
+  subjectId: text('subject_id').references((): AnySQLiteColumn => durableEntities.id, { onDelete: 'set null' }),
+  goalRef: text('goal_ref'),
+  goal: text('goal').notNull(),
+  body: text('body').notNull().default(''),
+  messagesJson: text('messages_json', { mode: 'json' }).notNull().default(sql`'[]'`),
+  authorizationBasis: text('authorization_basis').notNull(),
+  riskCategory: text('risk_category').notNull().default('ordinary'),
+  /** planned | awaiting_approval | authorized | executing | delivered | failed | cancelled | superseded */
+  status: text('status').notNull().default('planned'),
+  approvalId: text('approval_id').references(() => approvalRequests.id, { onDelete: 'set null' }),
+  idempotencyKey: text('idempotency_key').notNull(),
+  attempts: integer('attempts').notNull().default(0),
+  scheduledFor: text('scheduled_for'),
+  providerReceiptJson: text('provider_receipt_json', { mode: 'json' }),
+  lastError: text('last_error'),
+  authorizedAt: text('authorized_at'),
+  executedAt: text('executed_at'),
+  deliveredAt: text('delivered_at'),
+  cancelledAt: text('cancelled_at'),
+  ...baseTimestamps(),
+}, (table) => ({
+  uniqueDelivery: uniqueIndex('uq_channel_action_idempotency').on(table.workspaceId, table.idempotencyKey),
+  due: index('idx_channel_action_due').on(table.status, table.scheduledFor),
+  peerTimeline: index('idx_channel_action_peer').on(table.workspaceId, table.peerIdentityId, table.createdAt),
+  requesterPending: index('idx_channel_action_requester').on(table.workspaceId, table.requesterIdentityId, table.status, table.createdAt),
+}));
+
+/** Restart-durable utterance assembly. Provider bubbles become one semantic turn before cognition. */
+export const channelUtteranceBatches = sqliteTable('channel_utterance_batches', {
+  id: text('id').primaryKey(),
+  workspaceId: text('workspace_id').notNull().references(() => workspaces.id, { onDelete: 'cascade' }),
+  conversationId: text('conversation_id').notNull().references(() => conversations.id, { onDelete: 'cascade' }),
+  connectionId: text('connection_id').notNull().references(() => channelConnections.id, { onDelete: 'cascade' }),
+  chatId: text('chat_id').notNull(),
+  status: text('status').notNull().default('collecting'),
+  payloadJson: text('payload_json', { mode: 'json' }).notNull().default(sql`'{}'`),
+  messageIdsJson: text('message_ids_json', { mode: 'json' }).notNull().default(sql`'[]'`),
+  attachmentIdsJson: text('attachment_ids_json', { mode: 'json' }).notNull().default(sql`'[]'`),
+  softDeadlineAt: text('soft_deadline_at').notNull(),
+  hardDeadlineAt: text('hard_deadline_at').notNull(),
+  settledAt: text('settled_at'),
+  ...baseTimestamps(),
+}, (table) => ({
+  openPerChat: index('idx_channel_utterance_open').on(table.workspaceId, table.connectionId, table.chatId, table.status),
+  due: index('idx_channel_utterance_due').on(table.status, table.softDeadlineAt),
+}));
 
 /**
  * Per-workspace orchestrator model-role overrides (OMNICHANNEL §4.4). One row
@@ -3406,6 +3594,8 @@ export const appContacts = sqliteTable(
     handle: text('handle'),
     /** Cross-channel peer identity (ChannelIdentityService) — same person across channels. */
     peerId: text('peer_id'),
+    /** Canonical relationship actor; this table remains a query/UI projection. */
+    subjectId: text('subject_id').references((): AnySQLiteColumn => durableEntities.id, { onDelete: 'set null' }),
     displayName: text('display_name'),
     /** Pipeline stage (new | qualifying | …) — App-defined. */
     stage: text('stage'),

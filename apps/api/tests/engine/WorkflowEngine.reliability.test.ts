@@ -37,7 +37,10 @@ import { createTestContext, type TestContext } from '../_helpers/createTestConte
 class FailingAgentAdapter implements AgentAdapter {
   readonly adapterType: AdapterType = 'claude_code';
   readonly #handlers = new Set<(event: NormalizedAgentEvent) => void>();
-  constructor(private readonly agentId: string) {}
+  constructor(
+    private readonly agentId: string,
+    private readonly failure = 'claude_code exited 1',
+  ) {}
   async connect(): Promise<void> {}
   async disconnect(): Promise<void> {}
   async healthCheck() { return { isHealthy: true, checkedAt: new Date().toISOString() }; }
@@ -46,7 +49,7 @@ class FailingAgentAdapter implements AgentAdapter {
   async dispatchTask(task: NormalizedTask): Promise<void> {
     queueMicrotask(() => {
       for (const handler of this.#handlers) {
-        handler({ eventType: 'task.failed', agentId: this.agentId, taskId: task.taskId, runId: task.runId, workflowId: task.workflowId, error: 'claude_code exited 1', timestamp: new Date().toISOString() });
+        handler({ eventType: 'task.failed', agentId: this.agentId, taskId: task.taskId, runId: task.runId, workflowId: task.workflowId, error: this.failure, timestamp: new Date().toISOString() });
       }
     });
   }
@@ -150,6 +153,55 @@ describe('WorkflowEngine reliability', () => {
     expect(state.status).toBe('FAILED');
     // The honest harness error survives — not a misleading declared-output message.
     expect(state.nodeStates['write']?.error ?? '').toMatch(/exited 1|no usable output|no working/i);
+  });
+
+  it('parks a timed-out agent task without asking a text-only fallback to fabricate its result', async () => {
+    const agentId = randomUUID();
+    ctx.db.insert(schema.agents).values({ id: agentId, workspaceId: ctx.workspace.id, ambientId: ctx.ambient.id, userId: ctx.user.id, name: 'Worker', adapterType: 'claude_code', capabilityTags: [], config: {}, role: 'worker', status: 'online' }).run();
+    const adapters = new AdapterManager(ctx.logger);
+    adapters.register(agentId, new FailingAgentAdapter(
+      agentId,
+      'Hermes produced no observable output for 30m 0s and appears stuck; the runtime was stopped',
+    ));
+    let fallbackCalls = 0;
+    const runtime = mockRuntime({ complete: { sent_count: 1, status: 'sent' } });
+    const originalComplete = runtime.completeStructured.bind(runtime);
+    runtime.completeStructured = async (...args: Parameters<EvaluationRuntime['completeStructured']>) => {
+      fallbackCalls += 1;
+      return originalComplete(...args);
+    };
+    const engine = buildEngine(adapters, runtime);
+    const graph: WorkflowGraph = {
+      version: 1, viewport: { x: 0, y: 0, zoom: 1 },
+      nodes: [triggerNode, agentNode(agentId, ['sent_count', 'status'])],
+      edges: [{ id: 'e1', source: 'trigger', target: 'write' }],
+    };
+    const workflowId = randomUUID();
+    const runId = randomUUID();
+    const initialState = buildInitialRunState({ runId, workflowId, graph, inputs: {} });
+    ctx.db.insert(schema.workflows).values({ id: workflowId, workspaceId: ctx.workspace.id, ambientId: ctx.ambient.id, userId: ctx.user.id, title: 'timeout safety', graph, settings: {} }).run();
+    ctx.db.insert(schema.workflowRuns).values({ id: runId, workspaceId: ctx.workspace.id, ambientId: ctx.ambient.id, workflowId, userId: ctx.user.id, status: 'CREATED', runState: initialState }).run();
+    const paused = new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('timeout waiting for pause')), 15_000);
+      const unsubscribe = ctx.bus.subscribe((message) => {
+        if (message.room === `run:${runId}` && message.envelope.event === REALTIME_EVENTS.RUN_PAUSED) {
+          clearTimeout(timer);
+          unsubscribe();
+          resolve();
+        }
+      });
+    });
+
+    await engine.startRun({ workspaceId: ctx.workspace.id, ambientId: ctx.ambient.id, workflowId, userId: ctx.user.id, triggerId: null, inputs: {}, initialState, graph });
+    await paused;
+    const run = ctx.db.select().from(schema.workflowRuns).where(eq(schema.workflowRuns.id, runId)).get()!;
+    const state = run.runState as { nodeStates: Record<string, { status?: string; blockedReason?: string; outputData?: unknown }> };
+
+    expect(run.status).toBe('WAITING');
+    expect(state.nodeStates.write?.status).toBe('WAITING');
+    expect(state.nodeStates.write?.blockedReason).toMatch(/transient external|timeout/i);
+    expect(state.nodeStates.write?.outputData).toBeUndefined();
+    expect(fallbackCalls).toBe(0);
   });
 
   it('evaluator degrades to a pass when no evaluation runtime is available (run still completes)', async () => {

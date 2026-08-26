@@ -251,6 +251,23 @@ describe('PATCH /v1/workflows/:id', () => {
     });
     expect(res.status).toBe(200);
   });
+
+  it('does not mislabel an unchanged active revision as a candidate', async () => {
+    const graph = trivialGraph();
+    const id = seedWorkflow(graph);
+    const res = await app().request(`/v1/workflows/${id}`, {
+      method: 'PATCH',
+      headers: ctx.authHeaders,
+      body: JSON.stringify({ graph }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json() as {
+      activeRevision: { id: string };
+      candidateRevision: { id: string } | null;
+    };
+    expect(body.activeRevision.id).toBeTruthy();
+    expect(body.candidateRevision).toBeNull();
+  });
 });
 
 describe('workflow deployment', () => {
@@ -294,14 +311,14 @@ describe('workflow deployment', () => {
       listeners: undefined,
     } as unknown as TriggerRuntime;
 
-    // SWIFT arming gate: an unhardened cron REFUSES to arm without an audited
-    // override — this doubles as the fence for the route's override threading.
+    // An unhardened cron is blocked, but the response must be the lifecycle
+    // response the canvas recognizes so it can request an audited override.
     const blocked = await app(runtime).request(`/v1/workflows/${id}/activate`, {
       method: 'POST',
       headers: ctx.authHeaders,
     });
     expect(blocked.status).not.toBe(200);
-    expect(JSON.stringify(await blocked.json())).toMatch(/WORKFLOW_REVISION_UNPROVEN|Unattended triggers require a proven active revision/);
+    expect(JSON.stringify(await blocked.json())).toMatch(/BLOCKED_LIFECYCLE_NOT_HARDENED/);
 
     const publish = await app(runtime).request(`/v1/workflows/${id}/activate`, {
       method: 'POST',
@@ -814,5 +831,83 @@ describe('POST /v1/workflows/:id/run', () => {
       graph: candidateGraph,
       debugRun: true,
     }));
+  });
+
+  it('one-click latest mode runs the authoritative editor head without a revision id', async () => {
+    const id = seedWorkflow();
+    const revisions = new WorkflowRevisionService(ctx.db);
+    const active = revisions.active(ctx.workspace.id, id).revision;
+
+    const activeResponse = await app().request(`/v1/workflows/${id}/run`, {
+      method: 'POST',
+      headers: ctx.authHeaders,
+      body: JSON.stringify({ mode: 'latest' }),
+    });
+    expect(activeResponse.status).toBe(202);
+    expect(engine.startRun.mock.calls[0]?.[0]).toEqual(expect.objectContaining({
+      workflowRevisionId: active.id,
+      debugRun: false,
+    }));
+
+    const candidateGraph = trivialGraph();
+    candidateGraph.nodes[0] = { ...candidateGraph.nodes[0]!, title: 'AI working version' };
+    const candidate = revisions.createCandidate({
+      workspaceId: ctx.workspace.id,
+      workflowId: id,
+      graph: candidateGraph,
+      baseRevisionId: active.id,
+      source: 'agent_build',
+      actor: { type: 'agent', id: 'builder' },
+      reason: 'AI edited the workflow',
+    }).revision;
+
+    const candidateResponse = await app().request(`/v1/workflows/${id}/run`, {
+      method: 'POST',
+      headers: ctx.authHeaders,
+      // Even a stale client id cannot override the authoritative editor head.
+      body: JSON.stringify({ mode: 'latest', revisionId: active.id }),
+    });
+    expect(candidateResponse.status).toBe(202);
+    expect(engine.startRun.mock.calls[1]?.[0]).toEqual(expect.objectContaining({
+      workflowRevisionId: candidate.id,
+      graph: candidateGraph,
+      debugRun: true,
+    }));
+  });
+});
+
+describe('workflow versions', () => {
+  it('lists published milestones only and restores them as working changes', async () => {
+    const id = seedWorkflow();
+    const revisions = new WorkflowRevisionService(ctx.db);
+    const active = revisions.active(ctx.workspace.id, id).revision;
+    const changedGraph = trivialGraph();
+    changedGraph.nodes[0] = { ...changedGraph.nodes[0]!, title: 'Working change' };
+    const candidate = revisions.createCandidate({
+      workspaceId: ctx.workspace.id,
+      workflowId: id,
+      graph: changedGraph,
+      baseRevisionId: active.id,
+      source: 'user_edit',
+      actor: { type: 'user', id: ctx.user.id },
+      reason: 'Autosaved editor change',
+    }).revision;
+
+    const list = await app().request(`/v1/workflows/${id}/versions`, { headers: ctx.authHeaders });
+    expect(list.status).toBe(200);
+    const body = await list.json() as { versions: Array<{ id: string; label: string; isCurrent: boolean }> };
+    expect(body.versions).toHaveLength(1);
+    expect(body.versions[0]).toEqual(expect.objectContaining({ id: active.id, label: 'Version 1', isCurrent: true }));
+
+    const rejected = await app().request(`/v1/workflows/${id}/revisions/${candidate.id}/restore`, {
+      method: 'POST', headers: ctx.authHeaders, body: '{}',
+    });
+    expect(rejected.status).toBe(422);
+
+    const restored = await app().request(`/v1/workflows/${id}/revisions/${active.id}/restore`, {
+      method: 'POST', headers: ctx.authHeaders, body: '{}',
+    });
+    expect(restored.status).toBe(200);
+    expect(revisions.candidate(ctx.workspace.id, id)?.graph).toEqual(trivialGraph());
   });
 });

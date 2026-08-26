@@ -339,13 +339,19 @@ export function PackagesPage() {
   async function handleImport() {
     const input = document.createElement('input');
     input.type = 'file';
-    input.accept = '.agentisapp,.agentiswf,.agentisagt,.agentisext,.agentis,.json,application/json';
+    input.accept = '.agentishub,.agentisapp,.agentiswf,.agentisagt,.agentisext,.agentis,.json,application/json';
     input.onchange = async () => {
       const file = input.files?.[0];
       if (!file) return;
       try {
         const text = await file.text();
         const json = JSON.parse(text) as Record<string, unknown>;
+        if (json.format === '.agentishub' || file.name.endsWith('.agentishub')) {
+          await importHubArtifact(json);
+          toast.success('Installed from AgentisHub', file.name);
+          void refresh();
+          return;
+        }
         // A whole-workspace `.agentis` bundle goes through preview+confirm, not a silent import.
         if (isWorkspaceBundle(json)) {
           setImportBundle(json);
@@ -359,6 +365,35 @@ export function PackagesPage() {
       }
     };
     input.click();
+  }
+
+  async function importHubArtifact(envelope: Record<string, unknown>) {
+    type HubImportResponse = {
+      status: 'installed' | 'activation_required' | 'pending' | 'approved' | 'expired' | 'denied';
+      activation?: { deviceCode: string; verificationUriComplete: string; expiresIn?: number; interval?: number };
+    };
+    let response = await api<HubImportResponse>('/v1/hub/import', {
+      method: 'POST',
+      body: JSON.stringify({ envelope, permissionsAcknowledged: true }),
+    });
+    if (response.status === 'installed') return;
+    if (response.status !== 'activation_required' || !response.activation) throw new Error(`Unexpected AgentisHub import state: ${response.status}`);
+    const activation = response.activation;
+    const popup = window.open(activation.verificationUriComplete, '_blank', 'noopener,noreferrer');
+    if (!popup) toast.info('Activation required', `Open ${activation.verificationUriComplete} to approve this workspace.`);
+    else toast.info('Activation required', 'Approve this workspace in the AgentisHub window. Import will continue automatically.');
+    const deadline = Date.now() + Math.min((activation.expiresIn ?? 600) * 1000, 10 * 60_000);
+    const intervalMs = Math.max(2_000, (activation.interval ?? 3) * 1000);
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => window.setTimeout(resolve, intervalMs));
+      response = await api<HubImportResponse>('/v1/hub/import', {
+        method: 'POST',
+        body: JSON.stringify({ envelope, permissionsAcknowledged: true, deviceCode: activation.deviceCode }),
+      });
+      if (response.status === 'installed') return;
+      if (response.status === 'expired' || response.status === 'denied') throw new Error(`AgentisHub activation ${response.status}`);
+    }
+    throw new Error('AgentisHub activation timed out. Start the import again to receive a new code.');
   }
 
   /** Detect the package kind from its envelope shape (or extension) and import via the right route. */

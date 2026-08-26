@@ -41,20 +41,16 @@ export interface WorkflowFailureFingerprintInput {
 }
 
 const POLICY_CODE = /\b(BLOCKED_[A-Z0-9_]+|APPROVAL_[A-Z0-9_]+|POLICY_[A-Z0-9_]+)\b/;
-const SETUP_CODE = /\b(CONFIG_[A-Z0-9_]+|CAPABILITY_[A-Z0-9_]+|CREDENTIAL_[A-Z0-9_]+|AGENT_(?:NOT_FOUND|PAUSED|OFFLINE))\b/;
+const SETUP_CODE = /\b(CONFIG_[A-Z0-9_]+|CAPABILITY_[A-Z0-9_]+|CREDENTIAL_[A-Z0-9_]+|AGENT_(?:NOT_FOUND|PAUSED|OFFLINE|RUNTIME_UNAVAILABLE))\b/;
 const CONTRACT_CODE = /\b(CONTRACT_[A-Z0-9_]+|OUTPUT_[A-Z0-9_]+|INPUT_[A-Z0-9_]+|VALIDATION_[A-Z0-9_]+)\b/;
 const GRAPH_CODE = /\b(WORKFLOW_GRAPH_[A-Z0-9_]+|GRAPH_[A-Z0-9_]+|NODE_[A-Z0-9_]+)\b/;
 
-/**
- * One deterministic policy for every consumer. Callers may add typed metadata,
- * while legacy string errors are normalized here until all producers emit it.
- */
+/** One deterministic policy for every consumer. */
 export function classifyWorkflowFailure(
   error: unknown,
   metadata: Record<string, unknown> = {},
 ): WorkflowFailureClassification {
   const message = failureMessage(error);
-  const normalized = message.toLowerCase();
   const explicitClass = stringValue(metadata.failureClass);
   const explicitCode = stringValue(metadata.code) || codeFromError(error) || canonicalCode(message);
 
@@ -86,6 +82,15 @@ export function classifyWorkflowFailure(
   ) {
     return policyFor('human_policy', explicitCode, 'A deliberate human or policy boundary stopped execution.');
   }
+  if (/\b(?:pinned|assigned)?\s*agent\b.{0,120}\b(?:has )?no (?:connected|executable) runtime\b/i.test(message)
+    || /\bruntime\b.{0,80}\b(?:not connected|offline|disconnected|unavailable)\b/i.test(message)
+    || /\bagent\b.{0,120}\b(?:is )?(?:offline|disconnected|unavailable)\b/i.test(message)) {
+    return policyFor(
+      'configuration_capability',
+      explicitCode === 'UNCLASSIFIED_FAILURE' ? 'AGENT_RUNTIME_UNAVAILABLE' : explicitCode,
+      'The selected agent runtime is disconnected; this is an execution binding problem, not a workflow graph defect.',
+    );
+  }
   if (
     SETUP_CODE.test(message)
     || /\b(missing|unknown|unavailable|not configured|not installed|no executable runtime|no provider|no adapter)\b.{0,80}\b(credential|configuration|config|capability|operation|extension|tool|binary|runtime|agent|working directory|environment variable)\b/i.test(message)
@@ -93,14 +98,10 @@ export function classifyWorkflowFailure(
   ) {
     return policyFor('configuration_capability', explicitCode, 'The environment cannot execute the requested operation as configured.');
   }
-  if (
-    /\b(rate.?limit|429|quota|credits?|billing|out of memory|oom|econnreset|econnrefused|enotfound|etimedout|socket hang|network error|fetch failed|temporar(?:y|ily)|service unavailable|502|503|504|resource exhausted|provider busy)\b/i.test(message)
-  ) {
+  if (/\b(rate.?limit|429|quota|credits?|billing|out of memory|oom|econnreset|econnrefused|enotfound|etimedout|timed out|timeout|appears stuck|went quiet|socket hang|network error|fetch failed|temporar(?:y|ily)|service unavailable|502|503|504|resource exhausted|provider busy)\b/i.test(message)) {
     return policyFor('transient_resource', explicitCode, 'A resource or provider failed transiently; graph surgery cannot restore that resource.');
   }
-  if (
-    /\b(internal invariant|assertion failed|not implemented|unexpected engine|database corrupt|sqlite|cannot read properties|is not a function|platform defect|engine defect)\b/i.test(message)
-  ) {
+  if (/\b(internal invariant|assertion failed|not implemented|unexpected engine|database corrupt|sqlite|cannot read properties|is not a function|platform defect|engine defect)\b/i.test(message)) {
     return policyFor('platform', explicitCode, 'The failure originated in Agentis/runtime infrastructure.');
   }
   if (
@@ -149,11 +150,7 @@ export function isStructuralRepairEligible(error: unknown, metadata?: Record<str
   return classifyWorkflowFailure(error, metadata).graphRepairEligible;
 }
 
-function policyFor(
-  category: WorkflowFailureClass,
-  canonicalCodeValue: string,
-  reason: string,
-): WorkflowFailureClassification {
+function policyFor(category: WorkflowFailureClass, canonicalCodeValue: string, reason: string): WorkflowFailureClassification {
   switch (category) {
     case 'expected_business':
       return { category, canonicalCode: canonicalCodeValue, graphRepairEligible: false, retryable: false, learnerEligible: false, disposition: 'business_outcome', operatorAction: null, reason };
@@ -198,15 +195,8 @@ function canonicalCode(message: string): string {
 
 function isFailureClass(value: string): value is WorkflowFailureClass {
   return [
-    'expected_business',
-    'human_policy',
-    'configuration_capability',
-    'transient_resource',
-    'data_contract',
-    'graph_design',
-    'platform',
-    'cancellation_propagated',
-    'unknown',
+    'expected_business', 'human_policy', 'configuration_capability', 'transient_resource',
+    'data_contract', 'graph_design', 'platform', 'cancellation_propagated', 'unknown',
   ].includes(value);
 }
 

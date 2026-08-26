@@ -2,9 +2,11 @@ import { randomUUID } from 'node:crypto';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { AgentAdapter, AdapterHealthStatus, ChatDelta, ChatInvocationOptions, ChatMessage, NormalizedAgentEvent, NormalizedTask, ToolDefinition } from '@agentis/core';
 import { schema } from '@agentis/db/sqlite';
+import { eq } from 'drizzle-orm';
 import { AdapterManager } from '../../src/adapters/AdapterManager.js';
 import { buildConversationRoutes } from '../../src/routes/conversations.js';
 import { ConversationStore } from '../../src/services/conversation/conversationStore.js';
+import { TurnChangeJournal } from '../../src/services/conversation/turnChangeJournal.js';
 import { createTestContext, type TestContext } from '../_helpers/createTestContext.js';
 
 class DurableAdapter implements AgentAdapter {
@@ -151,5 +153,71 @@ describe('durable conversation turn routes', () => {
     });
     await expect.poll(() => adapter.aborted).toBe(true);
     await expect.poll(() => adapters.interactiveLease(agentId)).toBeNull();
+  });
+
+  it('exposes Undo/Redo for changes committed before a cancelled turn settled', async () => {
+    const agentId = randomUUID();
+    ctx.db.insert(schema.agents).values({
+      id: agentId,
+      workspaceId: ctx.workspace.id,
+      ambientId: ctx.ambient.id,
+      userId: ctx.user.id,
+      name: 'Reversible Agent',
+      adapterType: 'http',
+    }).run();
+    const adapter = new StopAwareDurableAdapter();
+    const adapters = new AdapterManager(ctx.logger);
+    adapters.register(agentId, adapter);
+    const conversations = new ConversationStore({ db: ctx.db, bus: ctx.bus });
+    const turnChanges = new TurnChangeJournal({ sqlite: ctx.sqlite, logger: ctx.logger, bus: ctx.bus });
+    const app = ctx.buildApp([{ path: '/v1/conversations', app: buildConversationRoutes({
+      db: ctx.db,
+      auth: ctx.auth,
+      conversations,
+      adapters,
+      logger: ctx.logger,
+      bus: ctx.bus,
+      turnChanges,
+    }) }]);
+    const clientTurnId = randomUUID();
+    const create = await app.request(`/v1/conversations/${agentId}/turns`, {
+      method: 'POST',
+      headers: ctx.authHeaders,
+      body: JSON.stringify({ body: 'Change then wait', clientTurnId, permissionMode: 'auto' }),
+    });
+    const created = await create.json() as { turn: { id: string } };
+    await expect.poll(() => adapters.interactiveLease(agentId)).not.toBeNull();
+
+    await turnChanges.captureTool({
+      workspaceId: ctx.workspace.id,
+      durableTurnId: created.turn.id,
+      toolCallId: 'tool-call-1',
+      toolId: 'agentis.agents.update',
+      behavior: 'local',
+    }, () => {
+      ctx.db.update(schema.agents).set({ description: 'Agent-authored change' }).where(eq(schema.agents.id, agentId)).run();
+    });
+
+    await app.request(`/v1/conversations/${agentId}/turns/by-client/${clientTurnId}/cancel`, {
+      method: 'POST', headers: ctx.authHeaders,
+    });
+    const changes = await app.request(`/v1/conversations/${agentId}/turns/${created.turn.id}/changes`, { headers: ctx.authHeaders });
+    expect(changes.status).toBe(200);
+    const summary = (await changes.json() as { changeSet: { state: string; version: number; reversibleCount: number } }).changeSet;
+    expect(summary).toMatchObject({ state: 'undoable', reversibleCount: 1 });
+
+    const undo = await app.request(`/v1/conversations/${agentId}/turns/${created.turn.id}/undo`, {
+      method: 'POST', headers: ctx.authHeaders, body: JSON.stringify({ expectedVersion: summary.version }),
+    });
+    expect(undo.status).toBe(200);
+    expect(ctx.db.select({ description: schema.agents.description }).from(schema.agents).where(eq(schema.agents.id, agentId)).get()).toEqual({ description: null });
+    const undone = await undo.json() as { changeSet: { state: string; version: number } };
+    expect(undone.changeSet.state).toBe('undone');
+
+    const redo = await app.request(`/v1/conversations/${agentId}/turns/${created.turn.id}/redo`, {
+      method: 'POST', headers: ctx.authHeaders, body: JSON.stringify({ expectedVersion: undone.changeSet.version }),
+    });
+    expect(redo.status).toBe(200);
+    expect(ctx.db.select({ description: schema.agents.description }).from(schema.agents).where(eq(schema.agents.id, agentId)).get()).toEqual({ description: 'Agent-authored change' });
   });
 });

@@ -787,7 +787,10 @@ describe('CodexAdapter', () => {
     await new Promise((r) => setTimeout(r, 5200)); // past the 5s heartbeat cadence
 
     // Still alive: a heartbeat activity was emitted, and the turn has NOT terminated.
-    expect(deltas.some((d) => d.type === 'activity' && /elapsed/i.test(d.label))).toBe(true);
+    expect(deltas.some((d) => d.type === 'activity'
+      && d.id === 'codex-cli-default'
+      && /codex is working/i.test(d.label)
+      && Boolean(d.startedAt))).toBe(true);
     expect(deltas.some((d) => d.type === 'done')).toBe(false);
 
     // Clean completion afterwards still works.
@@ -812,8 +815,10 @@ describe('CodexAdapter', () => {
     await new Promise((r) => setTimeout(r, 5200)); // past the 5s heartbeat cadence, still silent
 
     const heartbeat = deltas.find((d): d is Extract<ChatDelta, { type: 'activity' }> =>
-      d.type === 'activity' && /no output yet/i.test(d.label));
+      d.type === 'activity' && /waiting for codex provider output/i.test(d.label));
     expect(heartbeat).toBeDefined();
+    expect(heartbeat?.id).toBe('codex-cli-default');
+    expect(heartbeat?.startedAt).toBeDefined();
     expect(deltas.some((d) => d.type === 'activity' && /is working/i.test(d.label))).toBe(false);
     expect(deltas.some((d) => d.type === 'done')).toBe(false);
 

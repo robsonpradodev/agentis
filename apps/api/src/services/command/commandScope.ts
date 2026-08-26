@@ -65,10 +65,10 @@ export function resolveCommandScope(db: AgentisSqliteDb, workspaceId: string, ag
     .where(eq(schema.domains.workspaceId, workspaceId))
     .all();
 
-  // Orchestrator → the whole workspace. Also the implicit case: a workspace with
-  // no domains at all has nothing to scope down to, so its primary agent manages
-  // everything. Empty id lists at workspace scope are read as "no filter".
-  if (isOrchestratorRole(agent.role) || allDomains.length === 0) {
+  // Only an explicit orchestrator role owns the whole workspace. A workspace
+  // without domains does not promote every worker into a control plane; those
+  // agents remain scoped to the Apps/workflows they directly own.
+  if (isOrchestratorRole(agent.role)) {
     return { ...base, kind: 'workspace' };
   }
 

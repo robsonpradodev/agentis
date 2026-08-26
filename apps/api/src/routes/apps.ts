@@ -34,6 +34,10 @@ import {
   type AppRecord,
   type AppWorkflowBinding,
   type AppWorkflowSummary,
+  relationshipAutonomyPolicySchema,
+  autonomyModeSchema,
+  autonomyActionCategorySchema,
+  autonomyDecisionSchema,
 } from '@agentis/core';
 import { and, asc, desc, eq, inArray, or, sql } from 'drizzle-orm';
 import { schema } from '@agentis/db/sqlite';
@@ -184,6 +188,10 @@ const contactPatchSchema = z.object({
   displayName: z.string().trim().max(255).nullable().optional(),
   nextTouchAt: z.string().datetime().nullable().optional(),
   data: z.record(z.unknown()).optional(),
+});
+const contactAutonomySchema = z.object({
+  mode: autonomyModeSchema.optional(),
+  actions: z.record(autonomyActionCategorySchema, autonomyDecisionSchema).optional(),
 });
 const presenceHeartbeatSchema = z.object({
   conversationId: z.string().trim().min(1).max(255).nullable().optional(),
@@ -1390,7 +1398,20 @@ export function buildAppRoutes(deps: AppRoutesDeps) {
     const appId = c.req.param('id');
     store.get(ws.workspaceId, appId);
     if (!deps.contacts) return c.json({ data: [] });
-    return c.json({ data: deps.contacts.list(ws.workspaceId, appId) });
+    const appRecord = store.get(ws.workspaceId, appId);
+    const autonomy = appRecord.policy.autonomy;
+    const data = deps.contacts.list(ws.workspaceId, appId).map((contact) => {
+      const subject = contact.subjectId
+        ? deps.db.select({ state: schema.durableEntities.stateJson }).from(schema.durableEntities)
+            .where(and(eq(schema.durableEntities.workspaceId, ws.workspaceId), eq(schema.durableEntities.id, contact.subjectId))).get()
+        : null;
+      return {
+        ...contact,
+        relationship: subject?.state ?? null,
+        autonomy: contact.subjectId ? autonomy?.subjectOverrides?.[contact.subjectId] ?? null : null,
+      };
+    });
+    return c.json({ data });
   });
 
   app.patch('/:id/contacts/:contactId', async (c) => {
@@ -1412,6 +1433,29 @@ export function buildAppRoutes(deps: AppRoutesDeps) {
         .catch(() => {});
     }
     return c.json({ data: updated });
+  });
+
+  /** Per-case autonomy override: widen or narrow one relationship without changing the App default. */
+  app.patch('/:id/contacts/:contactId/autonomy', async (c) => {
+    const ws = getWorkspace(c);
+    const appId = c.req.param('id');
+    const appRecord = store.get(ws.workspaceId, appId);
+    if (!deps.contacts) throw new AgentisError('INTERNAL_ERROR', 'contacts service not available');
+    const contact = deps.contacts.get(ws.workspaceId, c.req.param('contactId'));
+    if (!contact || contact.appId !== appId || !contact.subjectId) {
+      throw new AgentisError('RESOURCE_NOT_FOUND', 'grounded relationship contact not found');
+    }
+    const patch = contactAutonomySchema.parse(await c.req.json().catch(() => ({})));
+    const current = relationshipAutonomyPolicySchema.parse(appRecord.policy.autonomy ?? {});
+    const next = relationshipAutonomyPolicySchema.parse({
+      ...current,
+      subjectOverrides: {
+        ...current.subjectOverrides,
+        [contact.subjectId]: { ...(current.subjectOverrides[contact.subjectId] ?? {}), ...patch },
+      },
+    });
+    const updated = store.update(ws.workspaceId, appId, { policy: { autonomy: next } });
+    return c.json({ data: { subjectId: contact.subjectId, autonomy: updated.policy.autonomy?.subjectOverrides[contact.subjectId] } });
   });
 
   // Phase M2 — explicitly record a terminal relationship outcome (won|lost|abandoned).

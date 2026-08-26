@@ -304,8 +304,15 @@ export class AdapterManager {
 
   async cancelTask(agentId: string, taskId: string): Promise<void> {
     const reg = this.#adapters.get(agentId);
-    if (!reg) return;
-    await reg.adapter.cancelTask(taskId);
+    try {
+      if (reg) await reg.adapter.cancelTask(taskId);
+    } finally {
+      // Cancellation is terminal from the scheduler's perspective. Some CLI
+      // runtimes intentionally suppress their post-abort completed/failed event
+      // so it cannot race the owning run's CANCELLED state; reclaim the global
+      // process slot here instead of leaking it until the safety timer fires.
+      this.#taskReleases.get(taskId)?.();
+    }
   }
 
   async healthCheck(agentId: string) {

@@ -25,6 +25,7 @@ import type {
   TriggerConfig,
   TriggerListenerHandle,
 } from '@agentis/core';
+import { randomUUID } from 'node:crypto';
 import type { Logger } from '../logger.js';
 import {
   AcpClient,
@@ -38,8 +39,9 @@ import {
   DEFAULT_CHAT_TURN_TIMEOUT_MS,
 } from './cliChatRuntime.js';
 import { probeCliRuntime } from './cliRuntimeProbe.js';
-import { runtimeProgressActivity } from './runtimeProgress.js';
+import { runtimeAttemptFromSessionKey, runtimeProgressActivity } from './runtimeProgress.js';
 import { nativeRuntimeCapabilities } from './runtimeCapabilityDeclarations.js';
+import { buildMarkerToolPrompt, extractMarkerToolCalls } from './markerToolProtocol.js';
 
 const DEFAULT_OPENCLAW_STARTUP_TIMEOUT_MS = 60_000;
 const MAX_OPENCLAW_STARTUP_TIMEOUT_MS = 180_000;
@@ -114,10 +116,10 @@ export class OpenClawAdapter implements AgentAdapter {
   capabilities(): AdapterCapabilities {
     return {
       interactiveChat: true,
-      // OpenClaw owns its remote tool loop. Agentis shows tool activity from ACP
-      // but does not execute those tools locally.
-      toolCalling: false,
-      toolForwarding: 'session_event',
+      // OpenClaw retains its remote native tools, while Agentis platform calls use
+      // the marker protocol when the caller owns the workflow tool loop.
+      toolCalling: true,
+      toolForwarding: 'marker_protocol',
       execution: {
         longRunning: true,
         pausable: true,
@@ -141,7 +143,7 @@ export class OpenClawAdapter implements AgentAdapter {
         'memory.inject',
       ]),
       limitations: [
-        'OpenClaw runs tools inside the gateway agent. Agentis streams its ACP activity instead of re-running those tools locally.',
+        'OpenClaw native tools run inside the gateway and stream through ACP; Agentis platform tools are caller-managed through marker calls.',
       ],
     };
   }
@@ -305,13 +307,18 @@ export class OpenClawAdapter implements AgentAdapter {
 
   async *chat(
     messages: ChatMessage[],
-    _tools: ToolDefinition[],
+    tools: ToolDefinition[],
     options?: ChatInvocationOptions,
   ): AsyncIterable<ChatDelta> {
     const sessionKey = this.#chatSessionKey(options?.sessionKey);
+    const callerManagedTools = options?.toolMode === 'caller_loop' && tools.length > 0;
+    const prompt = callerManagedTools
+      ? [buildMarkerToolPrompt(tools, { compact: true }), '', formatChatPrompt(messages)].join('\n')
+      : formatChatPrompt(messages);
     yield* this.#runAcpTurn({
       sessionKey,
-      prompt: formatChatPrompt(messages),
+      prompt,
+      callerManagedTools,
       signal: options?.signal,
       timeoutMs: options?.timeoutMs,
     });
@@ -322,6 +329,7 @@ export class OpenClawAdapter implements AgentAdapter {
     prompt: string;
     signal?: AbortSignal;
     timeoutMs?: number;
+    callerManagedTools?: boolean;
   }): AsyncIterable<ChatDelta> {
     const queue = createChatQueue();
     const idleTimeoutMs = clampChatTimeout(args.timeoutMs ?? (this.opts.timeoutSec ? this.opts.timeoutSec * 1000 : DEFAULT_CHAT_TURN_TIMEOUT_MS));
@@ -336,12 +344,14 @@ export class OpenClawAdapter implements AgentAdapter {
       agentId: this.opts.agentId,
       thoughtText: '',
       toolLabels: new Map(),
+      attempt: runtimeAttemptFromSessionKey(args.sessionKey),
     };
     let settled = false;
     let client: AcpClient | undefined;
     let sessionId = '';
     let hardTimer: NodeJS.Timeout | undefined;
     let abortHandler: (() => void) | undefined;
+    let bufferedAssistantText = '';
 
     const finish = (deltas: ChatDelta[]) => {
       if (settled) return;
@@ -367,6 +377,8 @@ export class OpenClawAdapter implements AgentAdapter {
           detail: 'Connecting through openclaw acp.',
           phase: 'runtime',
           status: 'running',
+          transport: 'openclaw_acp',
+          attempt: turnState.attempt,
           startedAt: new Date().toISOString(),
           agentId: this.opts.agentId,
         });
@@ -388,6 +400,8 @@ export class OpenClawAdapter implements AgentAdapter {
           label: 'OpenClaw ready',
           phase: 'runtime',
           status: 'success',
+          transport: 'openclaw_acp',
+          attempt: turnState.attempt,
           completedAt: new Date().toISOString(),
           agentId: this.opts.agentId,
         });
@@ -404,9 +418,22 @@ export class OpenClawAdapter implements AgentAdapter {
           { sessionId, prompt: [{ type: 'text', text: args.prompt }] },
           (update) => {
             const delta = openClawUpdateToDelta(update, turnState);
-            if (delta && !settled) queue.push(delta);
+            if (!delta || settled) return;
+            if (args.callerManagedTools && delta.type === 'text') {
+              bufferedAssistantText += delta.delta;
+            } else {
+              queue.push(delta);
+            }
           },
         );
+        if (args.callerManagedTools) {
+          const callerDeltas = openClawCallerManagedDeltas(bufferedAssistantText);
+          for (const delta of callerDeltas) queue.push(delta);
+          if (callerDeltas.some((delta) => delta.type === 'tool_call')) {
+            finish([{ type: 'done', finishReason: 'tool_calls' }]);
+            return;
+          }
+        }
         const finishReason: Extract<ChatDelta, { type: 'done' }>['finishReason'] =
           result.stopReason === 'max_tokens' || result.stopReason === 'max_turn_requests' ? 'max_turns' : 'stop';
         finish([{ type: 'done', finishReason }]);
@@ -511,11 +538,28 @@ export class OpenClawAdapter implements AgentAdapter {
   }
 }
 
+/** Convert the buffered ACP assistant response into the same safe marker-call
+ * boundary used by the other caller-managed runtimes. Exported so this critical
+ * capability path can be tested without starting a real OpenClaw gateway. */
+export function openClawCallerManagedDeltas(text: string): ChatDelta[] {
+  const { cleaned, calls } = extractMarkerToolCalls(text);
+  return [
+    ...(cleaned.trim() ? [{ type: 'text' as const, delta: cleaned.trim() }] : []),
+    ...calls.map((call) => ({
+      type: 'tool_call' as const,
+      id: randomUUID(),
+      name: call.name,
+      args: call.args,
+    })),
+  ];
+}
+
 interface OpenClawAcpTurnState {
   sessionKey: string;
   agentId: string;
   thoughtText: string;
   toolLabels: Map<string, string>;
+  attempt?: number;
 }
 
 function openClawUpdateToDelta(update: AcpSessionUpdate, state: OpenClawAcpTurnState): ChatDelta | null {
@@ -530,6 +574,8 @@ function openClawUpdateToDelta(update: AcpSessionUpdate, state: OpenClawAcpTurnS
         text: state.thoughtText,
         reasoning: true,
         agentId: state.agentId,
+        transport: 'openclaw_acp',
+        attempt: state.attempt,
       });
     }
     case 'agent_message_chunk': {
@@ -542,21 +588,26 @@ function openClawUpdateToDelta(update: AcpSessionUpdate, state: OpenClawAcpTurnS
       const toolCallId = u.toolCallId ?? `tool-${Math.random().toString(36).slice(2)}`;
       const label = u.title?.trim() || prettyToolName(u.kind) || 'a tool';
       state.toolLabels.set(toolCallId, label);
-      return openClawToolActivity(toolCallId, label, u.status ?? 'running');
+      return openClawToolActivity(toolCallId, label, u.status ?? 'running', state.attempt);
     }
     case 'tool_call_update': {
       const u = update as { toolCallId?: string; title?: string; status?: string };
       const toolCallId = u.toolCallId ?? `tool-${Math.random().toString(36).slice(2)}`;
       const label = u.title?.trim() || state.toolLabels.get(toolCallId) || 'a tool';
       state.toolLabels.set(toolCallId, label);
-      return openClawToolActivity(toolCallId, label, u.status ?? 'running');
+      return openClawToolActivity(toolCallId, label, u.status ?? 'running', state.attempt);
     }
     default:
       return null;
   }
 }
 
-function openClawToolActivity(toolCallId: string, label: string, rawStatus: string): Extract<ChatDelta, { type: 'activity' }> {
+function openClawToolActivity(
+  toolCallId: string,
+  label: string,
+  rawStatus: string,
+  attempt?: number,
+): Extract<ChatDelta, { type: 'activity' }> {
   const status = rawStatus.toLowerCase();
   const failed = /fail|error|cancel/.test(status);
   const completed = failed || /complete|success|done|finished/.test(status);
@@ -565,6 +616,8 @@ function openClawToolActivity(toolCallId: string, label: string, rawStatus: stri
     id: `openclaw-${toolCallId}`,
     phase: 'tool',
     status: failed ? 'error' : completed ? 'success' : 'running',
+    transport: 'openclaw_acp',
+    ...(attempt !== undefined ? { attempt } : {}),
     label: failed ? `Failed ${label}` : completed ? `Used ${label}` : `Using ${label}`,
     ...(completed
       ? { completedAt: new Date().toISOString() }

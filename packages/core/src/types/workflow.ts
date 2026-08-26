@@ -1579,6 +1579,8 @@ export interface WaitingInputBuffer {
 export interface WorkflowNodeState {
   nodeId: string;
   status: WorkflowNodeStatus;
+  /** Monotonic execution attempt within this run; survives pause/restart. */
+  attempt?: number;
   startedAt?: string;
   completedAt?: string;
   inputData?: Record<string, unknown>;

@@ -160,7 +160,10 @@ export function stripProcessNoise(text: string): string {
  * capability and lets the agent be whatever the operator configured; it does not
  * lie about, or fight, the runtime's native environment.
  */
-export function buildMarkerToolPrompt(tools: ToolDefinition[], opts?: { compact?: boolean }): string {
+export function buildMarkerToolPrompt(
+  tools: ToolDefinition[],
+  opts?: { compact?: boolean; nativeTools?: boolean },
+): string {
   // Compact rendering: one line per tool (name + param keys + description), no
   // pretty-printed JSON schema or examples. Used where the whole prompt must stay
   // small — e.g. Hermes, whose CLI takes the prompt as an inline `-q` argument
@@ -182,7 +185,9 @@ export function buildMarkerToolPrompt(tools: ToolDefinition[], opts?: { compact?
     '',
     'AGENTIS PLATFORM TOOLS:',
     '- To act on the Agentis platform — its workflows, data, agents, channels, and memory — use the AGENTIS_TOOL_CALL protocol below. That is the only way to reach platform state.',
-    '- These platform tools are IN ADDITION to whatever native tools your runtime already gives you; they do not replace them. Use whichever fits the request.',
+    opts?.nativeTools === false
+      ? '- This invocation is intentionally model-only: Agentis owns ALL tool execution. Use the marker protocol for every action; do not attempt terminal, filesystem, skill, browser, or other runtime-native calls.'
+      : '- These platform tools are IN ADDITION to whatever native tools your runtime already gives you; they do not replace them. Use whichever fits the request.',
     '- When the request calls for a platform action, decide from the conversation and the tool list and call the tool immediately.',
     '',
     'TOOL CALL PROTOCOL (this CLI runtime has no native function calling):',

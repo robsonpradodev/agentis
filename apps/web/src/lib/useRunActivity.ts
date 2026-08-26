@@ -44,12 +44,17 @@ export function useRunActivity(
         const historical = (res.activity ?? [])
           .map((env) => describeRealtimeActivity(env, { nodeTitle: nodeTitleRef.current }))
           .filter((a): a is RealtimeActivity => Boolean(a) && a!.runId === runId)
-          .map((a, i) => ({ ...a, id: `bf:${a.id}:${i}` }))
           .reverse(); // newest-first
         if (historical.length === 0) return;
         setFeed((current) => {
-          const seen = new Set(current.map((c) => c.id));
-          return [...current, ...historical.filter((h) => !seen.has(h.id))].slice(0, cap);
+          const merged = [...current];
+          for (const activity of historical) {
+            const key = runActivityKey(activity);
+            if (merged.some((item) => runActivityKey(item) === key)) continue;
+            seqRef.current += 1;
+            merged.push({ ...activity, id: `bf:${activity.id}:${seqRef.current}` });
+          }
+          return merged.slice(0, cap);
         });
       })
       .catch(() => {  });
@@ -62,10 +67,21 @@ export function useRunActivity(
     const activity = describeRealtimeActivity(env, { nodeTitle: nodeTitleRef.current });
     if (!activity || activity.runId !== runId) return;
     seqRef.current += 1;
-    setFeed((current) => [{ ...activity, id: `${activity.id}:${seqRef.current}` }, ...current].slice(0, cap));
+    const key = runActivityKey(activity);
+    setFeed((current) => [
+      { ...activity, id: `${activity.id}:${seqRef.current}` },
+      ...current.filter((item) => runActivityKey(item) !== key),
+    ].slice(0, cap));
   });
 
   return feed;
+}
+
+function runActivityKey(activity: RealtimeActivity): string {
+  if (/^Waiting for .+ to respond — .+ no output yet$/i.test(activity.detail.trim())) {
+    return `${activity.runId ?? 'run'}:${activity.nodeId ?? 'node'}:${activity.agentId ?? activity.agentName ?? 'agent'}:provider-wait`;
+  }
+  return activity.id;
 }
 
 /** The single most-recent meaningful activity item for a run (for compact rows). */

@@ -35,6 +35,8 @@ function deps(): ToolHandlerDeps {
       listKnowledgeBases: () => [{ id: 'default_kb', name: 'Default KB' }],
       addDocument: async (args: any) => ({ id: 'doc_123', name: args.name, chunks: 1 }),
       archiveDocument: (wsId: any, kbId: any, docId: any) => ({ id: docId, archived: true }),
+      deleteDocument: (wsId: any, kbId: any, docId: any) => ({ id: docId, deleted: true }),
+      deleteKnowledgeBase: (wsId: any, kbId: any) => ({ id: kbId, deleted: true }),
     } as unknown as ToolHandlerDeps['knowledgeBases'],
   };
 }
@@ -135,5 +137,28 @@ describe('agentis memory and knowledge native tools', () => {
 
     expect(archiveResult.ok).toBe(true);
     expect(archiveResult.output).toEqual({ id: writeOutput.id, archived: true });
+  });
+
+  it('permanently deletes knowledge documents in a batch and whole knowledge bases', async () => {
+    const registry = new AgentisToolRegistry({ logger: ctx.logger });
+    registerRunTools(registry, deps());
+
+    const deleteDocuments = await registry.execute({
+      toolId: 'agentis.knowledge.delete',
+      arguments: { knowledgeBaseId: 'default_kb', documentIds: ['doc_1', 'doc_2', 'doc_1'] },
+    }, toolContext());
+    expect(deleteDocuments.ok).toBe(true);
+    expect(deleteDocuments.output).toEqual({
+      knowledgeBaseId: 'default_kb',
+      deleted: [{ id: 'doc_1', deleted: true }, { id: 'doc_2', deleted: true }],
+      count: 2,
+    });
+
+    const deleteBase = await registry.execute({
+      toolId: 'agentis.knowledge_base.delete',
+      arguments: { knowledgeBaseId: 'default_kb' },
+    }, toolContext());
+    expect(deleteBase.ok).toBe(true);
+    expect(deleteBase.output).toEqual({ id: 'default_kb', deleted: true });
   });
 });

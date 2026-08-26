@@ -5,6 +5,7 @@ import type {
   ConversationTurnStatus,
   EffectiveConversationExecutionMode,
   TurnEventV2,
+  TurnChangeSummary,
 } from '@agentis/core';
 
 export interface DurableConversationTurn {
@@ -26,6 +27,7 @@ export interface DurableConversationTurn {
   completedAt?: string | null;
   createdAt: string;
   updatedAt: string;
+  changeSet?: TurnChangeSummary | null;
 }
 
 export interface DurableConversationTurnHistory {

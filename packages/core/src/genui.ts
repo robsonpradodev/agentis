@@ -163,6 +163,7 @@ function pipelineView(ctx: Ctx): BuiltSurface {
       gap: 16,
       style: { theme: 'product', design: 'editorial', density: 'compact' },
       children: [
+        { type: 'Hero', eyebrow: 'Pipeline', title: humanize(ctx.name), subtitle: 'Move work forward with a live stage view.' },
         { type: 'Toolbar', title: humanize(ctx.name), children: [{ type: 'Badge', value: 'Live pipeline', tone: 'success' }] },
         flow,
         kanban,
@@ -191,6 +192,7 @@ function crmView(ctx: Ctx): BuiltSurface {
       gap: 16,
       style: { theme: 'product', design: 'operations' },
       children: [
+        { type: 'Hero', eyebrow: 'Relationships', title: humanize(ctx.name), subtitle: 'Search, review, and update the complete relationship history.' },
         { type: 'Toolbar', title: humanize(ctx.name), children: [{ type: 'Text', value: 'Search, review, and update the complete relationship history.' }] },
         records,
         { type: 'Accordion', sections: [{ title: `Add ${humanize(ctx.name)}`, children: [addForm(ctx)] }] },
@@ -254,7 +256,7 @@ function analyticsView(ctx: Ctx): BuiltSurface {
       gap: 16,
       style: { theme: 'analytics', design: 'agentis' },
       children: [
-        { type: 'Heading', value: humanize(ctx.name) },
+        { type: 'Hero', eyebrow: 'Analytics', title: humanize(ctx.name), subtitle: 'Read the signal, then inspect the records behind each movement.' },
         { type: 'Narrative', title: 'Reading the signal', value: 'Explore the trend, then inspect the records behind each movement.', tone: 'brief' },
         chartCard,
         recordsTabs(ctx),
@@ -289,6 +291,7 @@ function operationsView(ctx: Ctx): BuiltSurface {
       gap: 16,
       style: { theme: 'operations', design: 'agentis' },
       children: [
+        { type: 'Hero', eyebrow: 'Operations', title: humanize(ctx.name), subtitle: 'Keep the work moving with a clear operational view.' },
         { type: 'Toolbar', title: humanize(ctx.name), children: [{ type: 'Badge', value: 'Operational', tone: 'neutral' }] },
         { type: 'OrchestrationPanel' },
         { type: 'Split', ratio: 2, left: main, right: { type: 'Stack', gap: 12, children: [{ type: 'RunMonitor', limit: 5 }, { type: 'AgentFeed', limit: 12 }] } },

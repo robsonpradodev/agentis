@@ -67,6 +67,7 @@ import type { VisionService } from '../services/visionService.js';
 import type { TranscriptionService } from '../services/transcriptionService.js';
 import type { RuntimeProfileService } from '../services/runtime/runtimeProfileService.js';
 import type { ConversationHandoffService } from '../services/conversation/conversationHandoffService.js';
+import type { TurnChangeJournal } from '../services/conversation/turnChangeJournal.js';
 import type { AgentConsultationService } from '../services/agent/agentConsultationService.js';
 import { channelModelRole } from '../services/conversation/channelConversationRole.js';
 import { ConversationAttachmentContextService } from '../services/conversation/conversationAttachmentContext.js';
@@ -118,6 +119,10 @@ const rewriteSchema = sendSchema.omit({ body: true }).extend({
   text: z.string().min(1).max(CONSTANTS.CONVERSATION_MESSAGE_MAX_LENGTH),
 });
 const swarmSteerSchema = z.object({ instruction: z.string().min(1).max(2_000) });
+const turnChangeActionSchema = z.object({
+  expectedVersion: z.number().int().positive(),
+  confirmSensitive: z.boolean().optional().default(false),
+});
 type ConversationRouteDeps = {
   db: AgentisSqliteDb;
   auth: AuthService;
@@ -140,6 +145,7 @@ type ConversationRouteDeps = {
   runtimeProfiles?: RuntimeProfileService;
   handoffs?: ConversationHandoffService;
   consultations?: AgentConsultationService;
+  turnChanges?: TurnChangeJournal;
   memoryCapture?: {
     captureImmediateCorrection?(args: {
       workspaceId: string;
@@ -229,6 +235,7 @@ export function buildConversationRoutes(deps: ConversationRouteDeps) {
       )).all();
       await Promise.allSettled(runs.map((run) => deps.engine!.cancelRun(run.id)));
     },
+    onSettled: (turn) => { deps.turnChanges?.seal(turn.workspaceId, turn.id); },
   });
   deps.consultations?.bindParentTurnResume((turnId) => durableTurns.resumeAfterApproval(turnId));
 
@@ -291,9 +298,12 @@ export function buildConversationRoutes(deps: ConversationRouteDeps) {
     return c.json({
       agent: serializeScopeAgent(orchestrator),
       conversation,
-      messages: deps.conversations
-        .messages(conversation.id, limit, before, beforeId)
-        .map(serializeConversationMessage),
+      messages: serializeConversationMessagesWithChanges(
+        deps,
+        ws.workspaceId,
+        conversation.id,
+        deps.conversations.messages(conversation.id, limit, before, beforeId),
+      ),
     });
   });
 
@@ -420,9 +430,12 @@ export function buildConversationRoutes(deps: ConversationRouteDeps) {
     const beforeId = c.req.query('beforeId') ?? null;
     return c.json({
       conversation,
-      messages: deps.conversations
-        .messages(conversation.id, limit, before, beforeId)
-        .map(serializeConversationMessage),
+      messages: serializeConversationMessagesWithChanges(
+        deps,
+        ws.workspaceId,
+        conversation.id,
+        deps.conversations.messages(conversation.id, limit, before, beforeId),
+      ),
     });
   });
 
@@ -559,7 +572,7 @@ export function buildConversationRoutes(deps: ConversationRouteDeps) {
     });
     const queuePosition = durableTurns.queuePosition(ws.workspaceId, turn.id);
     return c.json({
-      turn: serializeDurableTurn(turn),
+      turn: serializeDurableTurn(turn, deps.turnChanges),
       conversationId: conversation.id,
       message,
       queuePosition,
@@ -574,7 +587,7 @@ export function buildConversationRoutes(deps: ConversationRouteDeps) {
     if (!conversationId) throw new AgentisError('VALIDATION_FAILED', 'conversationId is required');
     const conversation = deps.conversations.getById(ws.workspaceId, conversationId);
     if (conversation.agentId !== agentId) throw new AgentisError('RESOURCE_NOT_FOUND', 'conversation not found for agent');
-    return c.json({ turns: durableTurns.listActive(ws.workspaceId, conversationId).map(serializeDurableTurn) });
+    return c.json({ turns: durableTurns.listActive(ws.workspaceId, conversationId).map((turn) => serializeDurableTurn(turn, deps.turnChanges)) });
   });
 
   app.get('/:agentId/turns', (c) => {
@@ -588,7 +601,7 @@ export function buildConversationRoutes(deps: ConversationRouteDeps) {
     const limit = Number.isFinite(requestedLimit) ? requestedLimit : 50;
     return c.json({
       history: durableTurns.history(ws.workspaceId, conversationId, limit).map(({ turn, events }) => ({
-        turn: serializeDurableTurn(turn),
+        turn: serializeDurableTurn(turn, deps.turnChanges),
         events,
       })),
     });
@@ -598,7 +611,56 @@ export function buildConversationRoutes(deps: ConversationRouteDeps) {
     const ws = getWorkspace(c);
     const turn = durableTurns.require(ws.workspaceId, c.req.param('turnId'));
     if (turn.agentId !== c.req.param('agentId')) throw new AgentisError('RESOURCE_NOT_FOUND', 'conversation turn not found');
-    return c.json({ turn: serializeDurableTurn(turn) });
+    return c.json({ turn: serializeDurableTurn(turn, deps.turnChanges) });
+  });
+
+  app.get('/:agentId/turns/:turnId/changes', (c) => {
+    const ws = getWorkspace(c);
+    const turn = durableTurns.require(ws.workspaceId, c.req.param('turnId'));
+    if (turn.agentId !== c.req.param('agentId')) throw new AgentisError('RESOURCE_NOT_FOUND', 'conversation turn not found');
+    return c.json({ changeSet: deps.turnChanges?.summary(ws.workspaceId, turn.id) ?? null });
+  });
+
+  app.post('/:agentId/turns/:turnId/undo', async (c) => {
+    const ws = getWorkspace(c);
+    const turn = durableTurns.require(ws.workspaceId, c.req.param('turnId'));
+    if (turn.agentId !== c.req.param('agentId')) throw new AgentisError('RESOURCE_NOT_FOUND', 'conversation turn not found');
+    if (!deps.turnChanges) throw new AgentisError('RESOURCE_NOT_FOUND', 'Turn restoration is unavailable.');
+    const body = turnChangeActionSchema.parse(await c.req.json().catch(() => ({})));
+    const result = deps.turnChanges.undo({
+      workspaceId: ws.workspaceId,
+      turnId: turn.id,
+      expectedVersion: body.expectedVersion,
+      confirmSensitive: body.confirmSensitive,
+    });
+    if (result.conflicts?.length) {
+      return c.json({ error: { code: 'TURN_CHANGE_CONFLICT', message: 'Later edits overlap these changes.', details: result } }, 409);
+    }
+    if (result.requiresSensitiveConfirmation) {
+      return c.json({ error: { code: 'TURN_CHANGE_CONFIRMATION_REQUIRED', message: 'Confirm restoration of sensitive local state.', details: result } }, 409);
+    }
+    return c.json(result);
+  });
+
+  app.post('/:agentId/turns/:turnId/redo', async (c) => {
+    const ws = getWorkspace(c);
+    const turn = durableTurns.require(ws.workspaceId, c.req.param('turnId'));
+    if (turn.agentId !== c.req.param('agentId')) throw new AgentisError('RESOURCE_NOT_FOUND', 'conversation turn not found');
+    if (!deps.turnChanges) throw new AgentisError('RESOURCE_NOT_FOUND', 'Turn restoration is unavailable.');
+    const body = turnChangeActionSchema.parse(await c.req.json().catch(() => ({})));
+    const result = deps.turnChanges.redo({
+      workspaceId: ws.workspaceId,
+      turnId: turn.id,
+      expectedVersion: body.expectedVersion,
+      confirmSensitive: body.confirmSensitive,
+    });
+    if (result.conflicts?.length) {
+      return c.json({ error: { code: 'TURN_CHANGE_CONFLICT', message: 'Later edits overlap these changes.', details: result } }, 409);
+    }
+    if (result.requiresSensitiveConfirmation) {
+      return c.json({ error: { code: 'TURN_CHANGE_CONFIRMATION_REQUIRED', message: 'Confirm restoration of sensitive local state.', details: result } }, 409);
+    }
+    return c.json(result);
   });
 
   app.get('/:agentId/turns/:turnId/events', (c) => {
@@ -628,7 +690,7 @@ export function buildConversationRoutes(deps: ConversationRouteDeps) {
     const before = durableTurns.require(ws.workspaceId, c.req.param('turnId'));
     if (before.agentId !== c.req.param('agentId')) throw new AgentisError('RESOURCE_NOT_FOUND', 'conversation turn not found');
     const turn = durableTurns.pause(ws.workspaceId, before.id);
-    return c.json({ turn: serializeDurableTurn(turn) });
+    return c.json({ turn: serializeDurableTurn(turn, deps.turnChanges) });
   });
 
   app.post('/:agentId/turns/:turnId/resume', (c) => {
@@ -636,7 +698,7 @@ export function buildConversationRoutes(deps: ConversationRouteDeps) {
     const before = durableTurns.require(ws.workspaceId, c.req.param('turnId'));
     if (before.agentId !== c.req.param('agentId')) throw new AgentisError('RESOURCE_NOT_FOUND', 'conversation turn not found');
     const turn = durableTurns.resume(ws.workspaceId, before.id);
-    return c.json({ turn: serializeDurableTurn(turn) });
+    return c.json({ turn: serializeDurableTurn(turn, deps.turnChanges) });
   });
 
   app.post('/:agentId/turns/:turnId/cancel', async (c) => {
@@ -644,7 +706,7 @@ export function buildConversationRoutes(deps: ConversationRouteDeps) {
     const before = durableTurns.require(ws.workspaceId, c.req.param('turnId'));
     if (before.agentId !== c.req.param('agentId')) throw new AgentisError('RESOURCE_NOT_FOUND', 'conversation turn not found');
     const turn = await durableTurns.cancel(ws.workspaceId, before.id);
-    return c.json({ turn: serializeDurableTurn(turn) });
+    return c.json({ turn: serializeDurableTurn(turn, deps.turnChanges) });
   });
 
   // Stop may arrive before the POST /turns response gives the browser a durable
@@ -656,7 +718,7 @@ export function buildConversationRoutes(deps: ConversationRouteDeps) {
     const turn = durableTurns.findByClientTurnId(ws.workspaceId, agentId, c.req.param('clientTurnId'));
     if (!turn) return c.json({ turn: null });
     const cancelled = await durableTurns.cancel(ws.workspaceId, turn.id);
-    return c.json({ turn: serializeDurableTurn(cancelled) });
+    return c.json({ turn: serializeDurableTurn(cancelled, deps.turnChanges) });
   });
 
   // Queue-then-auto-continue composer: still-pending messages queued while a
@@ -1368,7 +1430,7 @@ async function buildChatExecutionEnvelope(
   };
 }
 
-function serializeDurableTurn(turn: ConversationTurnRow) {
+function serializeDurableTurn(turn: ConversationTurnRow, turnChanges?: TurnChangeJournal) {
   return {
     id: turn.id,
     conversationId: turn.conversationId,
@@ -1388,7 +1450,46 @@ function serializeDurableTurn(turn: ConversationTurnRow) {
     completedAt: turn.completedAt,
     createdAt: turn.createdAt,
     updatedAt: turn.updatedAt,
+    changeSet: turnChanges?.summary(turn.workspaceId, turn.id) ?? null,
   };
+}
+
+function serializeConversationMessagesWithChanges(
+  deps: ConversationRouteDeps,
+  workspaceId: string,
+  conversationId: string,
+  messages: ReturnType<ConversationStore['messages']>,
+) {
+  const byClientTurn = new Map(
+    deps.db.select().from(schema.conversationTurns).where(and(
+      eq(schema.conversationTurns.workspaceId, workspaceId),
+      eq(schema.conversationTurns.conversationId, conversationId),
+    )).all().map((turn) => [turn.clientTurnId, turn]),
+  );
+  return messages.map((message) => {
+    const serialized = serializeConversationMessage(message);
+    const metadata = serialized.metadata && typeof serialized.metadata === 'object'
+      ? serialized.metadata as Record<string, unknown>
+      : {};
+    const trace = metadata.turn && typeof metadata.turn === 'object'
+      ? metadata.turn as Record<string, unknown>
+      : null;
+    const clientTurnId = typeof metadata.clientTurnId === 'string'
+      ? metadata.clientTurnId
+      : typeof trace?.clientTurnId === 'string'
+        ? trace.clientTurnId
+        : null;
+    const turn = clientTurnId ? byClientTurn.get(clientTurnId) : null;
+    if (!turn) return serialized;
+    return {
+      ...serialized,
+      metadata: {
+        ...metadata,
+        durableTurnId: turn.id,
+        changeSet: deps.turnChanges?.summary(workspaceId, turn.id) ?? null,
+      },
+    };
+  });
 }
 
 function missionTitle(body: string): string {

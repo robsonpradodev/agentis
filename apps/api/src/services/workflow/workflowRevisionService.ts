@@ -381,11 +381,42 @@ export class WorkflowRevisionService {
         }),
       };
     }
+    this.compactObsoleteAutosaves(input.workspaceId, input.workflowId);
     return {
       revision: this.revision(input.workspaceId, input.workflowId, id)!,
       presentationOnly: false,
       promotion: null,
     };
+  }
+
+  /**
+   * Bound invisible editor checkpoints without touching published history or
+   * any revision referenced by execution/repair/experience evidence.
+   */
+  private compactObsoleteAutosaves(workspaceId: string, workflowId: string, retain = 20) {
+    const obsolete = this.revisions(workspaceId, workflowId)
+      .filter((revision) => revision.source === 'user_edit'
+        && revision.status === 'superseded'
+        && !revision.promotedAt)
+      .slice(retain);
+    for (const revision of obsolete) {
+      const hasRun = this.db.select({ id: schema.workflowRuns.id }).from(schema.workflowRuns)
+        .where(eq(schema.workflowRuns.workflowRevisionId, revision.id)).get();
+      const hasExperience = this.db.select({ id: schema.workflowExperiences.id }).from(schema.workflowExperiences)
+        .where(eq(schema.workflowExperiences.revisionId, revision.id)).get();
+      const hasRepair = this.db.select({ id: schema.workflowRepairAttempts.id }).from(schema.workflowRepairAttempts)
+        .where(eq(schema.workflowRepairAttempts.candidateRevisionId, revision.id)).get();
+      if (hasRun || hasExperience || hasRepair) continue;
+      this.db.transaction(() => {
+        this.db.update(schema.workflowGraphRevisions)
+          .set({ parentRevisionId: revision.parentRevisionId })
+          .where(eq(schema.workflowGraphRevisions.parentRevisionId, revision.id))
+          .run();
+        this.db.delete(schema.workflowGraphRevisions)
+          .where(eq(schema.workflowGraphRevisions.id, revision.id))
+          .run();
+      });
+    }
   }
 
   recordProof(input: RecordProofInput) {
@@ -468,16 +499,15 @@ export class WorkflowRevisionService {
   }
 
   /**
-   * Promote a standalone workflow revision. App-owned semantic revisions are
-   * intentionally rejected here: their only production authority is the App
-   * delivery orchestrator, which must bind publication to an accomplished,
-   * clean run of the exact immutable revision.
+   * Promote an independently proven workflow revision. App membership is an
+   * ownership/grouping boundary, not a release train: an unrelated sibling's
+   * channel or trigger health must never block this candidate's publication.
    */
   promote(input: PromoteWorkflowRevisionInput): PromotionResult {
     return this.promoteWithAuthority(input, null);
   }
 
-  /** The sole semantic publication path for App-owned workflow revisions. */
+  /** Stronger App-delivery path when a caller is releasing the whole App. */
   promoteFromAppDelivery(input: PromoteWorkflowRevisionInput & { deliveryRunId: string }): PromotionResult {
     const run = this.db.select({
       status: schema.workflowRuns.status,
@@ -521,29 +551,9 @@ export class WorkflowRevisionService {
 
   private promoteWithAuthority(
     input: PromoteWorkflowRevisionInput,
-    authority: { kind: 'app_delivery'; runId: string } | null,
+    _authority: { kind: 'app_delivery'; runId: string } | null,
   ): PromotionResult {
     const revision = this.requireRevision(input.workspaceId, input.workflowId, input.revisionId);
-    const workflowAtRequest = this.workflow(input.workspaceId, input.workflowId);
-    const activeAtRequest = workflowAtRequest.activeRevisionId
-      ? this.revision(input.workspaceId, input.workflowId, workflowAtRequest.activeRevisionId)
-      : null;
-    const presentationOnly = Boolean(activeAtRequest && activeAtRequest.semanticHash === revision.semanticHash);
-    if (workflowAtRequest.appId && !presentationOnly && authority?.kind !== 'app_delivery') {
-      throw new AgentisError(
-        'WORKFLOW_GRAPH_INVALID',
-        'App-owned workflow revisions can only be published by agentis.app.deliver.',
-        {
-          httpStatus: 409,
-          details: {
-            code: 'APP_DELIVERY_REQUIRED',
-            appId: workflowAtRequest.appId,
-            workflowId: input.workflowId,
-            revisionId: input.revisionId,
-          },
-        },
-      );
-    }
     if (input.operatorApproval) {
       this.recordProof({
         workspaceId: input.workspaceId,

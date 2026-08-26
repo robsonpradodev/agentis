@@ -26,6 +26,7 @@ import {
 } from '@agentis/core';
 import type { Logger } from '../logger.js';
 import { decideToolApproval } from './chat/chatApprovalPolicy.js';
+import type { TurnChangeJournal } from './conversation/turnChangeJournal.js';
 
 export interface AgentisToolHandler<TIn = Record<string, unknown>, TOut = unknown> {
   (args: TIn, ctx: AgentisToolContext): Promise<TOut> | TOut;
@@ -38,6 +39,7 @@ export interface RegisteredTool {
 
 export interface RegistryDeps {
   logger: Logger;
+  turnChanges?: TurnChangeJournal;
   /** Optional clock — overridable in tests. */
   now?: () => Date;
   /** Optional minimal validator. Defaults to a permissive shape check. */
@@ -67,11 +69,13 @@ export class AgentisToolRegistry {
   readonly #logger: Logger;
   readonly #now: () => Date;
   readonly #validate: NonNullable<RegistryDeps['validateArgs']>;
+  readonly #turnChanges?: TurnChangeJournal;
 
   constructor(deps: RegistryDeps) {
     this.#logger = deps.logger;
     this.#now = deps.now ?? (() => new Date());
     this.#validate = deps.validateArgs ?? noopValidate;
+    this.#turnChanges = deps.turnChanges;
   }
 
   /** Register a tool. Throws on duplicate id — registration is one-shot. */
@@ -82,7 +86,10 @@ export class AgentisToolRegistry {
     if (this.#tools.has(definition.id)) {
       throw new AgentisError('VALIDATION_FAILED', `tool '${definition.id}' is already registered`);
     }
-    this.#tools.set(definition.id, { definition, handler: handler as AgentisToolHandler });
+    const normalized = definition.mutating && !definition.mutationBehavior
+      ? { ...definition, mutationBehavior: inferMutationBehavior(definition.id) }
+      : definition;
+    this.#tools.set(definition.id, { definition: normalized, handler: handler as AgentisToolHandler });
   }
 
   /**
@@ -194,7 +201,16 @@ export class AgentisToolRegistry {
     }
 
     try {
-      const output = await tool.handler(req.arguments, ctx);
+      const invoke = () => tool.handler(req.arguments, ctx);
+      const output = tool.definition.mutating && ctx.durableTurnId && this.#turnChanges
+        ? await this.#turnChanges.captureTool({
+            workspaceId: ctx.workspaceId,
+            durableTurnId: ctx.durableTurnId,
+            toolCallId: callId,
+            toolId: req.toolId,
+            behavior: tool.definition.mutationBehavior ?? 'local',
+          }, invoke)
+        : await invoke();
       return {
         id: callId,
         toolId: req.toolId,
@@ -234,6 +250,17 @@ export class AgentisToolRegistry {
   size(): number {
     return this.#tools.size;
   }
+}
+
+/**
+ * Every mutating definition leaves registration with an explicit behavior.
+ * Most Agentis tools only touch owned state; the narrow families below can
+ * also act on providers, browsers, host code, or already-running executions.
+ */
+function inferMutationBehavior(toolId: string): NonNullable<AgentisToolDefinition['mutationBehavior']> {
+  if (/^agentis\.(?:channel\.(?:send|typing|react)|integration\.call|mcp\.call)$/.test(toolId)) return 'external';
+  if (/^agentis\.(?:browser\.|media\.generate|code\.execute|run\.(?:start|cancel|replay|regrade))/.test(toolId)) return 'mixed';
+  return 'local';
 }
 
 /**

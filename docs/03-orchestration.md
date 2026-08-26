@@ -50,6 +50,53 @@ pure-expression handlers, and unit-testable utility converters).
   regression), ASSESS/REFLECT triggers, and budget breakers (iterations / tokens / wall-clock).
   Loop state persists to the durable **blackboard** (queryable at `/v1/runs/:id/blackboard`).
 
+## `agent_task` runtime semantics
+
+Chat-capable workflow agents execute through `ChatSessionExecutor`, the same identity-, instruction-,
+permission-, attachment-, cancellation-, tool-loop-, and output-parsing boundary used by Chat.
+`dispatchTask()` remains a compatibility path only for adapters without the chat/tool-loop contract.
+Every native task session is isolated as
+`agent-task:<runId>:<nodeId>:attempt:<n>`; a retry after a stale runtime failure increments the
+attempt instead of loading an ACP session from a previous run. The final value must still satisfy
+the node's declared `outputKeys`; runtime lifecycle text is never accepted as output.
+
+The rule is runtime-agnostic: exactly one layer owns each Agentis platform tool call. Native
+function-calling adapters forward calls into the shared executor; text-only adapters use the marker
+protocol; Claude Code does not also mount the Agentis MCP server when the caller-managed loop is
+active; OpenClaw keeps its gateway-native tools while bridging Agentis calls through markers; and
+Hermes caller-managed tasks use script-oriented one-shot mode with the valid zero-tool
+`context_engine` toolset. Hermes therefore performs one model request while Agentis owns the visible
+platform tool loop; it cannot enter a hidden native-tool loop or contend with a second ACP process.
+Interactive/direct runtime use keeps its normal native tool behavior.
+The configured `maxTurns` is an enforced workflow boundary. `error`, `max_turns`, `length`, an
+unfinished `tool_calls` boundary, an absent terminal event, or an empty result pauses the node with
+runtime, stage, elapsed time, attempt, session key, and retry guidance; none can be promoted into a
+successful business result merely because the runtime emitted explanatory prose.
+
+For Hermes `agent_task` calls with `chatTransport: auto`, the capability-preserving caller-managed
+path goes directly to Hermes's model-only one-shot CLI. This is the same fast execution shape used by
+interactive CLI chat: no ACP probe, no competing prewarm, no invalid synthetic toolset, and no second
+provider loop. The complete Agentis catalog is described through the marker protocol, marker fragments
+are reconstructed in stdout order, and runtime warnings cannot become business output. Each emitted
+marker is executed by the shared executor before the next model turn.
+
+Explicit `chatTransport: acp` remains authoritative and keeps ACP's public reasoning and native tool
+lifecycle. Its first-meaningful-event watchdog is 20 seconds; handshake, usage, and command-catalog
+messages do not satisfy it. A stalled session is cancelled and invalidated and the 15-minute ACP
+circuit breaker is recorded, but an explicit pin is never silently changed. Only explicitly ACP-owned
+runtimes are prepared early. Non-caller-managed automatic turns may use the existing ACP-to-CLI
+recovery path when the fallback is capability-equivalent.
+
+Operator-visible task cognition is stored in `run_activity_events`. Stable activity IDs update the
+same row for cumulative reasoning and tool status. Runtime, waiting, safe reasoning summary,
+commentary, tool, fallback, retry, and terminal phases retain transport, attempt, and timing metadata.
+Private chain-of-thought, prompts, secrets, raw arguments, and sensitive results are not stored.
+Heartbeat labels and IDs remain stable; elapsed time is computed by the UI from `startedAt`, so a
+quiet runtime updates one durable row rather than adding a new row on every heartbeat.
+`GET /v1/runs/:id/activity?limit=<1..400>&cursor=<ISO timestamp>` returns durable, workspace-scoped
+replay with `nextCursor`; run SSE replays this history before attaching to live events. Activity is
+retained and deleted with its workflow run through the existing cascade policy.
+
 ## Self-healing
 
 `engine/selfHeal/` + `services/workflow/workflowSelfHeal.ts`. Recovery layers, in order:

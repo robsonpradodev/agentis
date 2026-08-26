@@ -17,6 +17,7 @@ let engine: {
   cancelRun: ReturnType<typeof vi.fn>;
   resumeBlockedRun: ReturnType<typeof vi.fn>;
   applyGraphPatch: ReturnType<typeof vi.fn>;
+  getRunActivity: ReturnType<typeof vi.fn>;
 };
 let ledger: LedgerService;
 let scratchpad: ScratchpadService;
@@ -28,6 +29,7 @@ beforeEach(async () => {
     cancelRun: vi.fn().mockResolvedValue(undefined),
     resumeBlockedRun: vi.fn().mockResolvedValue({ resumed: 1 }),
     applyGraphPatch: vi.fn().mockResolvedValue({ newRevision: 2 }),
+    getRunActivity: vi.fn().mockReturnValue([]),
   };
   ledger = new LedgerService(ctx.db, ctx.bus);
   scratchpad = new ScratchpadService(ctx.bus, ctx.logger);
@@ -509,6 +511,32 @@ describe('GET /v1/runs/:id/ledger', () => {
     expect(res.status).toBe(200);
     const body = (await res.json()) as { events: unknown[] };
     expect(Array.isArray(body.events)).toBe(true);
+  });
+});
+
+describe('GET /v1/runs/:id/activity', () => {
+  it('returns bounded durable replay with a cursor', async () => {
+    const { runId } = seedRun();
+    const events = [
+      { activityId: 'runtime-1', event: 'agent.work.step', payload: { activityId: 'runtime-1', transport: 'hermes_acp' }, emittedAt: '2026-05-20T10:00:01.000Z' },
+      { activityId: 'reason-1', event: 'agent.terminal.message', payload: { activityId: 'reason-1', activityKind: 'thinking' }, emittedAt: '2026-05-20T10:00:02.000Z' },
+    ];
+    engine.getRunActivity.mockReturnValue(events);
+    const res = await app().request(`/v1/runs/${runId}/activity?limit=2&cursor=2026-05-20T10%3A00%3A00.000Z`, { headers: ctx.authHeaders });
+
+    expect(res.status).toBe(200);
+    expect(engine.getRunActivity).toHaveBeenCalledWith(runId, { limit: 2, cursor: '2026-05-20T10:00:00.000Z' });
+    expect(await res.json()).toEqual({ activity: events, nextCursor: '2026-05-20T10:00:02.000Z' });
+  });
+
+  it('enforces workspace isolation before reading activity', async () => {
+    const { runId } = seedRun();
+    const otherWorkspace = randomUUID();
+    const res = await app().request(`/v1/runs/${runId}/activity`, {
+      headers: { ...ctx.authHeaders, 'x-agentis-workspace': otherWorkspace },
+    });
+    expect(res.status).toBe(403);
+    expect(engine.getRunActivity).not.toHaveBeenCalled();
   });
 });
 

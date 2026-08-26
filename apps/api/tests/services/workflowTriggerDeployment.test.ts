@@ -89,14 +89,78 @@ describe('WorkflowTriggerDeploymentService', () => {
 
     expect(deployment).toMatchObject({
       triggerType: 'cron',
+      authoredTriggerType: 'cron',
       status: 'active',
       config: { expression: '*/5 * * * *', timezone: 'UTC' },
     });
+    expect(Date.parse(deployment.nextRunAt!)).toBeGreaterThan(Date.now());
     expect(activate).toHaveBeenCalledOnce();
     const workflow = ctx.db.select().from(schema.workflows).where(eq(schema.workflows.id, workflowId)).get()!;
     const trigger = (workflow.graph as WorkflowGraph).nodes[0]!.config as { triggerId?: string; schedule?: string };
     expect(trigger).toMatchObject({ schedule: '*/5 * * * *' });
     expect(trigger.triggerId).toBeUndefined();
+  });
+
+  it('activates the visible candidate trigger instead of the stale published trigger', async () => {
+    const publishedGraph = graphWithTrigger({ kind: 'trigger', triggerType: 'manual' });
+    const workflowId = seedWorkflow(publishedGraph);
+    const candidateGraph = graphWithTrigger({
+      kind: 'trigger',
+      triggerType: 'cron',
+      schedule: '* * * * *',
+      timezone: 'UTC',
+    });
+    const revisions = new WorkflowRevisionService(ctx.db);
+    const active = revisions.active(ctx.workspace.id, workflowId).revision;
+    revisions.createCandidate({
+      workspaceId: ctx.workspace.id,
+      workflowId,
+      graph: candidateGraph,
+      baseRevisionId: active.id,
+      source: 'user_edit',
+      actor: { type: 'user', id: ctx.user.id },
+      reason: 'Changed the visible trigger to a schedule',
+    });
+
+    const deployment = await service.activate({
+      workspaceId: ctx.workspace.id,
+      workflowId,
+      ambientId: ctx.ambient.id,
+      userId: ctx.user.id,
+    });
+
+    expect(deployment).toMatchObject({
+      triggerType: 'cron',
+      authoredTriggerType: 'cron',
+      status: 'active',
+      config: { expression: '* * * * *', timezone: 'UTC' },
+    });
+    expect(activate).toHaveBeenCalledWith(expect.objectContaining({
+      triggerType: 'cron',
+      config: expect.objectContaining({ expression: '* * * * *' }),
+    }));
+  });
+
+  it('preserves an RSS authored type while using the listener runtime', async () => {
+    const workflowId = seedWorkflow(graphWithTrigger({
+      kind: 'trigger',
+      triggerType: 'rss_feed',
+      rssFeed: { feedUrl: 'https://example.com/feed.xml', pollIntervalMs: 60_000 },
+    }));
+
+    const deployment = await service.activate({
+      workspaceId: ctx.workspace.id,
+      workflowId,
+      ambientId: ctx.ambient.id,
+      userId: ctx.user.id,
+    });
+
+    expect(deployment).toMatchObject({
+      triggerType: 'persistent_listener',
+      authoredTriggerType: 'rss_feed',
+      nextRunAt: null,
+      config: { source: { kind: 'rss', feedUrl: 'https://example.com/feed.xml', intervalMs: 60_000 } },
+    });
   });
 
   it('activates an extension-backed persistent listener and exposes health', async () => {

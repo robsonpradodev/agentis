@@ -296,6 +296,9 @@ export type ChatDelta =
       /** Normalized underlying operation; wrapper names remain only as gatewayTool. */
       tool?: string;
       gatewayTool?: string;
+      /** Safe runtime diagnostics for workflow/run activity surfaces. */
+      transport?: string;
+      attempt?: number;
     }
   | { type: 'thinking'; delta: string }
   | { type: 'text'; delta: string }
@@ -500,6 +503,8 @@ export interface AgentisToolDefinition {
   inputSchema: unknown;
   outputSchema?: unknown;
   mutating: boolean;
+  /** How a successful mutation participates in durable chat-turn restoration. */
+  mutationBehavior?: 'local' | 'mixed' | 'external' | 'none';
   /** Graduated Ask-mode policy. Unclassified mutations fail safe as high risk. */
   approval?: AgentisToolApprovalPolicy;
   autoExecute?: boolean;
@@ -556,6 +561,42 @@ export interface AgentisToolContext {
    * spending instead of running to completion in the background.
    */
   signal?: AbortSignal;
+}
+
+export type TurnChangeSetState = 'recording' | 'undoable' | 'undone' | 'failed';
+
+export interface TurnChangeResourceSummary {
+  kind: string;
+  id: string;
+  label: string;
+  sensitive: boolean;
+}
+
+/** Redacted, UI-safe projection of the reversible work owned by one durable turn. */
+export interface TurnChangeSummary {
+  turnId: string;
+  state: TurnChangeSetState;
+  version: number;
+  reversibleCount: number;
+  sensitiveCount: number;
+  externalEffectCount: number;
+  affectedResources: TurnChangeResourceSummary[];
+  updatedAt: string;
+}
+
+export interface TurnChangeConflict {
+  resourceKind: string;
+  resourceId: string;
+  label: string;
+  fields: string[];
+  reason: 'overlapping_change' | 'missing_dependency' | 'constraint';
+}
+
+export interface TurnChangeActionResult {
+  changeSet: TurnChangeSummary;
+  conflicts?: TurnChangeConflict[];
+  requiresSensitiveConfirmation?: boolean;
+  externalEffectsRetained?: boolean;
 }
 
 /** Trusted facts about the channel request that initiated a tool-capable turn. */

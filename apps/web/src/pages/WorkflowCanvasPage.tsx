@@ -54,6 +54,10 @@ import {
   LoaderCircle,
   CheckCircle2,
   Square,
+  Mail,
+  Rss,
+  TriangleAlert,
+  History,
 } from 'lucide-react';
 import clsx from 'clsx';
 import { api, apiErrorMessage, workspace as workspaceStore } from '../lib/api';
@@ -180,6 +184,21 @@ interface WorkflowRevisionListResponse {
   trustState: string;
   revisions: Array<WorkflowRevisionSummary & { proof: WorkflowRevisionProof }>;
 }
+interface WorkflowVersion {
+  id: string;
+  number: number;
+  label: string;
+  isCurrent: boolean;
+  publishedAt: string;
+  actor: { type: string; id?: string | null };
+  source: string;
+  summary: string;
+  changeSummary: Record<string, unknown>;
+}
+interface WorkflowVersionsResponse {
+  currentVersionId: string;
+  versions: WorkflowVersion[];
+}
 interface ExtensionRow {
   id: string;
   slug: string;
@@ -202,9 +221,11 @@ interface WorkflowDeployment {
   triggerId: string;
   workflowId: string;
   triggerType: 'manual' | 'cron' | 'webhook' | 'persistent_listener';
+  authoredTriggerType: 'manual' | 'cron' | 'webhook' | 'persistent_listener' | 'error_trigger' | 'email_imap' | 'rss_feed';
   status: 'active' | 'paused' | 'error';
   updatedAt: string;
   lastFiredAt: string | null;
+  nextRunAt: string | null;
   webhookUrl?: string;
   webhookSecret?: string;
   config: Record<string, unknown>;
@@ -237,7 +258,7 @@ interface SpaceSummary {
 }
 
 type SaveState = 'saved' | 'saving' | 'dirty' | 'error';
-type EnginePage = 'overview' | 'inputs' | 'contracts' | 'chains';
+type EnginePage = 'overview' | 'inputs' | 'contracts' | 'chains' | 'versions';
 
 /** Canvas tabs. UI surfaces moved to the Agentic App (AGENTIC-APPS-10X §4/§6). */
 type WorkflowTab = 'canvas' | 'brain';
@@ -297,6 +318,7 @@ export function WorkflowCanvasPage({ embedded = false, workflowId }: { embedded?
   const [deploymentLoading, setDeploymentLoading] = useState(false);
   const [deploymentBusy, setDeploymentBusy] = useState(false);
   const [deploymentError, setDeploymentError] = useState<string | null>(null);
+  const [recentAutomationRuns, setRecentAutomationRuns] = useState<WorkflowRunSummary[]>([]);
   /** Set when arming was refused because the workflow isn't hardened — drives the
    *  operator's audited-override prompt instead of a dead-end toast. */
   const [hardenPrompt, setHardenPrompt] = useState<{ message: string } | null>(null);
@@ -305,7 +327,6 @@ export function WorkflowCanvasPage({ embedded = false, workflowId }: { embedded?
   const [variablesOpen, setVariablesOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [saveState, setSaveState] = useState<SaveState>('saved');
-  const [revisionOpen, setRevisionOpen] = useState(false);
   const [knowledgeBaseCount, setKnowledgeBaseCount] = useState<number | null>(null);
   const [knowledgeChunkCount, setKnowledgeChunkCount] = useState<number | null>(null);
 
@@ -420,12 +441,14 @@ export function WorkflowCanvasPage({ embedded = false, workflowId }: { embedded?
     void api<{ runs: WorkflowRunSummary[] }>(`/v1/workflows/${id}/runs?limit=10`)
       .then((data) => {
         if (cancelled) return;
+        setRecentAutomationRuns((data.runs ?? []).slice(0, 5));
         const active = (data.runs ?? []).find(isActiveRunSummary);
         setActiveRunId(active?.id ?? null);
         setActiveRunFallbackStatus(active?.status ?? null);
       })
       .catch(() => {
         if (!cancelled) {
+          setRecentAutomationRuns([]);
           setActiveRunId(null);
           setActiveRunFallbackStatus(null);
         }
@@ -475,6 +498,39 @@ export function WorkflowCanvasPage({ embedded = false, workflowId }: { embedded?
     setActiveRunId(null);
     setActiveRunFallbackStatus(null);
     setRunControlOpen(false);
+  });
+
+  // ── Deployment live-sync: when the server emits WORKFLOW_UPDATED with
+  // reason:'deployment' (fired by emitWorkflowDeploymentChanged after any
+  // activate / pause / resume), silently re-fetch the deployment row so the
+  // panel reflects the new state without the operator having to click Refresh.
+  const workflowUpdatedEvents = useMemo(() => [REALTIME_EVENTS.WORKFLOW_UPDATED], []);
+  useRealtime(workflowUpdatedEvents, (env: RealtimeEnvelope) => {
+    const payload = (env.payload ?? {}) as { workflowId?: string; reason?: string };
+    if (!id || payload.workflowId !== id || payload.reason !== 'deployment') return;
+    void api<{ deployment: WorkflowDeployment | null }>(`/v1/workflows/${id}/deployment`)
+      .then((r) => setDeployment(r.deployment))
+      .catch(() => { /* best-effort; stale state is not fatal */ });
+  });
+
+  // ── Run live-tick: when any run starts for this workflow, immediately bump
+  // lastFiredAt on the deployment so "Last fired" updates without a refetch.
+  const runFiredEvents = useMemo(
+    () => [REALTIME_EVENTS.RUN_CREATED, REALTIME_EVENTS.RUN_RUNNING, REALTIME_EVENTS.RUN_SETTLED],
+    [],
+  );
+  useRealtime(runFiredEvents, (env: RealtimeEnvelope) => {
+    const payload = (env.payload ?? {}) as { workflowId?: string };
+    if (!id || payload.workflowId !== id) return;
+    // A manual test run is not a trigger fire. Refresh authoritative deployment
+    // state and scoped history rather than optimistically changing lastFiredAt.
+    void Promise.all([
+      api<{ deployment: WorkflowDeployment | null }>(`/v1/workflows/${id}/deployment`),
+      api<{ runs: WorkflowRunSummary[] }>(`/v1/workflows/${id}/runs?limit=5`),
+    ]).then(([deploymentResult, runsResult]) => {
+      setDeployment(deploymentResult.deployment);
+      setRecentAutomationRuns(runsResult.runs ?? []);
+    }).catch(() => { /* best-effort */ });
   });
 
   // Cmd+K / Ctrl+K opens the command palette. Bound at the page level so it
@@ -1597,22 +1653,28 @@ export function WorkflowCanvasPage({ embedded = false, workflowId }: { embedded?
     }
   }
 
-  async function runWorkflow(inputs: Record<string, unknown>, target: 'active' | 'candidate') {
+  async function runWorkflow(inputs: Record<string, unknown>) {
     if (!wf) return;
     setRunning(true);
     try {
-      const res = await api<{ runId: string }>(`/v1/workflows/${wf.id}/run`, {
+      // Flush the editor before selecting the execution target so Run always
+      // uses the exact workflow the user can currently see.
+      await saveNow();
+      const current = wfRef.current;
+      if (!current) return;
+      const res = await api<{ runId: string }>(`/v1/workflows/${current.id}/run`, {
         method: 'POST',
-        body: JSON.stringify(target === 'candidate'
-          ? { inputs, mode: 'debug', revisionId: wf.candidateRevision?.id }
-          : { inputs, mode: 'active', revisionId: wf.activeRevision?.id }),
+        // The server resolves the authoritative editor head after the save.
+        // Do not send revision ids from React state: promotion/autosave races can
+        // make those ids stale between the click and this request.
+        body: JSON.stringify({ inputs, mode: 'latest' }),
       });
       setActiveRunId(res.runId);
       setActiveRunFallbackStatus('pending');
       setRunDialogOpen(false);
       setRunControlOpen(false);
       setTab('canvas');
-      toast.success(target === 'candidate' ? 'Change verification started' : 'Live execution started');
+      toast.success('Workflow started');
     } catch (e) {
       toast.error('Failed to start run', apiErrorMessage(e));
     } finally {
@@ -1644,10 +1706,12 @@ export function WorkflowCanvasPage({ embedded = false, workflowId }: { embedded?
     setDeploymentLoading(true);
     setDeploymentError(null);
     try {
-      const result = await api<{ deployment: WorkflowDeployment | null }>(
-        `/v1/workflows/${wf.id}/deployment`,
-      );
+      const [result, history] = await Promise.all([
+        api<{ deployment: WorkflowDeployment | null }>(`/v1/workflows/${wf.id}/deployment`),
+        api<{ runs: WorkflowRunSummary[] }>(`/v1/workflows/${wf.id}/runs?limit=5`),
+      ]);
       setDeployment(result.deployment);
+      setRecentAutomationRuns(history.runs ?? []);
     } catch (error) {
       setDeploymentError(apiErrorMessage(error));
     } finally {
@@ -1684,12 +1748,28 @@ export function WorkflowCanvasPage({ embedded = false, workflowId }: { embedded?
       setTitleDraft(refreshed.workflow.title);
       lastSavedFingerprintRef.current = graphFingerprint(refreshed.workflow.graph, refreshed.workflow.title);
       setHardenPrompt(null);
-      toast.success(activationSuccessMessage(result.deployment.triggerType));
+      // Use the deployment's trigger type for the toast, but fall back to the
+      // draft type if the deployment came back as manual (pre-existing save-race).
+      const effectiveToastType = result.deployment.triggerType === 'manual'
+        ? (workflowTriggerConfig(refreshed.workflow)?.triggerType as string | undefined ?? 'manual')
+        : result.deployment.authoredTriggerType ?? result.deployment.triggerType;
+      toast.success(activationSuccessMessage(effectiveToastType));
     } catch (e) {
       const message = apiErrorMessage(e);
-      // Not-hardened is a CHOICE, not a failure: offer the audited override.
-      if (!overrideAck && /BLOCKED_LIFECYCLE_NOT_HARDENED/.test(message)) {
-        setHardenPrompt({ message });
+      const err = e as { code?: string; message?: string; details?: { code?: string } };
+      const isUnprovenOrNotHardened =
+        err?.code === 'AUTH_FORBIDDEN' ||
+        err?.details?.code === 'WORKFLOW_REVISION_UNPROVEN' ||
+        /BLOCKED_LIFECYCLE_NOT_HARDENED|WORKFLOW_REVISION_UNPROVEN/i.test(String(err?.message ?? '')) ||
+        /BLOCKED_LIFECYCLE_NOT_HARDENED/i.test(message);
+
+      // Not-hardened / unproven is a CHOICE, not a failure: offer the audited override.
+      if (!overrideAck && isUnprovenOrNotHardened) {
+        const displayMsg =
+          err?.message && typeof err.message === 'string' && !err.message.includes('AUTH_FORBIDDEN')
+            ? err.message
+            : "This workflow hasn't been proven at its current version yet, so Agentis requires an audited override reason from an administrator to arm an unattended trigger.";
+        setHardenPrompt({ message: displayMsg });
         setDeploymentError(null);
       } else {
         setDeploymentError(message);
@@ -1742,6 +1822,11 @@ export function WorkflowCanvasPage({ embedded = false, workflowId }: { embedded?
     setRunActionBusy('cancel');
     try {
       await api(`/v1/runs/${activeRunId}/cancel`, { method: 'POST' });
+      // The cancel response is authoritative. Do not keep presenting the old
+      // run as live while waiting for a workspace realtime event that may have
+      // raced the HTTP response or arrived before this surface subscribed.
+      setActiveRunId(null);
+      setActiveRunFallbackStatus(null);
       await refreshWorkspaceSnapshot();
       setRunControlOpen(false);
       toast.success('Run cancelled');
@@ -1780,6 +1865,37 @@ export function WorkflowCanvasPage({ embedded = false, workflowId }: { embedded?
     && Boolean(activeRunId)
     && activeRunStatus !== null
     && ['pending', 'running', 'waiting', 'paused'].includes(activeRunStatus);
+  const runIssues = wf.graph.nodes.flatMap((node) => {
+    const readiness = evaluateNodeReadiness(node.config, { integrations, credentialTypes });
+    const issues: Array<{ nodeId: string; nodeTitle: string; message: string }> = [];
+    if (!readiness.ready) {
+      issues.push({ nodeId: node.id, nodeTitle: node.title, message: readiness.message ?? 'Complete this step configuration.' });
+    }
+    const config = node.config as { kind?: string; requires?: unknown; agentId?: unknown };
+    if (config.kind === 'agent_task' || config.kind === 'agent_session') {
+      const requirements = normalizeAgentRequirements(config.requires);
+      if (hasAgentRequirements(requirements) && !connectedAgentMatches(agents, requirements).some((match) => match.satisfied)) {
+        issues.push({ nodeId: node.id, nodeTitle: node.title, message: 'No connected agent provides the capabilities required by this step.' });
+      }
+      if (typeof config.agentId === 'string') {
+        const bound = agents.find((agent) => agent.id === config.agentId);
+        if (!bound) {
+          issues.push({ nodeId: node.id, nodeTitle: node.title, message: 'The assigned agent no longer exists. Choose another agent.' });
+        } else if (!['online', 'busy', 'active', 'running'].includes(String(bound.status ?? '').toLowerCase())) {
+          issues.push({ nodeId: node.id, nodeTitle: node.title, message: `${bound.name} is not connected.` });
+        }
+      }
+    }
+    return issues;
+  });
+  const runVariables = workflowRunVariables(wf.variables ?? [], wf.graph.inputContract);
+  const requestRun = () => {
+    if (runIssues.length === 0 && runVariables.length === 0) {
+      void runWorkflow({});
+      return;
+    }
+    setRunDialogOpen(true);
+  };
 
   return (
     <div className="relative flex h-full flex-col">
@@ -1820,30 +1936,6 @@ export function WorkflowCanvasPage({ embedded = false, workflowId }: { embedded?
         )}
         <div className="relative flex items-center gap-1">
           <SaveIndicator state={saveState} onRetry={() => void saveNow()} />
-          <button
-            type="button"
-            onClick={() => setRevisionOpen((open) => !open)}
-            className={clsx(
-              'inline-flex h-7 items-center gap-1.5 rounded-full border px-2.5 text-[11px] font-semibold tracking-wide transition-colors',
-              wf.candidateRevision
-                ? 'border-warn/30 bg-warn/10 text-warn hover:bg-warn/15'
-                : wf.trustState === 'proven'
-                  ? 'border-success/25 bg-success/10 text-success hover:bg-success/15'
-                  : 'border-line bg-surface-2 text-text-secondary hover:bg-surface-3',
-            )}
-            aria-expanded={revisionOpen}
-            title="Workflow revision and proof"
-          >
-            <GitBranch size={11} />
-            {wf.candidateRevision ? 'Needs verification' : wf.trustState === 'proven' ? 'Live' : 'Needs proof'}
-          </button>
-          {revisionOpen && (
-            <WorkflowRevisionPopover
-              workflow={wf}
-              onClose={() => setRevisionOpen(false)}
-              onChanged={refreshWorkflowRevision}
-            />
-          )}
           <button
             type="button"
             onClick={(e) => {
@@ -1930,8 +2022,7 @@ export function WorkflowCanvasPage({ embedded = false, workflowId }: { embedded?
                   type="button"
                   onClick={(e) => {
                     e.stopPropagation();
-                    if (openFirstIncompleteNode()) return;
-                    setRunDialogOpen(true);
+                    requestRun();
                   }}
                   className="inline-flex h-8 items-center gap-1.5 rounded-btn bg-accent px-3 text-[13px] font-semibold text-canvas transition-colors hover:bg-accent-hover"
                 >
@@ -2016,6 +2107,8 @@ export function WorkflowCanvasPage({ embedded = false, workflowId }: { embedded?
                   loading={deploymentLoading}
                   busy={deploymentBusy}
                   error={deploymentError}
+                  runs={recentAutomationRuns}
+                  workflowId={wf.id}
                   onActivate={() => void handleActivate()}
                   onRefresh={() => void refreshDeployment()}
                   onPause={() => void setDeploymentStatus('paused')}
@@ -2097,6 +2190,8 @@ export function WorkflowCanvasPage({ embedded = false, workflowId }: { embedded?
                         loading={deploymentLoading}
                         busy={deploymentBusy}
                         error={deploymentError}
+                        runs={recentAutomationRuns}
+                        workflowId={wf.id}
                         onActivate={() => void handleActivate()}
                         onRefresh={() => void refreshDeployment()}
                         onPause={() => void setDeploymentStatus('paused')}
@@ -2124,7 +2219,7 @@ export function WorkflowCanvasPage({ embedded = false, workflowId }: { embedded?
               )}
               <button
                 type="button"
-                onClick={() => setRunDialogOpen(true)}
+                onClick={requestRun}
                 disabled={running || (wf.graph.nodes?.length ?? 0) === 0}
                 title={(wf.graph.nodes?.length ?? 0) === 0 ? 'Add a step before running' : headerIsManualRun ? 'Run this workflow' : 'Run once now (a manual test run)'}
                 className="inline-flex items-center gap-1.5 rounded-full bg-accent px-4 py-1.5 text-[12px] font-semibold text-on-accent transition-colors hover:bg-accent/90 disabled:opacity-45"
@@ -2441,6 +2536,7 @@ export function WorkflowCanvasPage({ embedded = false, workflowId }: { embedded?
         workflow={wf}
         spaces={spaces}
         onSaveSettings={handleSaveWorkflow}
+        onWorkflowChanged={refreshWorkflowRevision}
         onContractsChange={({ inputContract, outputContract }) => {
           const nextGraph = { ...wf.graph, inputContract, outputContract };
           setWf({ ...wf, graph: nextGraph });
@@ -2502,10 +2598,16 @@ export function WorkflowCanvasPage({ embedded = false, workflowId }: { embedded?
       <RunInputDialog
         open={runDialogOpen}
         onClose={() => setRunDialogOpen(false)}
-        variables={workflowRunVariables(wf.variables ?? [], wf.graph.inputContract)}
-        activeRevision={wf.activeRevision}
-        candidateRevision={wf.candidateRevision}
-        onRun={(inputs, target) => void runWorkflow(inputs, target)}
+        variables={runVariables}
+        issues={runIssues}
+        onIssueClick={(nodeId) => {
+          const node = wf.graph.nodes.find((candidate) => candidate.id === nodeId);
+          if (!node) return;
+          setSelection({ kind: 'node', nodeId: node.id, nodeType: node.type, data: node.config, title: node.title });
+          setInspectorOpen(true);
+          setRunDialogOpen(false);
+        }}
+        onRun={(inputs) => void runWorkflow(inputs)}
         running={running}
       />
 
@@ -3042,6 +3144,7 @@ function EngineModal({
   workflow,
   spaces,
   onSaveSettings,
+  onWorkflowChanged,
   onContractsChange,
 }: {
   open: boolean;
@@ -3051,6 +3154,7 @@ function EngineModal({
   workflow: WorkflowDetail;
   spaces: SpaceSummary[];
   onSaveSettings: (fields: any) => Promise<void>;
+  onWorkflowChanged: () => Promise<void>;
   onContractsChange: (contracts: {
     inputContract?: WorkflowContractValue;
     outputContract?: WorkflowContractValue;
@@ -3065,6 +3169,7 @@ function EngineModal({
     { id: 'inputs', label: 'Inputs', icon: <Variable size={16} /> },
     { id: 'contracts', label: 'I/O contracts', icon: <FileSignature size={16} /> },
     { id: 'chains', label: 'Event chains', icon: <GitBranch size={16} /> },
+    { id: 'versions', label: 'Versions', icon: <ClockIcon size={16} /> },
   ];
 
   return createPortal(
@@ -3134,6 +3239,9 @@ function EngineModal({
                 />
               )}
               {page === 'chains' && <EventChainsPanel workflowId={workflow.id} />}
+              {page === 'versions' && (
+                <WorkflowVersionsTab workflow={workflow} onWorkflowChanged={onWorkflowChanged} />
+              )}
             </div>
           </div>
         </div>
@@ -3148,6 +3256,78 @@ function EngineStat({ label, value }: { label: string; value: string }) {
     <div className="rounded-xl border border-line bg-surface-2 p-3 flex-1">
       <div className="text-[11px] uppercase tracking-wider text-text-muted">{label}</div>
       <div className="mt-1 truncate text-[16px] font-semibold text-text-primary">{value}</div>
+    </div>
+  );
+}
+
+function WorkflowVersionsTab({
+  workflow,
+  onWorkflowChanged,
+}: {
+  workflow: WorkflowDetail;
+  onWorkflowChanged: () => Promise<void>;
+}) {
+  const toast = useToast();
+  const [versions, setVersions] = useState<WorkflowVersion[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [restoringId, setRestoringId] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const response = await api<WorkflowVersionsResponse>(`/v1/workflows/${workflow.id}/versions`);
+      setVersions(response.versions);
+    } catch (error) {
+      toast.error('Could not load versions', apiErrorMessage(error));
+    } finally {
+      setLoading(false);
+    }
+  }, [toast, workflow.id]);
+
+  useEffect(() => { void load(); }, [load]);
+
+  async function restore(version: WorkflowVersion) {
+    setRestoringId(version.id);
+    try {
+      await api(`/v1/workflows/${workflow.id}/revisions/${version.id}/restore`, {
+        method: 'POST',
+        body: '{}',
+      });
+      await onWorkflowChanged();
+      toast.success(`${version.label} restored`, 'Review the workflow and run it to publish a new version.');
+    } catch (error) {
+      toast.error('Could not restore version', apiErrorMessage(error));
+    } finally {
+      setRestoringId(null);
+    }
+  }
+
+  if (loading) return <p className="text-sm text-text-muted">Loading versions…</p>;
+  return (
+    <div className="max-w-2xl space-y-3">
+      <p className="text-sm leading-6 text-text-secondary">
+        Versions are created when changed workflows run successfully. Restoring a version loads it as working changes for review.
+      </p>
+      {versions.map((version) => (
+        <div key={version.id} className="flex items-center gap-4 rounded-card border border-line bg-surface p-4">
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-2">
+              <span className="text-sm font-semibold text-text-primary">{version.label}</span>
+              {version.isCurrent && <span className="rounded-full bg-success/10 px-2 py-0.5 text-[10px] font-semibold text-success">Current</span>}
+            </div>
+            <p className="mt-1 truncate text-xs text-text-secondary">{version.summary || 'Published workflow'}</p>
+            <p className="mt-1 text-[11px] text-text-muted">
+              {new Date(version.publishedAt).toLocaleString()} · {version.actor.type}
+            </p>
+          </div>
+          {!version.isCurrent && (
+            <Button size="sm" variant="secondary" loading={restoringId === version.id} disabled={Boolean(restoringId)} onClick={() => void restore(version)}>
+              Restore
+            </Button>
+          )}
+        </div>
+      ))}
+      {versions.length === 0 && <p className="rounded-card border border-line p-4 text-sm text-text-muted">No published versions yet.</p>}
     </div>
   );
 }
@@ -3435,6 +3615,8 @@ function DeploymentPanel({
   loading,
   busy,
   error,
+  runs,
+  workflowId,
   onActivate,
   onRefresh,
   onPause,
@@ -3446,6 +3628,8 @@ function DeploymentPanel({
   loading: boolean;
   busy: boolean;
   error: string | null;
+  runs: WorkflowRunSummary[];
+  workflowId: string;
   onActivate: () => void;
   onRefresh: () => void;
   onPause: () => void;
@@ -3454,22 +3638,50 @@ function DeploymentPanel({
 }) {
   const triggerType = String(trigger?.triggerType ?? 'manual');
   const readiness = trigger ? evaluateNodeReadiness(trigger) : { ready: false, message: 'Add a trigger node.' };
-  const meta = deploymentMeta(triggerType);
   const changed = Boolean(deployment && deploymentDiffersFromDraft(deployment, trigger));
+  // When the draft differs from the deployed config, show the draft's trigger type
+  // (what's about to be activated), not the stale deployed type.
+  const displayType = changed ? triggerType : (deployment?.authoredTriggerType ?? deployment?.triggerType ?? triggerType);
+  const meta = deploymentMeta(displayType);
   const intervalMs = deploymentIntervalMs(deployment);
-  // Tick once a second so an interval/cron "Next run" countdown stays live.
+  // Keep a local wall-clock heartbeat while the popover is mounted. This must
+  // not depend on deployment status or last-fired updates: paused/pending
+  // schedules still need their countdown to repaint, and the server timestamp
+  // is only refreshed at lifecycle boundaries.
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
-    if (!deployment || deployment.triggerType === 'manual' || deployment.status !== 'active') return;
-    const id = window.setInterval(() => setNow(Date.now()), 1000);
-    return () => window.clearInterval(id);
-  }, [deployment?.triggerType, deployment?.status, deployment?.lastFiredAt]);
+    let disposed = false;
+    const tick = () => {
+      if (!disposed) setNow(Date.now());
+    };
+    tick();
+    const intervalId = window.setInterval(tick, 250);
+    return () => {
+      disposed = true;
+      window.clearInterval(intervalId);
+    };
+  }, []);
+
+  const deployedAuthoredType = deployment?.authoredTriggerType ?? deployment?.triggerType;
+  const deploymentMatchesType = Boolean(deployment && deployedAuthoredType === triggerType);
+  const isActive = deployment?.status === 'active' && deploymentMatchesType;
+  const isPaused = deployment?.status === 'paused' && deploymentMatchesType;
+  const isError = deployment?.status === 'error' && deploymentMatchesType;
+  const canPauseLiveDeployment = deployment?.status === 'active' && deployment.triggerType !== 'manual';
+  const displayedStatus = deploymentMatchesType ? deployment?.status : null;
+  // Show live metrics for non-manual deployment OR when draft is non-manual (pending activation)
+  const hasMetrics = (deployment && deployment.triggerType !== 'manual') || (changed && triggerType !== 'manual');
+
 
   return (
     <div>
+      {/* Header */}
       <div className="border-b border-line px-3.5 py-3">
         <div className="flex items-start gap-3">
-          <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-accent/25 bg-accent-soft text-accent">
+          <span className={clsx(
+            'flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border text-accent transition-colors',
+            isActive ? 'border-success/30 bg-success/10 text-success' : 'border-accent/25 bg-accent-soft',
+          )}>
             {meta.icon}
           </span>
           <div className="min-w-0 flex-1">
@@ -3478,21 +3690,17 @@ function DeploymentPanel({
               {deployment && (
                 <span className={clsx(
                   'inline-flex items-center gap-1 rounded-pill border px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wider',
-                  deployment.status === 'active'
+                  isActive
                     ? 'border-success/30 bg-success-soft text-success'
-                    : deployment.status === 'error'
+                    : isError
                       ? 'border-danger/30 bg-danger-soft text-danger'
                       : 'border-line bg-surface-2 text-text-muted',
                 )}>
                   <span className={clsx(
                     'h-1.5 w-1.5 rounded-full',
-                    deployment.status === 'active'
-                      ? 'bg-success'
-                      : deployment.status === 'error'
-                        ? 'bg-danger'
-                        : 'bg-text-muted',
+                    isActive ? 'bg-success animate-pulse' : isError ? 'bg-danger' : 'bg-text-muted',
                   )} />
-                  {deployment.status}
+                  {displayedStatus ?? 'not active'}
                 </span>
               )}
             </div>
@@ -3511,7 +3719,7 @@ function DeploymentPanel({
         </div>
       </div>
 
-      <div className="space-y-3 px-3.5 py-3">
+      <div className="space-y-2 px-3 py-2.5">
         {loading && !deployment ? (
           <div className="space-y-2" aria-label="Loading activation">
             <div className="h-3 w-2/3 animate-pulse rounded bg-surface-3" />
@@ -3519,60 +3727,40 @@ function DeploymentPanel({
           </div>
         ) : (
           <>
-            {!readiness.ready && (
-              <div className="rounded-input border border-warn/35 bg-warn/10 px-2.5 py-2 text-[11px] leading-4 text-warn">
-                {readiness.message}
-              </div>
-            )}
-            {changed && (
-              <div className="rounded-input border border-accent/25 bg-accent-soft px-2.5 py-2 text-[11px] leading-4 text-text-secondary">
-                The trigger changed after the last activation. Verify and publish the change to apply it.
-              </div>
-            )}
-            {error && (
-              <div className="rounded-input border border-danger/30 bg-danger-soft px-2.5 py-2 text-[11px] leading-4 text-danger">
-                {error}
+            {/* ── Live metrics: ALWAYS shown at top when deployment exists or draft is non-manual ── */}
+            {hasMetrics && (
+              <div className="grid grid-cols-2 divide-x divide-line overflow-hidden rounded-input border border-line bg-[linear-gradient(135deg,var(--color-surface-2),var(--color-canvas))]">
+                <MiniMetric
+                  label="Last fired"
+                  value={deployment?.lastFiredAt ? relativeSince(deployment.lastFiredAt) : 'Never'}
+                />
+                {displayType === 'cron'
+                  ? <MiniMetric
+                      label={changed && deployment?.triggerType === 'cron' ? 'Live next run' : 'Next run'}
+                      value={deployment?.triggerType !== 'cron'
+                        ? 'Not active'
+                        : deployment.status === 'paused'
+                          ? 'Paused'
+                          : deployment.status === 'error'
+                            ? 'Unavailable'
+                            : nextRunLabel(deployment.nextRunAt, deployment.config.expression, now)}
+                    />
+                  : (intervalMs && isActive)
+                    ? <MiniMetric label="Next run" value={intervalNextRunLabel(deployment!.lastFiredAt, intervalMs, now)} />
+                    : <MiniMetric label="Armed" value={deployment ? relativeSince(deployment.updatedAt) : '—'} />}
               </div>
             )}
 
-            {deployment?.triggerType === 'manual' && (
-              <DeploymentValue
-                label="Manual run"
-                value={deployment.status === 'active' ? 'Ready to run manually' : 'Paused'}
-              />
-            )}
-            {deployment?.triggerType === 'cron' && (
-              <DeploymentValue
-                label="Schedule"
-                value={`${String(deployment.config.expression ?? '')} · ${String(deployment.config.timezone ?? 'UTC')}`}
-              />
-            )}
-            {deployment?.triggerType === 'webhook' && deployment.webhookUrl && (
-              <DeploymentValue
-                label="Webhook URL"
-                value={deployment.webhookUrl}
-                onCopy={() => onCopy(deployment.webhookUrl!, 'Webhook URL')}
-              />
-            )}
-            {deployment?.webhookSecret && (
-              <div className="rounded-input border border-warn/30 bg-warn/10 p-2.5">
-                <div className="text-[9px] font-semibold uppercase tracking-wider text-warn">Secret shown once</div>
-                <div className="mt-1 flex items-center gap-2">
-                  <code className="min-w-0 flex-1 truncate text-[10px] text-text-primary">{deployment.webhookSecret}</code>
-                  <button type="button" onClick={() => onCopy(deployment.webhookSecret!, 'Webhook secret')} className="text-text-muted hover:text-text-primary">
-                    <Copy size={12} />
-                  </button>
-                </div>
-              </div>
-            )}
+
+            {/* ── Persistent-listener health grid ── */}
             {deployment?.triggerType === 'persistent_listener' && deployment.health && (
               <div className="grid grid-cols-3 divide-x divide-line rounded-input border border-line bg-surface-2">
                 <MiniMetric
                   label="Connection"
                   value={
-                    deployment.status === 'paused'
+                    isPaused
                       ? 'Paused'
-                      : deployment.status === 'error'
+                      : isError
                         ? 'Offline'
                         : deployment.health.status === 'error'
                           ? 'Error'
@@ -3590,19 +3778,68 @@ function DeploymentPanel({
                 {deployment.health.lastError}
               </p>
             )}
-            {deployment && deployment.triggerType !== 'manual' && (
-              <div className="grid grid-cols-2 divide-x divide-line rounded-input border border-line bg-surface-2">
-                <MiniMetric label="Last fired" value={deployment.lastFiredAt ? relativeSince(deployment.lastFiredAt) : 'Never'} />
-                {deployment.triggerType === 'cron'
-                  ? <MiniMetric label="Next run" value={cronNextRunLabel(deployment.config.expression)} />
-                  : intervalMs && deployment.status === 'active'
-                    ? <MiniMetric label="Next run" value={intervalNextRunLabel(deployment.lastFiredAt, intervalMs, now)} />
-                    : <MiniMetric label="Armed" value={relativeSince(deployment.updatedAt)} />}
+
+            {/* ── Config values: show DRAFT when pending, deployed when stable ── */}
+            <TriggerDeploymentDetails type={displayType} trigger={trigger} deployment={deployment} onCopy={onCopy} />
+            {deployment?.webhookSecret && (
+              <div className="rounded-input border border-warn/30 bg-warn/10 p-2.5">
+                <div className="text-[9px] font-semibold uppercase tracking-wider text-warn">Secret shown once</div>
+                <div className="mt-1 flex items-center gap-2">
+                  <code className="min-w-0 flex-1 truncate text-[10px] text-text-primary">{deployment.webhookSecret}</code>
+                  <button type="button" onClick={() => onCopy(deployment.webhookSecret!, 'Webhook secret')} className="text-text-muted hover:text-text-primary">
+                    <Copy size={12} />
+                  </button>
+                </div>
               </div>
             )}
 
+
+            {/* ── Warnings ── */}
+            {!readiness.ready && (
+              <div className="rounded-input border border-warn/35 bg-warn/10 px-2.5 py-2 text-[11px] leading-4 text-warn">
+                {readiness.message}
+              </div>
+            )}
+            {changed && (
+              <div className="flex items-center gap-2 rounded-input border border-accent/25 bg-accent-soft px-2.5 py-1.5 text-[10px] leading-4 text-text-secondary">
+                <RefreshCw size={11} className="shrink-0 text-accent" /> Settings changed · reactivate to apply
+              </div>
+            )}
+            {error && (
+              <div className="rounded-input border border-danger/30 bg-danger-soft px-2.5 py-2 text-[11px] leading-4 text-danger">
+                {error}
+              </div>
+            )}
+
+            <div className="flex h-10 items-center gap-2 rounded-input border border-line bg-canvas px-2.5">
+              <div className="flex shrink-0 items-center gap-1.5 text-[9px] font-semibold uppercase tracking-wider text-text-muted">
+                <History size={10} /> Last runs
+              </div>
+              <div className="flex min-w-0 flex-1 items-center gap-1" aria-label="Recent workflow run results">
+                {runs.length === 0
+                  ? <span className="text-[10px] text-text-muted">No runs yet</span>
+                  : runs.slice(0, 5).map((run) => (
+                    <button
+                      key={run.id}
+                      type="button"
+                      title={run.status.replaceAll('_', ' ')}
+                      aria-label={`Open ${run.status.replaceAll('_', ' ')} run`}
+                      onClick={() => openRunModal({ runId: run.id, workflowId, source: 'automation-panel' })}
+                      className="group flex h-5 w-5 items-center justify-center rounded-full transition hover:bg-surface-3"
+                    >
+                      <RunStatusDot status={run.status} />
+                    </button>
+                  ))}
+              </div>
+              {runs.length > 0 && <span className="shrink-0 text-[10px] text-text-secondary">{runResultSummary(runs.slice(0, 5))}</span>}
+              <Link to="/history?tab=runs" aria-label="View all runs" title="View all runs" className="shrink-0 text-text-muted transition hover:text-accent">
+                <ExternalLink size={11} />
+              </Link>
+            </div>
+
+            {/* ── Actions ── */}
             <div className="flex items-center gap-2">
-              {(!deployment || deployment.status === 'error' || changed) && (
+              {(!deployment || isError || changed || !deploymentMatchesType) && (
                 <Button
                   variant="primary"
                   size="sm"
@@ -3612,10 +3849,10 @@ function DeploymentPanel({
                   iconLeft={<Power size={13} />}
                   onClick={onActivate}
                 >
-                  {deployment ? 'Apply and activate' : meta.action}
+                  {changed && canPauseLiveDeployment ? 'Apply changes' : meta.action}
                 </Button>
               )}
-              {deployment?.status === 'paused' && !changed && (
+              {isPaused && !changed && (
                 <Button
                   variant="primary"
                   size="sm"
@@ -3627,18 +3864,20 @@ function DeploymentPanel({
                   Resume
                 </Button>
               )}
-              {deployment?.status === 'active' && !changed && (
+              {canPauseLiveDeployment && (
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  className="flex-1"
+                  loading={busy}
+                  iconLeft={<Pause size={13} />}
+                  onClick={onPause}
+                >
+                  Pause
+                </Button>
+              )}
+              {isActive && !changed && (
                 <>
-                  <Button
-                    variant="secondary"
-                    size="sm"
-                    className="flex-1"
-                    loading={busy}
-                    iconLeft={<Pause size={13} />}
-                    onClick={onPause}
-                  >
-                    Pause
-                  </Button>
                   <Button
                     variant="ghost"
                     size="sm"
@@ -3656,6 +3895,7 @@ function DeploymentPanel({
     </div>
   );
 }
+
 
 function DeploymentValue({
   label,
@@ -3679,6 +3919,91 @@ function DeploymentValue({
       </div>
     </div>
   );
+}
+
+function TriggerDeploymentDetails({
+  type,
+  trigger,
+  deployment,
+  onCopy,
+}: {
+  type: string;
+  trigger: Record<string, unknown> | null;
+  deployment: WorkflowDeployment | null;
+  onCopy: (value: string, label: string) => void;
+}) {
+  if (type === 'cron') {
+    const rules = (deployment?.config.scheduleRules ?? trigger?.scheduleRules) as Array<{ expression?: string; timezone?: string; label?: string }> | undefined;
+    const fallbackExpression = String(deployment?.config.expression ?? trigger?.schedule ?? '');
+    const fallbackTimezone = String(deployment?.config.timezone ?? trigger?.timezone ?? 'UTC');
+    const visibleRules = rules?.length ? rules : [{ expression: fallbackExpression, timezone: fallbackTimezone }];
+    return (
+      <div>
+        <div className="mb-1 text-[9px] font-semibold uppercase tracking-wider text-text-muted">Schedule</div>
+        <div className="overflow-hidden rounded-input border border-line bg-canvas">
+          {visibleRules.map((rule, index) => (
+            <div key={`${rule.expression}-${index}`} className="flex items-center justify-between gap-3 border-b border-line px-2.5 py-2 last:border-b-0">
+              <div className="min-w-0">
+                {rule.label && <div className="truncate text-[10px] font-medium text-text-primary">{rule.label}</div>}
+                <code className="block truncate text-[10px] text-text-secondary">{rule.expression || 'Not configured'}</code>
+              </div>
+              <span className="shrink-0 text-[9px] text-text-muted">{rule.timezone || fallbackTimezone}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+  if (type === 'webhook') {
+    return deployment?.webhookUrl ? (
+      <DeploymentValue label="Webhook URL" value={deployment.webhookUrl} onCopy={() => onCopy(deployment.webhookUrl!, 'Webhook URL')} />
+    ) : <DeploymentValue label="Webhook endpoint" value="Created when activated" />;
+  }
+  if (type === 'error_trigger') {
+    const source = (deployment?.config.source ?? {}) as { workflowId?: string; onStatus?: string[] };
+    const authored = (trigger?.errorTrigger ?? {}) as { targetWorkflowId?: string; onStatus?: string[] };
+    return <DeploymentValue label="Failure event" value={`${source.workflowId ?? authored.targetWorkflowId ?? 'Any workflow'} · ${(source.onStatus ?? authored.onStatus ?? ['FAILED']).join(', ')}`} />;
+  }
+  if (type === 'rss_feed') {
+    const source = (deployment?.config.source ?? {}) as { feedUrl?: string; intervalMs?: number };
+    const authored = (trigger?.rssFeed ?? {}) as { feedUrl?: string; pollIntervalMs?: number };
+    return <DeploymentValue label="RSS feed" value={`${source.feedUrl ?? authored.feedUrl ?? 'Not configured'} · every ${formatCompactInterval(source.intervalMs ?? authored.pollIntervalMs)}`} />;
+  }
+  if (type === 'email_imap') {
+    const source = (deployment?.config.source ?? {}) as { host?: string; mailbox?: string; pollIntervalMs?: number };
+    const authored = (trigger?.emailImap ?? {}) as { host?: string; mailbox?: string; pollIntervalMs?: number };
+    return <DeploymentValue label="Inbox" value={`${source.mailbox ?? authored.mailbox ?? 'INBOX'} @ ${source.host ?? authored.host ?? 'Not configured'} · every ${formatCompactInterval(source.pollIntervalMs ?? authored.pollIntervalMs)}`} />;
+  }
+  if (type === 'persistent_listener') {
+    const source = (deployment?.config.source ?? trigger?.listenerConfig ?? {}) as { kind?: string };
+    return <DeploymentValue label="Event source" value={source.kind ? source.kind.replaceAll('_', ' ') : 'Persistent connection'} />;
+  }
+  return <DeploymentValue label="Manual run" value={deployment?.status === 'active' ? 'Ready to run manually' : 'Run on demand'} />;
+}
+
+function RunStatusDot({ status }: { status: WorkflowRunSummary['status'] }) {
+  return <span className={clsx(
+    'h-2 w-2 rounded-full',
+    status === 'completed' ? 'bg-success'
+      : status === 'failed' || status === 'cancelled' ? 'bg-danger'
+        : status === 'running' || status === 'pending' ? 'animate-pulse bg-accent'
+          : 'bg-warn',
+  )} />;
+}
+
+function runResultSummary(runs: WorkflowRunSummary[]): string {
+  const successful = runs.filter((run) => run.status === 'completed').length;
+  const unsuccessful = runs.filter((run) => ['failed', 'cancelled', 'completed_with_violation'].includes(run.status)).length;
+  if (unsuccessful > 0) return `${successful} ok · ${unsuccessful} issues`;
+  if (successful > 0) return `${successful}/${runs.length} successful`;
+  return `${runs.length} active`;
+}
+
+function formatCompactInterval(value?: number): string {
+  if (!value || value < 1000) return '—';
+  if (value < 60_000) return `${Math.round(value / 1000)}s`;
+  if (value < 3_600_000) return `${Math.round(value / 60_000)}m`;
+  return `${Math.round(value / 3_600_000)}h`;
 }
 
 function MiniMetric({ label, value }: { label: string; value: string }) {
@@ -3719,14 +4044,17 @@ function intervalNextRunLabel(lastFiredAt: string | null, intervalMs: number, no
   return `${Math.floor(s / 60)}m ${s % 60}s`;
 }
 
-/** "in 12m" for the next fire of a cron expression, or "—" if unparseable. */
-function cronNextRunLabel(expression: unknown): string {
-  if (typeof expression !== 'string' || !expression.trim()) return '—';
-  const next = nextFires(expression, 1)[0];
-  if (!next) return '—';
-  const s = Math.floor((Date.parse(next) - Date.now()) / 1000);
+function nextRunLabel(nextRunAt: string | null | undefined, expression: unknown, now: number): string {
+  let target = nextRunAt ? Date.parse(nextRunAt) : Number.NaN;
+  if (!Number.isFinite(target) || target <= now) {
+    const next = typeof expression === 'string' ? nextFires(expression, 1)[0] : undefined;
+    target = next ? Date.parse(next) : Number.NaN;
+  }
+  if (!Number.isFinite(target)) return '—';
+  const s = Math.floor((target - now) / 1000);
   if (Number.isNaN(s)) return '—';
   if (s <= 0) return 'now';
+  if (s < 60) return `in ${s}s`;
   if (s < 3600) return `in ${Math.max(1, Math.floor(s / 60))}m`;
   if (s < 86400) return `in ${Math.floor(s / 3600)}h`;
   return `in ${Math.floor(s / 86400)}d`;
@@ -3767,6 +4095,30 @@ function deploymentMeta(triggerType: string): {
       icon: <Webhook size={15} />,
     };
   }
+  if (triggerType === 'error_trigger') {
+    return {
+      title: 'Failure automation',
+      description: 'Starts when the selected workflow reaches a watched failure state.',
+      action: 'Watch failures',
+      icon: <TriangleAlert size={15} />,
+    };
+  }
+  if (triggerType === 'rss_feed') {
+    return {
+      title: 'RSS feed monitor',
+      description: 'Checks the feed continuously and starts a run for new entries.',
+      action: 'Start monitoring',
+      icon: <Rss size={15} />,
+    };
+  }
+  if (triggerType === 'email_imap') {
+    return {
+      title: 'Inbox monitor',
+      description: 'Checks the connected mailbox and starts runs for matching email.',
+      action: 'Start monitoring',
+      icon: <Mail size={15} />,
+    };
+  }
   return {
     title: 'Persistent listener',
     description: 'Keep a source connected 24/7 and start runs as matching events arrive.',
@@ -3780,10 +4132,22 @@ function deploymentDiffersFromDraft(
   trigger: Record<string, unknown> | null,
 ): boolean {
   const triggerType = String(trigger?.triggerType ?? 'manual');
-  if (deployment.triggerType !== triggerType) return true;
+  if ((deployment.authoredTriggerType ?? deployment.triggerType) !== triggerType) return true;
   if (triggerType === 'cron') {
-    return String(trigger?.schedule ?? '').trim() !== String(deployment.config.expression ?? '').trim()
-      || String(trigger?.timezone ?? 'UTC').trim() !== String(deployment.config.timezone ?? 'UTC').trim();
+    const normalizeRules = (rules: Array<{ expression?: string; timezone?: string; label?: string }>) => rules
+      .filter((rule) => rule.expression?.trim())
+      .map((rule) => ({
+        expression: rule.expression!.trim(),
+        timezone: (rule.timezone ?? 'UTC').trim(),
+        label: rule.label ?? null,
+      }));
+    const draftRules = Array.isArray(trigger?.scheduleRules) && trigger.scheduleRules.length
+      ? normalizeRules(trigger.scheduleRules as Array<{ expression?: string; timezone?: string; label?: string }>)
+      : normalizeRules([{ expression: String(trigger?.schedule ?? trigger?.expression ?? ''), timezone: String(trigger?.timezone ?? 'UTC') }]);
+    const deployedRules = Array.isArray(deployment.config.scheduleRules) && deployment.config.scheduleRules.length
+      ? normalizeRules(deployment.config.scheduleRules as Array<{ expression?: string; timezone?: string; label?: string }>)
+      : normalizeRules([{ expression: String(deployment.config.expression ?? ''), timezone: String(deployment.config.timezone ?? 'UTC') }]);
+    return JSON.stringify(draftRules) !== JSON.stringify(deployedRules);
   }
   if (triggerType === 'persistent_listener') {
     return JSON.stringify(trigger?.listenerConfig ?? null) !== JSON.stringify(deployment.config);
@@ -3791,10 +4155,13 @@ function deploymentDiffersFromDraft(
   return false;
 }
 
-function activationSuccessMessage(triggerType: WorkflowDeployment['triggerType']): string {
+function activationSuccessMessage(triggerType: WorkflowDeployment['authoredTriggerType'] | string): string {
   if (triggerType === 'manual') return 'Manual run activated';
   if (triggerType === 'cron') return 'Schedule activated';
   if (triggerType === 'webhook') return 'Webhook endpoint activated';
+  if (triggerType === 'rss_feed') return 'RSS feed monitor activated';
+  if (triggerType === 'email_imap') return 'Inbox monitor activated';
+  if (triggerType === 'error_trigger') return 'Failure automation activated';
   return 'Persistent listener activated';
 }
 
@@ -3824,21 +4191,20 @@ function RunInputDialog({
   open,
   onClose,
   variables,
-  activeRevision,
-  candidateRevision,
+  issues,
+  onIssueClick,
   onRun,
   running,
 }: {
   open: boolean;
   onClose: () => void;
   variables: Array<{ name: string; type: string; default?: unknown; label?: string; required?: boolean }>;
-  activeRevision: WorkflowRevisionSummary | undefined;
-  candidateRevision: WorkflowRevisionSummary | null | undefined;
-  onRun: (inputs: Record<string, unknown>, target: 'active' | 'candidate') => void;
+  issues: Array<{ nodeId: string; nodeTitle: string; message: string }>;
+  onIssueClick: (nodeId: string) => void;
+  onRun: (inputs: Record<string, unknown>) => void;
   running: boolean;
 }) {
   const [values, setValues] = useState<Record<string, string>>({});
-  const [target, setTarget] = useState<'active' | 'candidate'>('active');
   useEffect(() => {
     if (open) {
       const init: Record<string, string> = {};
@@ -3846,9 +4212,6 @@ function RunInputDialog({
         init[v.name] = v.default != null ? String(v.default) : '';
       });
       setValues(init);
-      // Running a draft is always a verification run. Publishing is a separate,
-      // proof-gated operation, so an operator never has to choose a revision here.
-      setTarget(candidateRevision ? 'candidate' : 'active');
     }
   }, [open, variables]);
 
@@ -3864,7 +4227,7 @@ function RunInputDialog({
       <form
         onSubmit={(e) => {
           e.preventDefault();
-          onRun(values, target);
+          onRun(values);
         }}
         className="animate-scale-in w-full max-w-md rounded-modal border border-line bg-surface shadow-modal"
       >
@@ -3880,29 +4243,19 @@ function RunInputDialog({
           </button>
         </header>
         <div className="space-y-4 px-5 py-5">
-          <div className="hidden grid grid-cols-2 gap-2" role="radiogroup" aria-label="Revision to run">
-            <button type="button" role="radio" aria-checked={target === 'active'} onClick={() => setTarget('active')} className={clsx('rounded-lg border p-3 text-left', target === 'active' ? 'border-accent bg-accent/10' : 'border-line bg-surface-2')}>
-              <div className="text-[12px] font-semibold text-text-primary">Live version</div>
-              <div className="mt-1 font-mono text-[10px] text-text-muted">{activeRevision ? activeRevision.id.slice(0, 8) : 'Legacy live version'}</div>
-            </button>
-            <button type="button" role="radio" aria-checked={target === 'candidate'} disabled={!candidateRevision} onClick={() => candidateRevision && setTarget('candidate')} className={clsx('rounded-lg border p-3 text-left disabled:cursor-not-allowed disabled:opacity-45', target === 'candidate' ? 'border-warn bg-warn/10' : 'border-line bg-surface-2')}>
-              <div className="text-[12px] font-semibold text-text-primary">Pending change verification</div>
-              <div className="mt-1 font-mono text-[10px] text-text-muted">{candidateRevision ? candidateRevision.id.slice(0, 8) : 'No pending change'}</div>
-            </button>
-          </div>
-          <div className={clsx(
-            'rounded-lg border px-3 py-2.5',
-            candidateRevision ? 'border-warn/35 bg-warn/10' : 'border-accent/35 bg-accent/10',
-          )}>
-            <div className="text-[12px] font-semibold text-text-primary">
-              {candidateRevision ? 'Verifying a pending change' : 'Running the live workflow'}
+          {issues.length > 0 && (
+            <div className="rounded-lg border border-warn/35 bg-warn/10 px-3 py-2.5">
+              <div className="text-[12px] font-semibold text-text-primary">Check before running</div>
+              <div className="mt-2 space-y-2">
+                {issues.map((issue) => (
+                  <button key={`${issue.nodeId}:${issue.message}`} type="button" onClick={() => onIssueClick(issue.nodeId)} className="block w-full rounded-md px-2 py-1.5 text-left hover:bg-warn/10">
+                    <span className="block text-[11px] font-medium text-text-primary">{issue.nodeTitle}</span>
+                    <span className="block text-[11px] text-text-secondary">{issue.message}</span>
+                  </button>
+                ))}
+              </div>
             </div>
-            <div className="mt-1 text-[11px] text-text-secondary">
-              {candidateRevision
-                ? `Change ${candidateRevision.id.slice(0, 8)} is isolated. It will publish automatically only after this exact revision passes.`
-                : `Live revision ${activeRevision?.id.slice(0, 8) ?? 'legacy live version'} will run.`}
-            </div>
-          </div>
+          )}
           {variables.length === 0 ? null : (
             <>
               <p className="text-[13px] text-text-secondary">

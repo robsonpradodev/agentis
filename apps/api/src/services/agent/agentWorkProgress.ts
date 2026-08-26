@@ -19,6 +19,14 @@ export interface AgentWorkContext {
 }
 
 export interface AgentWorkStepInput extends AgentWorkContext {
+  activityId?: string;
+  activityKind?: string;
+  activityStatus?: string;
+  transport?: string;
+  attempt?: number;
+  startedAt?: string;
+  completedAt?: string;
+  durationMs?: number;
   phase?: string;
   step?: string;
   description: string;
@@ -42,6 +50,14 @@ export function publishAgentWorkStep(bus: EventBus, input: AgentWorkStepInput): 
     workflowId: input.workflowId,
     runId: input.runId,
     nodeId: input.nodeId,
+    activityId: input.activityId,
+    activityKind: input.activityKind,
+    activityStatus: input.activityStatus,
+    transport: input.transport,
+    attempt: input.attempt,
+    startedAt: input.startedAt,
+    completedAt: input.completedAt,
+    durationMs: input.durationMs,
     phase: input.phase ?? 'progress',
     step: input.step ?? 'agent_task',
     description,

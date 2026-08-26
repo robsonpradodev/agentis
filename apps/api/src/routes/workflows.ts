@@ -237,6 +237,35 @@ export function buildWorkflowRoutes(deps: {
     });
   });
 
+  // User-facing history contains publication milestones only. Draft, proof,
+  // and autosave revisions remain available through the agent-facing revision
+  // API above, but are deliberately not presented as workflow versions.
+  app.get('/:id/versions', (c) => {
+    const ws = getWorkspace(c);
+    const workflowId = c.req.param('id');
+    const workflow = revisions.active(ws.workspaceId, workflowId).workflow;
+    const published = revisions.revisions(ws.workspaceId, workflowId)
+      .filter((revision) => Boolean(revision.promotedAt))
+      .sort((a, b) => {
+        const promoted = String(a.promotedAt).localeCompare(String(b.promotedAt));
+        return promoted || a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id);
+      });
+    return c.json({
+      currentVersionId: workflow.activeRevisionId,
+      versions: published.map((revision, index) => ({
+        id: revision.id,
+        number: index + 1,
+        label: `Version ${index + 1}`,
+        isCurrent: revision.id === workflow.activeRevisionId,
+        publishedAt: revision.promotedAt,
+        actor: { type: revision.actorType, id: revision.actorId },
+        source: revision.source,
+        summary: revision.reason,
+        changeSummary: revision.changeSummaryJson,
+      })).reverse(),
+    });
+  });
+
   app.get('/:id/revisions/:revisionId', (c) => {
     const ws = getWorkspace(c);
     const workflowId = c.req.param('id');
@@ -446,6 +475,9 @@ export function buildWorkflowRoutes(deps: {
     const workflowId = c.req.param('id');
     const source = revisions.revision(ws.workspaceId, workflowId, c.req.param('revisionId'));
     if (!source) throw new AgentisError('RESOURCE_NOT_FOUND', 'Workflow revision not found');
+    if (!source.promotedAt) {
+      throw new AgentisError('WORKFLOW_GRAPH_INVALID', 'Only a published workflow version can be restored');
+    }
     const workflow = revisions.active(ws.workspaceId, workflowId).workflow;
     const restored = revisions.createCandidate({
       workspaceId: ws.workspaceId,
@@ -653,7 +685,13 @@ export function buildWorkflowRoutes(deps: {
     const revisionState = revisions.active(ws.workspaceId, c.req.param('id'));
     const trusted = revisionState.workflow.trustState === 'proven'
       || revisionState.workflow.trustState === 'break_glass';
-    if (!trusted && !body.override?.ack?.trim()) {
+    const operator = deps.db.select({ isAdmin: schema.users.isAdmin })
+      .from(schema.users)
+      .where(eq(schema.users.id, ws.user.id))
+      .get();
+    const isAdmin = operator?.isAdmin === true;
+
+    if (!trusted && !body.override?.ack?.trim() && !isAdmin) {
       throw new AgentisError(
         'AUTH_FORBIDDEN',
         'Unattended triggers require a proven active revision. Verify and promote the candidate, or use an audited override.',
@@ -724,7 +762,7 @@ export function buildWorkflowRoutes(deps: {
     const selectedGraph = normalizedGraph
       ?? revisions.candidate(ws.workspaceId, id)?.graph
       ?? revisions.active(ws.workspaceId, id).graph;
-    const candidate = normalizedGraph || specChanged
+    const candidateMutation = normalizedGraph || specChanged
       ? revisions.createCandidate({
           workspaceId: ws.workspaceId,
           workflowId: id,
@@ -751,16 +789,20 @@ export function buildWorkflowRoutes(deps: {
     // re-proven, and a proven workflow only breaks when it changes. The save still
     // succeeds (non-blocking); the warning steers to re-verify (or restore) next.
     const active = revisions.active(ws.workspaceId, id);
-    const currentCandidate = candidate?.revision ?? revisions.candidate(ws.workspaceId, id)?.revision ?? null;
+    // createCandidate is intentionally idempotent: an unchanged save can return
+    // the active base revision, and a presentation-only save can auto-promote.
+    // Neither is a candidate. Always read the authoritative head after mutation
+    // instead of relabeling the mutation result as editable working state.
+    const currentCandidate = revisions.candidate(ws.workspaceId, id)?.revision ?? null;
     return c.json({
       ok: true,
       activeRevision: presentRevision(active.revision),
       candidateRevision: currentCandidate ? presentRevision(currentCandidate) : null,
       trustState: currentCandidate ? 'candidate' : active.revision.trustState,
-      ...(candidate ? {
+      ...(candidateMutation && currentCandidate ? {
         divergence: {
           workflowId: id,
-          graphHash: candidate.revision.semanticHash,
+          graphHash: currentCandidate.semanticHash,
           protectedGraphHash: active.revision.semanticHash,
           source: 'active_revision',
           message: 'Saved as an unverified candidate. Production continues to use the active revision.',
@@ -778,8 +820,14 @@ export function buildWorkflowRoutes(deps: {
       revisions,
       workspaceId: ws.workspaceId,
       workflowId: id,
-      mode: body.mode === 'debug' ? 'candidate' : 'active',
-      revisionId: body.revisionId,
+      mode: body.mode === 'debug'
+        ? 'candidate'
+        : body.mode === 'latest'
+          ? 'candidate_or_active'
+          : 'active',
+      // `latest` is deliberately server-authoritative. Ignore any accidental
+      // client revision id so a stale editor can never override the current head.
+      revisionId: body.mode === 'latest' ? undefined : body.revisionId,
     });
     const selected = target.revision;
     const rawGraph = target.graph;
@@ -861,6 +909,8 @@ export function buildWorkflowRoutes(deps: {
       ambientId: ws.ambientId,
     });
 
+    const debugRun = body.mode === 'debug'
+      || (body.mode === 'latest' && selected.id !== target.workflow.activeRevisionId);
     await deps.engine.startRun({
       workspaceId: ws.workspaceId,
       ambientId: ws.ambientId,
@@ -871,18 +921,16 @@ export function buildWorkflowRoutes(deps: {
       initialState: state,
       graph,
       workflowRevisionId: selected.id,
-      debugRun: body.mode === 'debug',
+      debugRun,
     });
 
-    // SWIFT "warn previously": this HTTP run is always a production run (self-heal
-    // ON). If the graph diverges from its PROVEN blueprint/hardened version, the run
-    // is proceeding UNVERIFIED — surface that with the run id so the operator can
-    // re-verify (deliver) or restore rather than trust an unproven change silently.
+    // Return the immutable revision actually selected. Editor-head candidate runs
+    // are explicit debug executions; active runs retain production self-healing.
     return c.json({
       runId,
       revisionId: selected.id,
       mode: body.mode,
-      selfHealEnabled: body.mode !== 'debug',
+      selfHealEnabled: !debugRun,
       trustState: selected.trustState,
     }, 202);
   });

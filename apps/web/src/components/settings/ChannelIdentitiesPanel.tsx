@@ -8,7 +8,7 @@
  */
 
 import { useCallback, useEffect, useState } from 'react';
-import { Ban, Link2, Loader2, ShieldCheck } from 'lucide-react';
+import { Ban, Crown, Link2, Loader2, ShieldCheck, UserCheck } from 'lucide-react';
 import { api } from '../../lib/api';
 import { Button } from '../shared/Button';
 import { Skeleton } from '../shared/Skeleton';
@@ -17,10 +17,14 @@ import { useToast } from '../shared/Toast';
 interface PeerIdentity {
   id: string;
   channelKind: string;
+  connectionId: string | null;
   handle: string;
   displayName: string | null;
   userId: string | null;
   peerKey: string | null;
+  authorityRole?: 'external' | 'owner' | 'delegate';
+  verifiedAt?: string | null;
+  grantExpiresAt?: string | null;
   blocked?: boolean;
   messageCount: number;
   lastSeenAt: string;
@@ -54,7 +58,7 @@ export function ChannelIdentitiesPanel() {
     try {
       await api('/v1/channels/identities/link', {
         method: 'POST',
-        body: JSON.stringify({ channelKind: identity.channelKind, handle: identity.handle, userId }),
+        body: JSON.stringify({ connectionId: identity.connectionId, channelKind: identity.channelKind, handle: identity.handle, userId }),
       });
       toast.success(userId ? 'Identity linked' : 'Identity unlinked');
       await refresh();
@@ -70,7 +74,7 @@ export function ChannelIdentitiesPanel() {
     try {
       await api('/v1/channels/identities/block', {
         method: 'POST',
-        body: JSON.stringify({ channelKind: identity.channelKind, handle: identity.handle, blocked }),
+        body: JSON.stringify({ connectionId: identity.connectionId, channelKind: identity.channelKind, handle: identity.handle, blocked }),
       });
       toast.success(blocked ? 'Sender blocked' : 'Sender unblocked', blocked ? 'Their messages are now ignored.' : undefined);
       await refresh();
@@ -81,13 +85,33 @@ export function ChannelIdentitiesPanel() {
     }
   }
 
+  async function setAuthority(identity: PeerIdentity, role: 'owner' | 'delegate' | 'external') {
+    if (!identity.connectionId) return;
+    setBusy(identity.id);
+    try {
+      if (role === 'external') {
+        await api(`/v1/channels/identities/${identity.id}/authority`, { method: 'DELETE' });
+      } else {
+        await api('/v1/channels/identities/authority', {
+          method: 'POST',
+          body: JSON.stringify({ connectionId: identity.connectionId, channelKind: identity.channelKind, handle: identity.handle, role }),
+        });
+      }
+      toast.success(role === 'external' ? 'Authority revoked' : role === 'owner' ? 'Primary owner verified' : 'Delegate verified');
+      await refresh();
+    } catch (err) {
+      toast.error('Could not update authority', String(err));
+    } finally {
+      setBusy(null);
+    }
+  }
+
   return (
     <section>
       <h2 className="mb-1 text-[11px] font-semibold uppercase tracking-wider text-text-muted">Channel identities</h2>
       <p className="mb-3 text-[13px] text-text-secondary">
-        People reaching your agents over channels. <strong>Link</strong> a sender to a workspace user so the
-        orchestrator recognizes them across WhatsApp, Telegram, and Slack — or <strong>Block</strong> a
-        sender to silently ignore their messages workspace-wide.
+        Connection-scoped principals reaching your agents. Linking joins the same person across channels;
+        authority explicitly marks the primary owner or a revocable delegate. A default recipient never grants control.
       </p>
 
       {identities === null ? (
@@ -103,6 +127,7 @@ export function ChannelIdentitiesPanel() {
               <tr>
                 <th className="px-3 py-2 font-medium">Channel</th>
                 <th className="px-3 py-2 font-medium">Sender</th>
+                <th className="px-3 py-2 font-medium">Authority</th>
                 <th className="px-3 py-2 font-medium">Messages</th>
                 <th className="px-3 py-2 font-medium">Linked</th>
                 <th className="px-3 py-2" />
@@ -117,6 +142,13 @@ export function ChannelIdentitiesPanel() {
                     {identity.displayName && (
                       <span className="ml-1 text-[11px] text-text-muted">({truncate(identity.handle)})</span>
                     )}
+                  </td>
+                  <td className="px-3 py-2">
+                    {identity.authorityRole === 'owner' ? (
+                      <span className="inline-flex items-center gap-1 text-[12px] text-accent"><Crown size={12} /> owner</span>
+                    ) : identity.authorityRole === 'delegate' ? (
+                      <span className="inline-flex items-center gap-1 text-[12px] text-text-primary"><UserCheck size={12} /> delegate</span>
+                    ) : <span className="text-[12px] text-text-muted">external</span>}
                   </td>
                   <td className="px-3 py-2 text-text-secondary">{identity.messageCount}</td>
                   <td className="px-3 py-2">
@@ -144,6 +176,15 @@ export function ChannelIdentitiesPanel() {
                             <Button size="sm" variant="secondary" disabled={busy === identity.id || !me} onClick={() => me && void link(identity, me.id)}>
                               {busy === identity.id ? <Loader2 size={12} className="animate-spin" /> : 'Link to me'}
                             </Button>
+                          )}
+                          {identity.connectionId && identity.authorityRole === 'external' && (
+                            <>
+                              <Button size="sm" variant="ghost" disabled={busy === identity.id} onClick={() => void setAuthority(identity, 'delegate')}>Delegate</Button>
+                              <Button size="sm" variant="ghost" disabled={busy === identity.id} onClick={() => void setAuthority(identity, 'owner')}>Owner</Button>
+                            </>
+                          )}
+                          {identity.connectionId && identity.authorityRole !== 'external' && (
+                            <Button size="sm" variant="ghost" disabled={busy === identity.id} onClick={() => void setAuthority(identity, 'external')}>Revoke</Button>
                           )}
                           <Button size="sm" variant="ghost" disabled={busy === identity.id} title="Block this sender" onClick={() => void block(identity, true)}>
                             <Ban size={12} />

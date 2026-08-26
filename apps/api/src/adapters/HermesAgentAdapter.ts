@@ -31,18 +31,21 @@ import {
 } from './cliChatRuntime.js';
 import { probeCliRuntime } from './cliRuntimeProbe.js';
 import { nativeRuntimeCapabilities } from './runtimeCapabilityDeclarations.js';
-import { runtimeProgressActivity } from './runtimeProgress.js';
+import { runtimeAttemptFromSessionKey, runtimeProgressActivity } from './runtimeProgress.js';
 
 const DEFAULT_HERMES_STARTUP_TIMEOUT_MS = 120_000;
 const MAX_HERMES_STARTUP_TIMEOUT_MS = 300_000;
-const DEFAULT_HERMES_FIRST_EVENT_TIMEOUT_MS = 90_000;
+// ACP occasionally accepts a prompt but stalls before it even starts the provider
+// request. Workflow callers now retain the Agentis tool loop during CLI recovery,
+// so waiting 90 seconds no longer buys capability safety; it only freezes the run.
+const DEFAULT_HERMES_FIRST_EVENT_TIMEOUT_MS = 20_000;
 // Interactive chat cannot sit silent for 90s while we wait to see whether the
 // ACP build will EVER stream output. When the operator is at a keyboard
 // (latencyClass 'interactive'), a session that opens but produces no first event
 // quickly is treated as an ACP stall: in `auto` transport we cut over to the
 // stable CLI path fast instead of freezing. Env-overridable for genuinely slow
 // providers.
-const DEFAULT_HERMES_INTERACTIVE_FIRST_EVENT_TIMEOUT_MS = 30_000;
+const DEFAULT_HERMES_INTERACTIVE_FIRST_EVENT_TIMEOUT_MS = 12_000;
 const MIN_HERMES_FIRST_EVENT_TIMEOUT_MS = 2_000;
 const MAX_HERMES_FIRST_EVENT_TIMEOUT_MS = 120_000;
 // Once an `auto`-transport turn has had to abandon a stalled ACP attempt and fall
@@ -50,7 +53,21 @@ const MAX_HERMES_FIRST_EVENT_TIMEOUT_MS = 120_000;
 // ~startup + first-event-probe seconds for nothing. Latch the CLI route for this
 // cooldown so subsequent turns are CLI-fast, then periodically re-try ACP in case
 // the build recovered. Env-overridable; 0 disables the breaker.
-const DEFAULT_HERMES_ACP_STALL_COOLDOWN_MS = 60_000;
+const DEFAULT_HERMES_ACP_STALL_COOLDOWN_MS = 15 * 60_000;
+// Hermes' quiet CLI emits only its final answer: its model calls and native tool
+// work are written to Hermes' own log, not the child stdout/stderr pipes Agentis
+// can observe. A short "silence" deadline therefore kills HEALTHY tool-using
+// workflow tasks. Interactive turns retain a short operator-facing budget, while
+// background/deep work gets the shared long-running harness ceiling. Both remain
+// environment-overridable.
+const DEFAULT_HERMES_INTERACTIVE_CLI_SILENCE_TIMEOUT_MS = 90_000;
+const DEFAULT_HERMES_CLI_SILENCE_TIMEOUT_MS = 30 * 60_000;
+// `context_engine` is a real Hermes toolset whose static definition is empty.
+// Using a made-up name looked equivalent in unit tests, but Hermes printed an
+// "Unknown toolsets" warning into quiet stdout and some builds fell back to the
+// configured CLI tool surface. A real zero-tool profile makes caller-loop
+// ownership explicit and keeps native skill/terminal loops from racing Agentis.
+const HERMES_CALLER_LOOP_TOOLSET = 'context_engine';
 
 export interface HermesAgentAdapterOptions {
   agentId: string;
@@ -203,6 +220,25 @@ export class HermesAgentAdapter implements AgentAdapter {
     };
   }
 
+  async prepare(): Promise<void> {
+    // Auto caller-loop work is intentionally served by the model-only CLI path
+    // (see chat()). Prewarming ACP for those runs creates a second Hermes process
+    // that competes for the same plugin/state locks and made the first CLI round
+    // take minutes. Only an explicitly ACP-pinned runtime should be prewarmed.
+    if (this.#chatTransport() !== 'acp' || this.#prewarmedSession) return;
+    const startupTimeoutMs = boundedTimeout(
+      process.env.AGENTIS_HERMES_STARTUP_TIMEOUT_MS,
+      DEFAULT_HERMES_STARTUP_TIMEOUT_MS,
+      MAX_HERMES_STARTUP_TIMEOUT_MS,
+      DEFAULT_HERMES_STARTUP_TIMEOUT_MS,
+    );
+    this.#prewarmReady ??= this.#prewarm(startupTimeoutMs).catch((err) => {
+      this.#prewarmReady = undefined;
+      this.opts.logger.warn('hermes_agent.prewarm.failed', { agentId: this.opts.agentId, error: (err as Error).message });
+    });
+    await this.#prewarmReady;
+  }
+
   async getRuntimeContext(): Promise<RuntimeContext> {
     const currentModel = this.opts.model ?? 'hermes-agent-default';
     // After the first chat turn we know the harness's REAL model catalog (from
@@ -329,7 +365,12 @@ export class HermesAgentAdapter implements AgentAdapter {
     childProcess.on('error', (err) => {
       if (terminalEventEmitted) return;
       terminalEventEmitted = true;
-      this.#emitFailure(task, `hermes_agent_error: ${err.message}`);
+      // An operator cancellation tears down the Windows process tree and can
+      // surface here as AbortError. It is not a task failure and must not race a
+      // CANCELLED run with a late FAILED event.
+      if (!controller.signal.aborted && !task.signal?.aborted) {
+        this.#emitFailure(task, `hermes_agent_error: ${err.message}`);
+      }
       cleanup();
       unlinkAbort();
       this.#inFlight.delete(task.taskId);
@@ -387,6 +428,10 @@ export class HermesAgentAdapter implements AgentAdapter {
       if (timeout) clearTimeout(timeout);
       if (terminalEventEmitted) return;
       terminalEventEmitted = true;
+      // taskkill can report a clean exit even though the operator cancelled the
+      // run. Never translate that exit into the false "Agent task completed"
+      // event that used to repaint a cancelled node as running/completed.
+      if (controller.signal.aborted || task.signal?.aborted) return;
       if (code === 0) {
         this.#emit({
           eventType: 'task.completed',
@@ -445,14 +490,25 @@ export class HermesAgentAdapter implements AgentAdapter {
           latencyClass: 'deliberate',
           timeoutMs: task.timeoutMs,
         })) {
+          if (controller.signal.aborted || task.signal?.aborted) break;
           if (delta.type === 'text' && delta.delta) {
             transcript += delta.delta;
-            this.#emitProgress(task, delta.delta, timestamp());
+            this.#emitProgress(task, delta.delta, timestamp(), { kind: 'commentary' });
           } else if (delta.type === 'activity') {
-            this.#emitProgress(task, delta.detail?.trim() || delta.label, timestamp());
+            this.#emitProgress(task, delta.detail?.trim() || delta.label, timestamp(), {
+              activityId: delta.id,
+              kind: delta.phase === 'tool' ? 'tool' : delta.phase === 'waiting' ? 'waiting' : /reason/i.test(delta.label) ? 'reasoning' : 'runtime',
+              phase: delta.phase,
+              status: delta.status,
+              transport: delta.transport,
+              startedAt: delta.startedAt,
+              completedAt: delta.completedAt,
+              durationMs: delta.durationMs,
+            });
           } else if (delta.type === 'tool_result' && delta.error) {
             failure = delta.error;
           } else if (delta.type === 'done') {
+            if (controller.signal.aborted || task.signal?.aborted || delta.finishReason === 'interrupted') break;
             if (delta.finishReason === 'error') {
               this.#emitFailure(task, failure || 'Hermes ACP task failed.');
             } else {
@@ -469,7 +525,12 @@ export class HermesAgentAdapter implements AgentAdapter {
           }
         }
       } catch (err) {
-        this.#emitFailure(task, `hermes_agent_acp_failed: ${(err as Error).message}`);
+        // Aborting an ACP prompt rejects the stream. Cancellation is already a
+        // terminal run state owned by the engine, so do not repaint it as a
+        // provider failure after the operator has stopped the run.
+        if (!controller.signal.aborted && !task.signal?.aborted) {
+          this.#emitFailure(task, `hermes_agent_acp_failed: ${(err as Error).message}`);
+        }
       } finally {
         unlinkAbort();
         this.#inFlight.delete(task.taskId);
@@ -505,20 +566,37 @@ export class HermesAgentAdapter implements AgentAdapter {
    *
    * `cleanup()` is retained for call-site symmetry but is now a no-op (no temp file).
    */
-  #buildChatInvocation(prompt: string, model = this.opts.model): { args: string[]; cleanup: () => void } {
-    const baseArgs = (queryArg: string): string[] => [
-      'chat',
-      '-q', queryArg,
-      '-Q',
-      ...(model ? ['-m', model] : []),
-      // Codex parity: no native turn cap by default — a stale `--max-turns 24`
-      // killed long runs mid-task. Pass it ONLY when explicitly set (env via
-      // agentCommission.nativeTurnCap); otherwise let Hermes run to completion.
-      ...(this.opts.maxTurns && this.opts.maxTurns > 0 ? ['--max-turns', String(this.opts.maxTurns)] : []),
-      '--ignore-rules',
-      '--yolo',
-      ...(this.opts.extraArgs ?? []),
-    ];
+  #buildChatInvocation(
+    prompt: string,
+    model = this.opts.model,
+    options: { callerManagedTools?: boolean } = {},
+  ): { args: string[]; cleanup: () => void } {
+    const baseArgs = (queryArg: string): string[] => options.callerManagedTools
+      ? [
+          // `-z` is Hermes' script-oriented, final-answer-only path. It bypasses
+          // the classic chat shell/session UI and, paired with a real zero-tool
+          // toolset, guarantees exactly one provider round. Agentis owns every
+          // subsequent tool/result round through the marker protocol.
+          '-z', queryArg,
+          ...(model ? ['-m', model] : []),
+          '-t', HERMES_CALLER_LOOP_TOOLSET,
+          '--ignore-rules',
+          '--yolo',
+          ...(this.opts.extraArgs ?? []),
+        ]
+      : [
+          'chat',
+          '-q', queryArg,
+          '-Q',
+          ...(model ? ['-m', model] : []),
+          // Codex parity: no native turn cap by default — a stale
+          // `--max-turns 24` killed long runs mid-task. Pass it ONLY when
+          // explicitly set; otherwise let Hermes run to completion.
+          ...(this.opts.maxTurns && this.opts.maxTurns > 0 ? ['--max-turns', String(this.opts.maxTurns)] : []),
+          '--ignore-rules',
+          '--yolo',
+          ...(this.opts.extraArgs ?? []),
+        ];
 
     const limit = hermesInlinePromptLimit();
     const query = prompt.length <= limit ? prompt : truncateHermesPromptToInline(prompt, limit);
@@ -535,6 +613,25 @@ export class HermesAgentAdapter implements AgentAdapter {
       yield* this.#chatCli(messages, tools, options);
       return;
     }
+    const callerCanPreserveTools = options?.toolMode === 'caller_loop'
+      && options.transportRecovery === 'capability_preserving';
+    if (transport === 'auto' && callerCanPreserveTools) {
+      // ACP is useful only when Hermes owns its native MCP/tool loop. A caller-
+      // managed Agentis turn cannot consume that loop and previously paid a
+      // guaranteed 20s probe before launching the same CLI chat uses. Go directly
+      // to the capability-equivalent model-only path; explicit `acp` remains a pin.
+      yield* this.#chatCli(messages, tools, options);
+      return;
+    }
+    if (transport === 'auto' && options?.latencyClass === 'interactive') {
+      // Human-facing channel/chat turns optimize for response latency. The
+      // installed Hermes ACP can pass its handshake yet stall before the model
+      // call, so probing it on every fresh process adds ~30s before the proven
+      // CLI path even begins. Background/deep work still probes ACP for native
+      // streaming + MCP; interactive auto turns take the reliable path now.
+      yield* this.#chatCli(messages, tools, options);
+      return;
+    }
     if (transport === 'auto' && Date.now() < this.#acpDisabledUntil) {
       // ACP stalled recently in this environment — don't re-pay the startup +
       // first-event probe every turn; serve straight from the stable CLI until
@@ -542,11 +639,16 @@ export class HermesAgentAdapter implements AgentAdapter {
       yield* this.#chatCli(messages, tools, options);
       return;
     }
-    const allowCliFallback = transport === 'auto';
+    // CLI cannot inherit ACP-mounted MCP by itself. It is capability-equivalent
+    // only when Agentis owns the caller loop and supplied the same tool catalogue;
+    // in that mode marker calls come back to ChatSessionExecutor for enforcement.
+    const allowCliFallback = transport === 'auto'
+      && ((this.opts.mcpServers?.length ?? 0) === 0 || callerCanPreserveTools);
 
     const releaseTurn = await this.#acquireTurn();
     const queue = createChatQueue();
     const sessionKey = options?.sessionKey?.trim() || 'default';
+    const attempt = runtimeAttemptFromSessionKey(sessionKey);
     const configuredTimeoutMs = this.opts.timeoutSec && this.opts.timeoutSec > 0
       ? this.opts.timeoutSec * 1000
       : DEFAULT_CHAT_TURN_TIMEOUT_MS;
@@ -575,6 +677,7 @@ export class HermesAgentAdapter implements AgentAdapter {
     let firstEventTimer: NodeJS.Timeout | undefined;
     let hardTimer: NodeJS.Timeout | undefined;
     let abortHandler: (() => void) | undefined;
+    let waitingStartedAt = 0;
     const turnState: HermesAcpTurnState = {
       sessionKey,
       agentId: this.opts.agentId,
@@ -619,11 +722,24 @@ export class HermesAgentAdapter implements AgentAdapter {
         detail: `${code}: ${message}`,
         phase: 'runtime',
         status: 'running',
+        transport: 'hermes_cli',
+        attempt,
         startedAt: new Date().toISOString(),
+        durationMs: waitingStartedAt ? Date.now() - waitingStartedAt : undefined,
         agentId: this.opts.agentId,
       });
       try {
-        for await (const delta of this.#chatCli(messages, tools, options)) queue.push(delta);
+        for await (const delta of this.#chatCli(messages, tools, options)) {
+          if (delta.type === 'tool_result' && delta.id === 'adapter' && delta.error) {
+            const acpElapsedMs = waitingStartedAt ? Date.now() - waitingStartedAt : undefined;
+            queue.push({
+              ...delta,
+              error: `Hermes recovery failed: stage=first_meaningful_event transport=hermes_acp${acpElapsedMs != null ? ` elapsedMs=${acpElapsedMs}` : ''} reason=${code}; stage=fallback transport=hermes_cli error=${delta.error}. Retry or resume the node after checking the Hermes provider/runtime.`,
+            });
+          } else {
+            queue.push(delta);
+          }
+        }
       } catch (err) {
         queue.push({
           type: 'tool_result',
@@ -664,6 +780,8 @@ export class HermesAgentAdapter implements AgentAdapter {
           detail: 'Connecting to the persistent ACP runtime.',
           phase: 'runtime',
           status: 'running',
+          transport: 'hermes_acp',
+          attempt,
           startedAt: new Date().toISOString(),
           agentId: this.opts.agentId,
         });
@@ -674,6 +792,8 @@ export class HermesAgentAdapter implements AgentAdapter {
           label: 'Hermes runtime ready',
           phase: 'runtime',
           status: 'success',
+          transport: 'hermes_acp',
+          attempt,
           completedAt: new Date().toISOString(),
           agentId: this.opts.agentId,
         });
@@ -684,6 +804,8 @@ export class HermesAgentAdapter implements AgentAdapter {
           detail: 'Preparing the conversation and runtime tools.',
           phase: 'runtime',
           status: 'running',
+          transport: 'hermes_acp',
+          attempt,
           startedAt: new Date().toISOString(),
           agentId: this.opts.agentId,
         });
@@ -699,6 +821,8 @@ export class HermesAgentAdapter implements AgentAdapter {
           label: 'Hermes session ready',
           phase: 'runtime',
           status: 'success',
+          transport: 'hermes_acp',
+          attempt,
           completedAt: new Date().toISOString(),
           agentId: this.opts.agentId,
         });
@@ -715,6 +839,8 @@ export class HermesAgentAdapter implements AgentAdapter {
             label: `Selecting ${requestedModel ?? resolvedModelId}`,
             phase: 'runtime',
             status: 'running',
+            transport: 'hermes_acp',
+            attempt,
             startedAt: new Date().toISOString(),
             agentId: this.opts.agentId,
           });
@@ -731,6 +857,8 @@ export class HermesAgentAdapter implements AgentAdapter {
             label: `Using ${requestedModel ?? resolvedModelId}`,
             phase: 'runtime',
             status: 'success',
+            transport: 'hermes_acp',
+            attempt,
             completedAt: new Date().toISOString(),
             agentId: this.opts.agentId,
           });
@@ -747,9 +875,12 @@ export class HermesAgentAdapter implements AgentAdapter {
             : 'The runtime is waiting for its configured provider. Provider silence is allowed.',
           phase: 'waiting',
           status: 'running',
+          transport: 'hermes_acp',
+          attempt,
           startedAt: new Date().toISOString(),
           agentId: this.opts.agentId,
         });
+        waitingStartedAt = Date.now();
 
         firstEventTimer = setTimeout(() => {
           const secs = Math.round(firstEventTimeoutMs / 1000);
@@ -782,6 +913,19 @@ export class HermesAgentAdapter implements AgentAdapter {
               if (!firstEventSeen) {
                 firstEventSeen = true;
                 if (firstEventTimer) clearTimeout(firstEventTimer);
+                queue.push({
+                  type: 'activity',
+                  id: `hermes-wait-${sessionKey}`,
+                  label: 'Hermes responded',
+                  detail: 'The provider produced the first meaningful model or tool event.',
+                  phase: 'waiting',
+                  status: 'success',
+                  transport: 'hermes_acp',
+                  attempt,
+                  completedAt: new Date().toISOString(),
+                  durationMs: waitingStartedAt ? Date.now() - waitingStartedAt : undefined,
+                  agentId: this.opts.agentId,
+                });
               }
               if (!settled) queue.push(delta);
             }
@@ -823,18 +967,27 @@ export class HermesAgentAdapter implements AgentAdapter {
       : DEFAULT_CHAT_TURN_TIMEOUT_MS;
     const idleTimeoutMs = Math.max(30_000, options?.timeoutMs ?? configuredTimeoutMs);
     const requestedModel = normalizeHermesCliModel(options?.preferredModel) ?? normalizeHermesCliModel(this.opts.model);
+    const callerManagedTools = options?.toolMode === 'caller_loop';
     const invocation = this.#buildChatInvocation(
-      appendRuntimeInputAttachments(buildHermesCliPrompt(messages, tools), options?.inputAttachments),
+      appendRuntimeInputAttachments(buildHermesCliPrompt(messages, tools, { callerManagedTools }), options?.inputAttachments),
       requestedModel,
+      { callerManagedTools },
     );
+    const cliStartedAt = Date.now();
+    const cliActivityId = `hermes-cli-${options?.sessionKey ?? 'default'}`;
+    const attempt = runtimeAttemptFromSessionKey(options?.sessionKey);
 
     yield {
       type: 'activity',
-      id: `hermes-cli-${options?.sessionKey ?? 'default'}`,
+      id: cliActivityId,
       label: 'Starting Hermes',
-      detail: 'Compatibility fallback: Hermes exposes only the final answer in this mode, not live reasoning or tool activity.',
+      detail: callerManagedTools
+        ? 'Hermes model-only turn; Agentis owns tool execution and preserves each tool boundary.'
+        : 'Hermes exposes only the final answer in this mode, not live reasoning or tool activity.',
       phase: 'runtime',
       status: 'running',
+      transport: 'hermes_cli',
+      attempt,
       startedAt: new Date().toISOString(),
       agentId: this.opts.agentId,
     };
@@ -851,12 +1004,17 @@ export class HermesAgentAdapter implements AgentAdapter {
         logger: this.opts.logger,
         signal: options?.signal,
         idleTimeoutMs,
-        hardCeilingMs: chatHardCeilingMs(idleTimeoutMs, 'AGENTIS_HERMES_CHAT_HARD_CEILING_MS'),
-        interpret: (event) => {
-          const parsed = event && typeof event === 'object' ? event as Record<string, unknown> : {};
-          const text = extractText(parsed);
-          return text ? { kind: 'final', text } : { kind: 'ignore' };
-        },
+        hardCeilingMs: hermesCliSilenceTimeoutMs(options?.latencyClass),
+        progressVisibility: 'final_only',
+        activityId: cliActivityId,
+        transport: 'hermes_cli',
+        attempt,
+        // Hermes -Q is documented as final-answer-only, but native file edits can
+        // still leak ANSI "review diff" previews to stdout. Those previews are
+        // runtime activity, not the assistant's answer, and previously replaced
+        // the node's structured result.
+        keepRawFallbackLine: isHermesQuietAnswerLine,
+        interpret: interpretHermesQuietEvent,
         formatExitError: (_code, stderr, stdoutErr) => formatHermesExitError(stderr, stdoutErr),
         onEmptyResult: () => {
           this.opts.logger.warn('hermes_agent.chat.empty_result', {
@@ -865,6 +1023,28 @@ export class HermesAgentAdapter implements AgentAdapter {
           });
         },
       })) {
+        if (delta.type === 'done') {
+          const requestedTool = delta.finishReason === 'tool_calls';
+          yield {
+            type: 'activity',
+            id: cliActivityId,
+            label: delta.finishReason === 'stop'
+              ? 'Hermes CLI responded'
+              : requestedTool
+                ? 'Hermes CLI requested an Agentis tool'
+                : 'Hermes CLI stopped',
+            phase: 'runtime',
+            // `tool_calls` is a healthy round boundary. ChatSessionExecutor now
+            // executes the requested Agentis tool and starts the next round; it
+            // must not flash as a runtime failure in the operations trace.
+            status: delta.finishReason === 'stop' || requestedTool ? 'success' : 'error',
+            transport: 'hermes_cli',
+            attempt,
+            completedAt: new Date().toISOString(),
+            durationMs: Date.now() - cliStartedAt,
+            agentId: this.opts.agentId,
+          };
+        }
         if (
           delta.type === 'tool_result'
           && delta.id === 'adapter'
@@ -1111,7 +1291,12 @@ export class HermesAgentAdapter implements AgentAdapter {
     client.dispose();
   }
 
-  #emitProgress(task: NormalizedTask, message: string, timestamp: string): void {
+  #emitProgress(
+    task: NormalizedTask,
+    message: string,
+    timestamp: string,
+    metadata: Omit<Extract<NormalizedAgentEvent, { eventType: 'task.progress' }>, 'eventType' | 'agentId' | 'runId' | 'workflowId' | 'taskId' | 'message' | 'timestamp'> = {},
+  ): void {
     this.#emit({
       eventType: 'task.progress',
       agentId: this.opts.agentId,
@@ -1120,6 +1305,7 @@ export class HermesAgentAdapter implements AgentAdapter {
       taskId: task.taskId,
       message,
       timestamp,
+      ...metadata,
     });
   }
 
@@ -1170,6 +1356,7 @@ function acpUpdateToDelta(update: AcpSessionUpdate, state: HermesAcpTurnState): 
         text: state.thoughtText,
         reasoning: true,
         agentId: state.agentId,
+        transport: 'hermes_acp',
       });
     }
     case 'agent_message_chunk': {
@@ -1207,6 +1394,7 @@ function hermesToolActivity(toolCallId: string, label: string, rawStatus: string
     id: `hermes-${toolCallId}`,
     phase: 'tool',
     status: failed ? 'error' : completed ? 'success' : 'running',
+    transport: 'hermes_acp',
     label: failed ? `Failed ${label}` : completed ? `Used ${label}` : `Using ${label}`,
     ...(completed
       ? { completedAt: new Date().toISOString() }
@@ -1402,9 +1590,13 @@ function prettyToolName(raw: unknown): string {
  * AUTHORITATIVE IDENTITY RULE pins the SYSTEM/operating-manual block as the
  * agent's real identity over any Hermes product/persona defaults.
  */
-function buildHermesCliPrompt(messages: ChatMessage[], tools: ToolDefinition[]): string {
+function buildHermesCliPrompt(
+  messages: ChatMessage[],
+  tools: ToolDefinition[],
+  options: { callerManagedTools?: boolean } = {},
+): string {
   const toolProtocol = tools.length > 0
-    ? buildMarkerToolPrompt(tools, { compact: true })
+    ? buildMarkerToolPrompt(tools, { compact: true, nativeTools: !options.callerManagedTools })
     : [
       'Agentis interactive chat session.',
       'Answer the operator naturally and directly. If the SYSTEM message defines an <agentis_identity> block, treat that as your identity for this turn.',
@@ -1436,6 +1628,18 @@ function formatAcpPrompt(messages: ChatMessage[]): string {
     }
     return `${message.role.toUpperCase()}:\n${content}`;
   }).join('\n\n');
+}
+
+function hermesCliSilenceTimeoutMs(latencyClass: ChatInvocationOptions['latencyClass'] | undefined): number {
+  const interactive = latencyClass === 'interactive';
+  const raw = interactive
+    ? (process.env.AGENTIS_HERMES_INTERACTIVE_CLI_SILENCE_TIMEOUT_MS
+      ?? process.env.AGENTIS_HERMES_CLI_SILENCE_TIMEOUT_MS)
+    : process.env.AGENTIS_HERMES_CLI_SILENCE_TIMEOUT_MS;
+  const fallback = interactive
+    ? DEFAULT_HERMES_INTERACTIVE_CLI_SILENCE_TIMEOUT_MS
+    : DEFAULT_HERMES_CLI_SILENCE_TIMEOUT_MS;
+  return boundedTimeout(raw, fallback, 30 * 60_000, 30_000);
 }
 
 function appendRuntimeInputAttachments(prompt: string, attachments?: RuntimeInputAttachment[]): string {
@@ -1506,6 +1710,31 @@ function extractText(event: HermesJsonEvent): string {
   if (messageText) return messageText;
   const item = objectOf(event.item);
   return firstString(item?.text, item?.content) ?? '';
+}
+
+function isHermesQuietAnswerLine(line: string): boolean {
+  if (/\u001b\[[0-9;?]*[ -/]*[@-~]/.test(line)) return false;
+  if (/^\s*[┊│]?\s*review diff\s*$/i.test(line)) return false;
+  if (/^\s*warning:\s*unknown toolsets?:/i.test(line)) return false;
+  if (/^\s*session_id:\s*\S+/i.test(line)) return false;
+  return true;
+}
+
+function interpretHermesQuietEvent(event: unknown): { kind: 'final'; text: string } | { kind: 'ignore' } {
+  const parsed = event && typeof event === 'object' && !Array.isArray(event)
+    ? event as Record<string, unknown>
+    : null;
+  if (!parsed) return { kind: 'ignore' };
+  const text = extractText(parsed);
+  if (text) return { kind: 'final', text };
+  // In -Q mode a correct workflow agent often prints the requested strict JSON
+  // object directly. The shared CLI reader parses that line before its raw-text
+  // fallback; treating an untyped object as an unknown event used to discard the
+  // entire answer. Typed Hermes lifecycle/tool events remain ignored.
+  if (!('type' in parsed) && Object.keys(parsed).length > 0) {
+    return { kind: 'final', text: JSON.stringify(parsed) };
+  }
+  return { kind: 'ignore' };
 }
 
 function extractToolCall(event: HermesJsonEvent): { tool: string; input: unknown } | null {

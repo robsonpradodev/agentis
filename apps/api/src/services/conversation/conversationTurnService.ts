@@ -48,6 +48,7 @@ interface ConversationTurnServiceDeps {
   bus?: EventBus;
   execute: (turn: ConversationTurnRow, sink: DurableTurnEventSink, signal: AbortSignal) => Promise<DurableTurnExecutionResult>;
   onCancel?: (turn: ConversationTurnRow) => Promise<void> | void;
+  onSettled?: (turn: ConversationTurnRow) => Promise<void> | void;
 }
 
 export interface DurableTurnEventSink {
@@ -292,7 +293,9 @@ export class ConversationTurnService {
     this.#running.get(turnId)?.abort(new Error('operator_cancel'));
     await this.deps.onCancel?.(turn);
     this.appendEvent(turnId, workspaceId, 'done', { finishReason: 'interrupted', status: 'cancelled' });
-    return this.require(workspaceId, turnId);
+    const cancelled = this.require(workspaceId, turnId);
+    await this.deps.onSettled?.(cancelled);
+    return cancelled;
   }
 
   resolveAwaiting(
@@ -429,6 +432,9 @@ export class ConversationTurnService {
       updatedAt: now,
     }).where(eq(schema.conversationTurns.id, turnId)).run();
     if (current) this.appendEvent(turnId, current.workspaceId, 'turn', { type: 'turn_status', status, error });
+    if (current && (status === 'completed' || status === 'failed')) {
+      void this.deps.onSettled?.(this.require(current.workspaceId, turnId));
+    }
     if (current && status !== 'awaiting_approval') {
       const next = this.deps.db.select({ id: schema.conversationTurns.id }).from(schema.conversationTurns).where(and(
         eq(schema.conversationTurns.workspaceId, current.workspaceId),

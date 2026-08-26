@@ -114,7 +114,7 @@ export function registerConversationTools(registry: AgentisToolRegistry, deps: T
       handler: async (args, ctx) => {
         if (!deps.conversation) throw new AgentisError('VALIDATION_FAILED', 'conversation runtime not configured');
         const appId = resolveAppId(args, ctx);
-        const connectionId = resolveConnectionId(args, deps, ctx.workspaceId);
+        const connectionId = resolveConversationConnectionId(args, deps, ctx);
         const sharedFacts = asFacts(args.facts);
         const roster = readRoster(args, sharedFacts);
         const enrollCtx = { workspaceId: ctx.workspaceId, appId, userId: ctx.userId, ambientId: ctx.ambientId ?? null };
@@ -228,14 +228,36 @@ function readRoster(
 }
 
 /** Explicit connectionId, else the single active channel (optionally filtered by kind). */
-function resolveConnectionId(args: Record<string, unknown>, deps: ToolHandlerDeps, workspaceId: string): string {
+export function resolveConversationConnectionId(
+  args: Record<string, unknown>,
+  deps: ToolHandlerDeps,
+  ctx: AgentisToolContext,
+): string {
   const explicit = typeof args.connectionId === 'string' ? args.connectionId.trim() : '';
   if (explicit) return explicit;
   if (!deps.channels) throw new AgentisError('VALIDATION_FAILED', 'no channel bridge configured; pass connectionId');
   const kind = typeof args.kind === 'string' ? args.kind.trim() : '';
   const active = deps.channels
-    .list(workspaceId)
+    .list(ctx.workspaceId)
     .filter((c) => c.status === 'active' && (!kind || c.kind === kind));
+
+  // A channel-originated turn must continue on that exact connection. For an
+  // outbound workflow/tool turn, prefer the channel explicitly bound to the App
+  // and then the executing agent's own channel. Talki legitimately has two live
+  // WhatsApp accounts; treating that as global ambiguity prevented Bia
+  // Outreacher from enrolling contacts even though her own connection is active.
+  const originId = ctx.channelOrigin?.connectionId;
+  if (originId && active.some((connection) => connection.id === originId)) return originId;
+  if (ctx.appId) {
+    const appMatches = active.filter((connection) => connection.appId === ctx.appId);
+    if (appMatches.length === 1) return appMatches[0]!.id;
+  }
+  if (ctx.agentId) {
+    const agentMatches = active.filter((connection) => connection.agentId === ctx.agentId);
+    if (agentMatches.length === 1) return agentMatches[0]!.id;
+  }
+  const defaults = active.filter((connection) => connection.isDefault);
+  if (defaults.length === 1) return defaults[0]!.id;
   if (active.length === 1) return active[0]!.id;
   throw new AgentisError(
     'VALIDATION_FAILED',

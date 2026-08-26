@@ -56,6 +56,13 @@ const envSchema = z.object({
   AGENTIS_EXTENSION_REGISTRY_URL: z.string().url().optional(),
   AGENTIS_EXTENSION_REGISTRY_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
 
+  // AgentisHub is an optional, explicit trust relationship. The open-source
+  // runtime never ships or discovers a private key. Operators configure the
+  // Hub URL plus a JSON key-id -> Ed25519 public-key map. When absent, Hub
+  // import routes report "not configured" and no network request is made.
+  AGENTIS_HUB_URL: z.string().url().optional(),
+  AGENTIS_HUB_PUBLIC_KEYS: z.string().optional(),
+
   // Dashboard static asset serving (V1-SPEC §13). When set, the API server
   // serves the built dashboard from this directory at any non-/v1 path.
   AGENTIS_DASHBOARD_DIST: z.string().optional(),

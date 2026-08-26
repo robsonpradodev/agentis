@@ -21,7 +21,7 @@
  */
 
 import { createHash, randomUUID } from 'node:crypto';
-import { and, eq, inArray, isNull, lte, or } from 'drizzle-orm';
+import { and, asc, eq, gt, inArray, isNull, lte, or } from 'drizzle-orm';
 import {
   CONSTANTS,
   AgentisError,
@@ -157,6 +157,7 @@ import type { AgentToolRuntime } from '../services/agent/agentToolRuntime.js';
 import { AgentToolLoop, type StructuredLlm } from '../services/agent/agentToolLoop.js';
 import type { AgentisToolRegistry } from '../services/agentisToolRegistry.js';
 import { ChatSessionExecutor } from '../services/chat/chatSessionExecutor.js';
+import { isSensitiveFieldName, redactSecretString } from '../services/security/secretRedaction.js';
 import type { AgentSessionService } from '../services/agent/agentSession.js';
 import { estimateTokens } from '../services/agent/agentSession.js';
 import type { AgentSessionRuntime, SessionRunContext, SessionOutcome, SessionYield } from '../services/agent/agentSessionRuntime.js';
@@ -1846,6 +1847,15 @@ export class WorkflowEngine {
     tool?: string;
     toolInput?: unknown;
     toolResult?: unknown;
+    activityId?: string;
+    activityPhase?: string;
+    activityStatus?: 'running' | 'success' | 'error';
+    activityTitle?: string;
+    transport?: string;
+    attempt?: number;
+    startedAt?: string;
+    completedAt?: string;
+    durationMs?: number;
   }): void {
     const ctx = this.#runs.get(args.runId);
     if (!ctx) return;
@@ -1866,6 +1876,15 @@ export class WorkflowEngine {
       nodeId,
       nodeTitle: node?.title,
       activityKind: args.kind,
+      activityId: args.activityId,
+      activityPhase: args.activityPhase,
+      activityStatus: args.activityStatus,
+      activityTitle: args.activityTitle,
+      transport: args.transport,
+      attempt: args.attempt,
+      startedAt: args.startedAt,
+      completedAt: args.completedAt,
+      durationMs: args.durationMs,
       at: new Date().toISOString(),
       ...(args.text ? { message: args.text } : {}),
       ...(args.tool ? { tool: args.tool, args: args.toolInput } : {}),
@@ -1898,15 +1917,94 @@ export class WorkflowEngine {
 
   /** Append to the capped, in-memory replayable activity tail for a run. */
   #appendActivityTail(runId: string, event: string, payload: Record<string, unknown>): void {
+    const safePayload = sanitizeRunActivityPayload(payload);
+    const emittedAt = stringValue(safePayload.at) ?? new Date().toISOString();
+    const activityId = stringValue(safePayload.activityId)
+      ?? runActivityIdentity(event, safePayload, emittedAt);
+    safePayload.activityId = activityId;
     let tail = this.#runActivity.get(runId);
     if (!tail) { tail = []; this.#runActivity.set(runId, tail); }
-    tail.push({ event, payload, emittedAt: new Date().toISOString() });
+    const existing = tail.findIndex((item) => item.activityId === activityId);
+    const envelope = { activityId, event, payload: safePayload, emittedAt };
+    if (existing >= 0) tail[existing] = envelope;
+    else tail.push(envelope);
     if (tail.length > RUN_ACTIVITY_TAIL_CAP) tail.splice(0, tail.length - RUN_ACTIVITY_TAIL_CAP);
+    this.#persistRunActivity(runId, envelope);
   }
 
-  /** Recent activity for a run (back-fill for a surface opened mid-run). */
-  getRunActivity(runId: string): RunActivityEnvelope[] {
-    return this.#runActivity.get(runId) ?? [];
+  #persistRunActivity(runId: string, envelope: RunActivityEnvelope): void {
+    const payload = envelope.payload;
+    const workspaceId = stringValue(payload.workspaceId);
+    if (!workspaceId) return;
+    const now = new Date().toISOString();
+    const values = {
+      id: randomUUID(),
+      workspaceId,
+      runId,
+      nodeId: stringValue(payload.nodeId),
+      agentId: stringValue(payload.agentId),
+      activityId: envelope.activityId,
+      event: envelope.event,
+      kind: stringValue(payload.activityKind) ?? stringValue(payload.kind),
+      phase: stringValue(payload.activityPhase) ?? stringValue(payload.phase),
+      status: stringValue(payload.activityStatus) ?? stringValue(payload.status),
+      title: stringValue(payload.activityTitle) ?? stringValue(payload.nodeTitle) ?? stringValue(payload.title),
+      detail: clipActivityText(stringValue(payload.message) ?? stringValue(payload.detail) ?? stringValue(payload.description)),
+      transport: stringValue(payload.transport),
+      attempt: numberValue(payload.attempt),
+      startedAt: stringValue(payload.startedAt),
+      completedAt: stringValue(payload.completedAt),
+      durationMs: numberValue(payload.durationMs),
+      payload,
+      createdAt: envelope.emittedAt,
+      updatedAt: now,
+    };
+    try {
+      this.deps.db.insert(schema.runActivityEvents).values(values).onConflictDoUpdate({
+        target: [schema.runActivityEvents.runId, schema.runActivityEvents.activityId],
+        set: {
+          event: values.event,
+          kind: values.kind,
+          phase: values.phase,
+          status: values.status,
+          title: values.title,
+          detail: values.detail,
+          transport: values.transport,
+          attempt: values.attempt,
+          startedAt: values.startedAt,
+          completedAt: values.completedAt,
+          durationMs: values.durationMs,
+          payload: values.payload,
+          updatedAt: now,
+        },
+      }).run();
+    } catch (err) {
+      // Synthetic test runs have no workflow_runs parent. Activity must never
+      // interfere with execution, but real persisted runs remain durable.
+      this.deps.logger.debug?.('engine.run_activity.persist_skipped', { runId, error: (err as Error).message });
+    }
+  }
+
+  /** Durable recent activity for a run, with the in-memory tail as a test fallback. */
+  getRunActivity(runId: string, options: { limit?: number; cursor?: string } = {}): RunActivityEnvelope[] {
+    const limit = Math.max(1, Math.min(options.limit ?? RUN_ACTIVITY_TAIL_CAP, RUN_ACTIVITY_TAIL_CAP));
+    try {
+      const filters = [eq(schema.runActivityEvents.runId, runId)];
+      if (options.cursor) filters.push(gt(schema.runActivityEvents.createdAt, options.cursor));
+      const rows = this.deps.db.select().from(schema.runActivityEvents)
+        .where(and(...filters)).orderBy(asc(schema.runActivityEvents.createdAt)).limit(limit).all();
+      if (rows.length > 0) return rows.map((row) => ({
+        activityId: row.activityId,
+        event: row.event,
+        payload: recordValue(row.payload),
+        emittedAt: row.createdAt,
+      }));
+    } catch {
+      // Migration-less unit fixtures keep using the bounded in-memory tail.
+    }
+    return (this.#runActivity.get(runId) ?? [])
+      .filter((item) => !options.cursor || item.emittedAt > options.cursor)
+      .slice(0, limit);
   }
 
   /**
@@ -2612,6 +2710,8 @@ export class WorkflowEngine {
     const dispatchCounts = this.#nodeDispatchCounts(ctx);
     const dispatchCount = (dispatchCounts.get(node.id) ?? 0) + 1;
     dispatchCounts.set(node.id, dispatchCount);
+    const dispatchState = ctx.state.nodeStates[node.id];
+    if (dispatchState) dispatchState.attempt = dispatchCount;
     const ceiling = nodeDispatchCeiling();
     if (dispatchCount > ceiling) {
       const ns = ctx.state.nodeStates[node.id];
@@ -3356,16 +3456,18 @@ export class WorkflowEngine {
     // it (idempotent, like dispatch) and give it a REAL Agentis tool loop so it
     // wields its native tools AND the Agentis platform surface (search/brain/app/
     // data/cooperation/channels) mid-task, then completes the node with its result.
-    // Anything it can't run falls back to dispatch; mcp_native harnesses keep their
-    // own MCP loop.
+    // Chat-capable native and marker harnesses both enter the shared executor. The
+    // caller-owned loop preserves the Agentis catalog when transport recovery is
+    // required, while the adapter still supplies its native reasoning runtime.
     if (config.agentId) {
       if (!this.deps.adapters.get(config.agentId)) {
         const pin = stringValue(config.modelOverride) ?? this.#agentConfiguredModel(config.agentId);
         const runtime = this.deps.resolveAgentRuntime?.(ctx.workspaceId, config.agentId, config.prompt, pin);
         if (runtime) this.deps.adapters.register(config.agentId, runtime);
       }
-      const fwd = this.deps.adapters.get(config.agentId)?.adapter.capabilities?.().toolForwarding;
-      if (fwd === 'marker_protocol'
+      const adapter = this.deps.adapters.get(config.agentId)?.adapter;
+      const capabilities = adapter?.capabilities?.();
+      if (adapter?.chat && capabilities?.interactiveChat
         && await this.#runHarnessChatToolLoop(ctx, node, config, config.agentId, inputData)) {
         return true;
       }
@@ -3384,10 +3486,10 @@ export class WorkflowEngine {
     // runs its OWN superior tool loop via dispatch. The in-engine loop exists to fix
     // the single-completion *inherited* runtime (the toolless default) — never to
     // downgrade an agent deliberately bound to a powerful coding harness.
-    const boundForwarding = agentId
-      ? this.deps.adapters.get(agentId)?.adapter.capabilities?.().toolForwarding
-      : undefined;
-    if (boundForwarding === 'mcp_native' || boundForwarding === 'marker_protocol') return false;
+    const boundAdapter = agentId ? this.deps.adapters.get(agentId)?.adapter : undefined;
+    if (agentId && boundAdapter?.chat && boundAdapter.capabilities?.().interactiveChat) {
+        return this.#runHarnessChatToolLoop(ctx, node, config, agentId, inputData);
+    }
 
     const def = this.#specialistDef(ctx, role);
     // A workflow agent gets its FULL Agentis-native toolbox, not a starved subset:
@@ -3523,6 +3625,8 @@ export class WorkflowEngine {
       'You are executing a workflow step. Use your OWN native tools AND the Agentis platform tools below — search, browser, the workspace/app/agent brain, app data, cooperation, and channels — whichever the task needs. Work autonomously; do not ask the operator to confirm. Finish with your result as your final message.',
     ].filter(Boolean).join('\n\n');
     const appId = this.deps.resolveAppIdForWorkflow?.(ctx.workspaceId, ctx.workflowId);
+    const attempt = ctx.state.nodeStates[node.id]?.attempt ?? this.#nodeDispatchCounts(ctx).get(node.id) ?? 1;
+    const sessionKey = `agent-task:${ctx.runId}:${node.id}:attempt:${attempt}`;
     const clip = (s: string, n: number) => (s.length > n ? `${s.slice(0, n)}…` : s);
 
     ctx.state.activeExecutions[node.id] = {
@@ -3535,13 +3639,16 @@ export class WorkflowEngine {
     await this.#persistRun(ctx).catch(() => {});
     this.#emitWorkStep(ctx, node, 'thinking', 'Running on its full-power runtime with the Agentis toolset');
     let text = '';
+    let finishReason: Extract<ChatDelta, { type: 'done' }>['finishReason'] | undefined;
+    let adapterFailure: string | undefined;
+    const executionStartedAt = Date.now();
     try {
       for await (const delta of ChatSessionExecutor.turn(adapter, [], brief, {
         workspaceId: ctx.workspaceId,
         agentId,
         userId: ctx.userId,
-        conversationId: `agent-task:${ctx.runId}:${node.id}`,
-        clientTurnId: `agent-task:${ctx.runId}:${node.id}`,
+        conversationId: sessionKey,
+        clientTurnId: sessionKey,
         executionMode: 'chat',
         permissionMode: 'auto',
         runId: ctx.runId,
@@ -3567,9 +3674,20 @@ export class WorkflowEngine {
         // explicit operator step budget when set; otherwise stay generous.
         maxToolCalls: config.maxToolSteps && config.maxToolSteps > 24 ? config.maxToolSteps : 2000,
         systemAddendum,
+        sessionKey,
+        // `agent_task` must be able to recover from a stalled native runtime
+        // without losing the Agentis tool surface.
+        toolMode: 'caller_loop',
+        transportRecovery: 'capability_preserving',
+        // AdapterManager already validated this bound runtime. Re-running a
+        // Hermes/Python `--version` process here cost ~9s before every fresh
+        // agent_task while the real invocation has precise spawn/provider errors.
+        skipRuntimePreflight: true,
       })) {
         if (ctx.abortController?.signal.aborted || ctx.state.status === 'CANCELLED') break;
         if (delta.type === 'text') text += delta.delta;
+        if (delta.type === 'tool_result' && delta.error) adapterFailure = delta.error;
+        if (delta.type === 'done') finishReason = delta.finishReason;
         this.#selfHeal.relayChatDelta(ctx, node, agentId, delta, clip);
       }
     } catch (err) {
@@ -3580,9 +3698,32 @@ export class WorkflowEngine {
     }
     if (ctx.abortController?.signal.aborted || ctx.state.status === 'CANCELLED') return true;
 
+    // A workflow node may complete only after the shared executor reports a
+    // clean terminal stop. Runtime error prose, turn-limit guidance, and an
+    // unconsumed tool-call boundary are diagnostics—not business output. The
+    // previous behavior appended that prose to `text` and could falsely mark an
+    // unfinished agent_task successful.
+    if (finishReason !== 'stop') {
+      const elapsedMs = Date.now() - executionStartedAt;
+      const transport = adapter.adapterType || 'unknown runtime';
+      const stage = finishReason ?? 'stream ended without a terminal event';
+      const detail = adapterFailure ? ` ${adapterFailure}` : '';
+      await this.#pauseNodeBlocked(
+        ctx,
+        node.id,
+        `Agent task runtime did not produce a completed result (runtime=${transport}, stage=${stage}, elapsedMs=${elapsedMs}, attempt=${attempt}, session=${sessionKey}).${detail} Retry or resume the run; the next attempt uses a fresh isolated runtime session.`,
+      );
+      return true;
+    }
+
     const trimmed = text.trim();
     if (!trimmed) {
-      await this.#failNode(ctx, node.id, 'agent produced no output');
+      const elapsedMs = Date.now() - executionStartedAt;
+      await this.#pauseNodeBlocked(
+        ctx,
+        node.id,
+        `Agent task runtime stopped without a result (runtime=${adapter.adapterType}, stage=empty_result, elapsedMs=${elapsedMs}, attempt=${attempt}, session=${sessionKey}). Retry or resume the run; the next attempt uses a fresh isolated runtime session.`,
+      );
       return true;
     }
     const structured = parseGeneric(trimmed);
@@ -4528,9 +4669,18 @@ export class WorkflowEngine {
       }
       if (!this.#isSoftPinnedSpecialist(args.explicitAgentId)) {
         this.#assertAgentSatisfiesRequirements(args.explicitAgentId, args.requires, args.label);
+        const agentName = this.#agentName(args.explicitAgentId) ?? args.explicitAgentId;
         throw new AgentisError(
           'WORKFLOW_GRAPH_INVALID',
-          `${args.label}: pinned agent ${args.explicitAgentId} has no connected runtime`,
+          `${args.label}: agent "${agentName}" is offline. Reconnect its runtime or choose an online agent before running.`,
+          {
+            remediation: 'Reconnect the assigned agent runtime or bind this node to an online compatible agent.',
+            details: {
+              failureClass: 'configuration_capability',
+              code: 'AGENT_RUNTIME_UNAVAILABLE',
+              agentId: args.explicitAgentId,
+            },
+          },
         );
       }
     }
@@ -4636,7 +4786,19 @@ export class WorkflowEngine {
       }
 
       const registration = this.deps.adapters.get(agentId);
-      const canUseManagedSession = Boolean(this.deps.sessions && this.deps.sessionRuntime?.canRun(workspaceId));
+      if (registration?.adapter.prepare) {
+        void registration.adapter.prepare().catch((error) => {
+          this.deps.logger.warn('engine.agent_task.prewarm_failed', {
+            agentId,
+            nodeId: node.id,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
+      }
+      const sessionEligible = config.kind === 'agent_session'
+        || (config.useSession !== false && config.useRoleTools !== false);
+      const canUseManagedSession = sessionEligible
+        && Boolean(this.deps.sessions && this.deps.sessionRuntime?.canRun(workspaceId));
       if (!registration && !canUseManagedSession) {
         // Auto-authored specialists are intentionally soft pins: let the normal
         // role/capability resolver choose a connected runtime when their own
@@ -4644,7 +4806,16 @@ export class WorkflowEngine {
         if (this.#isSoftPinnedSpecialist(agentId)) continue;
         throw new AgentisError(
           'WORKFLOW_GRAPH_INVALID',
-          `${node.title || node.id}: assigned specialist "${row.name}" has no executable runtime. Connect an available runtime or configure a workspace model before running.`,
+          `${node.title || node.id}: agent "${row.name}" is offline. Reconnect its runtime or choose an online agent before running.`,
+          {
+            remediation: 'Reconnect the assigned agent runtime or bind this node to an online compatible agent.',
+            details: {
+              failureClass: 'configuration_capability',
+              code: 'AGENT_RUNTIME_UNAVAILABLE',
+              agentId,
+              nodeId: node.id,
+            },
+          },
         );
       }
       if (registration && hasAgentRequirements(config.requires)
@@ -6702,6 +6873,12 @@ export class WorkflowEngine {
     // P1.2: debug/test runs surface the raw agent failure — no fallback recovery.
     if (this.#debugRuns.has(ctx.runId)) return null;
     if (node.config.kind !== 'agent_task' && node.config.kind !== 'agent_session') return null;
+    // Infrastructure/setup failures need the resource repaired or resumed. A
+    // structured-completion fallback cannot reproduce native tool side effects
+    // and must never fabricate success (provider_ack, sent_count, deployment id,
+    // etc.) after a timed-out or disconnected executor.
+    const failureClass = classifyWorkflowFailure(reason).category;
+    if (failureClass === 'transient_resource' || failureClass === 'configuration_capability') return null;
     if (!ctx.nodeFallbackAttempted) ctx.nodeFallbackAttempted = new Set();
     if (ctx.nodeFallbackAttempted.has(node.id)) return null;
     ctx.nodeFallbackAttempted.add(node.id);
@@ -6767,8 +6944,9 @@ export class WorkflowEngine {
     if (!runtime) return null;
     const config = node.config as AgentTaskNodeConfig;
     const system = 'You reshape one automated step\'s output to a strict JSON contract. '
-      + 'Map the SOURCE object\'s EXISTING data onto the required keys — same data, correct shape/names. '
-      + 'Do NOT invent data absent from SOURCE; if a required field is genuinely not present, use its empty default ([], false, 0, "", {}). '
+      + 'Map and EXTRACT the SOURCE object\'s EXISTING evidence onto the required keys — same facts, correct shape/names. '
+      + 'Concrete prose is evidence: for example, an explicitly delivered message entails its stated provider acknowledgement and count; an explicitly absent duplicate entails duplicate count zero. '
+      + 'Never invent facts that SOURCE does not state or logically entail; only then use the field\'s empty default ([], false, 0, "", {}). '
       + 'Respond with ONE strict JSON object and nothing else — no prose, no code fences.';
     const user = `SOURCE (the step's actual output):\n${safeJson(output)}\n\nMissing required keys: ${missingKeys.join(', ')}${buildNodeProcessBriefing(ctx.graph, node, config)}`;
     try {
@@ -7307,6 +7485,18 @@ export class WorkflowEngine {
           if (re.missingKeys.length < normalization.missingKeys.length) { normalization = re; normalizedOutput = re.output; }
         }
       }
+      // A prose transcript (or runtime/tool noise) that satisfies NONE of a
+      // multi-field contract is not a partially useful structured result. Filling
+      // every field with false/0/"" previously turned real side effects into a
+      // mechanically completed node and made the final verifier contradict the
+      // outside world. Partial omissions remain adaptable; total contract loss is
+      // an honest node failure with the original evidence preserved for diagnosis.
+      if (
+        isEvidenceBearingOutputContract(normalization.declaredKeys)
+        && normalization.missingKeys.length === normalization.declaredKeys.length
+      ) {
+        throw new Error(`OUTPUT_CONTRACT_UNSATISFIED: ${missingDeclaredOutputMessage(completedNode, normalization.missingKeys)}; the runtime returned no declared fields.`);
+      }
       // 2. TYPED-EMPTY DEFAULTS — complete any keys STILL absent. Keeps the
       //    adaptation HONEST + VISIBLE: the run is COMPLETED_WITH_CONTRACT_VIOLATION
       //    (a deviation records the defaulted keys), downstream reads get typed
@@ -7650,6 +7840,11 @@ export class WorkflowEngine {
         inflightDispatches: 0,
         swarms: new Map(),
         selfHealAttempts: hydrateSelfHealAttempts(state),
+        nodeDispatchCounts: new Map(
+          Object.values(state.nodeStates)
+            .filter((nodeState): nodeState is NonNullable<typeof nodeState> => Boolean(nodeState))
+            .map((nodeState) => [nodeState.nodeId, nodeState.attempt ?? 0]),
+        ),
         abortController: new AbortController(),
       };
     } catch (err) {
@@ -9481,7 +9676,7 @@ function isResourceFailure(error: string): boolean {
     || /usage limit|hit your usage limit|quota (?:exceeded|exhausted)|out of quota/.test(e)
     || /login wall|captcha required|\b403\b|access denied|401 unauthorized|permission denied/.test(e)
     || /\b(502|503|504)\b|service unavailable|temporarily unavailable|bad gateway|gateway timeout/.test(e)
-    || /econnreset|etimedout|enotfound|socket hang up/.test(e);
+    || /econnreset|etimedout|timed out|timeout|appears stuck|went quiet|enotfound|socket hang up/.test(e);
 }
 
 /**
@@ -9511,9 +9706,52 @@ function resourceBlockerReason(error: string): string {
 
 /** A replayable activity item — a RealtimeEnvelope kept in the per-run tail. */
 interface RunActivityEnvelope {
+  activityId: string;
   event: string;
   payload: Record<string, unknown>;
   emittedAt: string;
+}
+
+function sanitizeRunActivityPayload(payload: Record<string, unknown>): Record<string, unknown> {
+  const safe: Record<string, unknown> = {};
+  const blocked = new Set(['args', 'input', 'result', 'toolInput', 'toolResult', 'output', 'payload']);
+  for (const [key, value] of Object.entries(payload)) {
+    if (blocked.has(key) || isSensitiveFieldName(key)) continue;
+    if (typeof value === 'string') safe[key] = clipActivityText(redactSecretString(value));
+    else if (value == null || typeof value === 'number' || typeof value === 'boolean') safe[key] = value;
+    else if (Array.isArray(value)) safe[key] = value.slice(0, 20).map((item) => typeof item === 'string' ? clipActivityText(redactSecretString(item)) : '[redacted]');
+    else safe[key] = '[redacted]';
+  }
+  return safe;
+}
+
+function clipActivityText(value: string | null | undefined): string | null {
+  if (!value) return null;
+  return value.length > 4000 ? `${value.slice(0, 3999)}…` : value;
+}
+
+function runActivityIdentity(event: string, payload: Record<string, unknown>, emittedAt: string): string {
+  const stable = [
+    event,
+    stringValue(payload.nodeId),
+    stringValue(payload.agentId),
+    stringValue(payload.activityKind),
+    stringValue(payload.activityPhase),
+    stringValue(payload.phase),
+  ].filter(Boolean).join(':');
+  // Lifecycle/status events replace their prior projection. Free-form messages
+  // remain discrete so meaningful commentary is not overwritten.
+  return stringValue(payload.message) || stringValue(payload.description)
+    ? `${stable}:${emittedAt}`
+    : stable || `${event}:${emittedAt}`;
+}
+
+function numberValue(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function recordValue(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }
 /** Max items kept in a run's in-memory activity tail. */
 const RUN_ACTIVITY_TAIL_CAP = 400;
@@ -10253,6 +10491,14 @@ function normalizeDeclaredNodeOutputResult(node: WorkflowNode, output: Record<st
 
 function missingDeclaredOutputMessage(node: WorkflowNode, missing: string[]): string {
   return `agent node '${node.id}' did not produce declared output key(s): ${missing.join(', ')}`;
+}
+
+function isEvidenceBearingOutputContract(keys: string[]): boolean {
+  const normalized = new Set(keys.map(normalizeOutputKey));
+  const has = (...candidates: string[]) => candidates.some((key) => normalized.has(normalizeOutputKey(key)));
+  if (has('provider_ack', 'delivery_receipt', 'provider_message_id', 'message_id')) return true;
+  if (has('sent_count') && has('status', 'failed_count', 'verified')) return true;
+  return has('verified') && has('duplicates', 'missing_acks');
 }
 
 /**

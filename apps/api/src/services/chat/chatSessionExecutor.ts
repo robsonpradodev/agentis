@@ -125,6 +125,13 @@ export interface ChatTurnOptions {
   qualityMode?: 'quick' | 'deep' | 'mission';
   /** Override the runtime-native session lane (used by non-blocking companion turns). */
   sessionKey?: string;
+  /** Force Agentis to retain ownership of tool execution for this turn. */
+  toolMode?: 'adapter_native' | 'caller_loop';
+  /** Allow adapters to change transport only when the caller-owned tool surface is preserved. */
+  transportRecovery?: 'none' | 'capability_preserving';
+  /** Skip the redundant CLI `--version` probe when the caller already owns a
+   * connected adapter registration and the real invocation is self-diagnosing. */
+  skipRuntimePreflight?: boolean;
   /**
    * Drain messages that arrived while this turn was executing. They join the
    * next model round after a tool boundary without cancelling completed work.
@@ -609,6 +616,7 @@ export class ChatSessionExecutor {
     if (
       adapter === agentAdapter
       && (agentForwarding === 'marker_protocol' || agentForwarding === 'mcp_native')
+      && !options.skipRuntimePreflight
     ) {
       const health = await this.#preflightHealth(adapter, ctx.agentId);
       if (health && !health.isHealthy) {
@@ -861,7 +869,10 @@ export class ChatSessionExecutor {
       agentRole?: string | null;
       agentDomain?: string | null;
     };
-    const baseSystemPrompt = lightweightConversation
+    const channelScopedWorker = Boolean(ctx.channelOrigin)
+      && !/(?:orchestrat|manager)/i.test(promptMeta.agentRole ?? '');
+    const compactConversationPrompt = lightweightConversation || channelScopedWorker;
+    const baseSystemPrompt = compactConversationPrompt
       ? buildLightweightConversationSystemPrompt({
         context: { ...ctx, viewport },
         workspaceName: promptMeta.workspaceName,
@@ -896,7 +907,7 @@ export class ChatSessionExecutor {
     let operatingManualBlock: string | null = null;
     try {
       const db = this.#deps.db;
-      if (db && ctx.workspaceId) {
+      if (db && ctx.workspaceId && !channelScopedWorker) {
         const role = ctx.agentId
           ? (db.select({ role: schema.agents.role }).from(schema.agents).where(eq(schema.agents.id, ctx.agentId)).get()?.role ?? null)
           : null;
@@ -911,7 +922,7 @@ export class ChatSessionExecutor {
     // both are never injected at once. Best-effort — never blocks a turn.
     let commandBriefingBlock: string | null = null;
     let capabilityManifestBlock: string | null = null;
-    if (!lightweightConversation) {
+    if (!lightweightConversation && !channelScopedWorker) {
       try {
         if (this.#deps.commandModel && ctx.agentId) {
           commandBriefingBlock = this.#deps.commandModel.briefingBlock(ctx.workspaceId, ctx.agentId) || null;
@@ -929,7 +940,7 @@ export class ChatSessionExecutor {
     // is actually connected. This is the block that stops an agent assuming it has no
     // integrations/MCP when the workspace has them mounted. Best-effort.
     let mountedConnectionsBlock: string | null = null;
-    if (!lightweightConversation && this.#deps.capabilityIndex) {
+    if (!lightweightConversation && !channelScopedWorker && this.#deps.capabilityIndex) {
       try {
         mountedConnectionsBlock = (await this.#deps.capabilityIndex.mountedConnectionsBlock(ctx.workspaceId)) || null;
       } catch (err) {
@@ -965,6 +976,8 @@ export class ChatSessionExecutor {
       sessionKey: options.sessionKey ?? cliSessionKey(ctx.conversationId, capabilities?.toolForwarding, identityChecksum),
       liveInput: options.liveInput,
       inputAttachments: options.inputAttachments,
+      toolMode: options.toolMode,
+      transportRecovery: options.transportRecovery,
       // The agent's own harness should answer on the model the operator picked in
       // the UI — not whatever default the harness happens to boot with.
       preferredModel: adapter === agentAdapter && 'agentRuntimeModel' in promptCtx ? promptCtx.agentRuntimeModel : null,
@@ -1105,6 +1118,8 @@ export class ChatSessionExecutor {
       qualityMode?: 'quick' | 'deep' | 'mission';
       liveInput?: () => ChatMessage[] | Promise<ChatMessage[]>;
       inputAttachments?: RuntimeInputAttachment[];
+      toolMode?: 'adapter_native' | 'caller_loop';
+      transportRecovery?: 'none' | 'capability_preserving';
     },
   ): AsyncIterable<ChatDelta> {
     let toolCallCount = options.toolCallCount;
@@ -1163,7 +1178,12 @@ export class ChatSessionExecutor {
     // / no-progress — NOT on a wall clock. `absoluteMaxRounds()` is only a
     // defensive ceiling the monitor should always beat to the punch.
     const monitor = new ChatProgressMonitor();
-    const maxRounds = absoluteMaxRounds();
+    // `maxTurns` is the caller/node's explicit model-round contract. It used to
+    // be carried through confirmations but ignored by the loop in favour of the
+    // global 2000-round emergency ceiling, letting agent_task models wander for
+    // minutes or hours while still technically making novel calls. Keep the
+    // progress monitor, but honor the configured local budget as the hard backstop.
+    const maxRounds = Math.min(options.maxTurns, absoluteMaxRounds());
     // IPI taint: set once a tool round ingests content carrying prompt-injection
     // signals. While tainted, high-impact tools are force-confirmed even in
     // `auto` mode — so injected content cannot silently trigger a dangerous
@@ -1203,15 +1223,20 @@ export class ChatSessionExecutor {
           ? await adapter.getRuntimeContext().then((runtime) => runtime.currentEffort).catch(() => undefined)
           : undefined;
         const missionEffort = qualityMode === 'mission' ? reasoningFloor(configuredEffort, 'high') : undefined;
+        const selectedToolMode = options.toolMode
+          ?? (adapterMcpNative
+            ? (options.lightweightConversation ? 'caller_loop' : 'adapter_native')
+            : undefined);
         const chatOptions: ChatInvocationOptions = {
           latencyClass: qualityMode === 'quick' ? 'interactive' : 'deliberate',
           ...(missionEffort ? { reasoningEffort: missionEffort, fastMode: false } : {}),
           timeoutMs: modelRoundTimeoutMs,
           sessionKey: options.sessionKey ?? ctx.conversationId,
           ...(ctx.turnLease ? { conversationId: ctx.conversationId, turnLease: ctx.turnLease } : {}),
+          ...(selectedToolMode ? { toolMode: selectedToolMode } : {}),
+          ...(options.transportRecovery ? { transportRecovery: options.transportRecovery } : {}),
           ...(adapterMcpNative
             ? {
-                toolMode: options.lightweightConversation ? 'caller_loop' : 'adapter_native',
                 // Real (registry-level) permission enforcement for the harness's own
                 // tool loop: the adapter turns this into an execution-mode header on
                 // the per-turn MCP descriptor. `plan` hard-blocks mutations; `ask`
@@ -2564,6 +2589,31 @@ function confirmationImpact(toolName: string, args: unknown, fallbackDescription
       ],
       riskLevel: 'medium',
       reversible: true,
+      externalSideEffects: false,
+    };
+  }
+
+  if (toolName === 'agentis.knowledge.delete') {
+    const documentIds = Array.isArray(record.documentIds) ? record.documentIds.map(String) : [];
+    return {
+      summary: `Permanently delete ${documentIds.length} knowledge document${documentIds.length === 1 ? '' : 's'}`,
+      details: [
+        `Knowledge base ID: ${stringFrom(record.knowledgeBaseId) ?? 'Unknown'}`,
+        ...documentIds.slice(0, 20).map((id) => `Document ID: ${id}`),
+        ...(documentIds.length > 20 ? [`And ${documentIds.length - 20} more documents`] : []),
+      ],
+      riskLevel: 'high',
+      reversible: false,
+      externalSideEffects: false,
+    };
+  }
+
+  if (toolName === 'agentis.knowledge_base.delete') {
+    return {
+      summary: 'Permanently delete an entire knowledge base',
+      details: [`Knowledge base ID: ${stringFrom(record.knowledgeBaseId) ?? 'Unknown'}`],
+      riskLevel: 'high',
+      reversible: false,
       externalSideEffects: false,
     };
   }

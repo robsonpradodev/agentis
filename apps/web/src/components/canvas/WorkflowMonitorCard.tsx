@@ -129,6 +129,7 @@ export function WorkflowMonitorCard({
   const [analyticsError, setAnalyticsError] = useState<string | null>(null);
   const [offset, setOffset] = useState({ x: 0, y: 0 });
   const [width, setWidth] = useState(DEFAULT_WIDTH);
+  const [clock, setClock] = useState(() => Date.now());
   const previousRunId = useRef<string | null>(activeRunId);
   const dragRef = useRef<{
     pointerId: number;
@@ -145,6 +146,12 @@ export function WorkflowMonitorCard({
     handle: HTMLElement;
   } | null>(null);
   const monitorRunId = activeRunId ?? trackedRunId;
+
+  useEffect(() => {
+    if (status !== 'running' && status !== 'waiting') return;
+    const timer = window.setInterval(() => setClock(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [status]);
 
   const workflowApprovals = useMemo(
     () => {
@@ -273,10 +280,10 @@ export function WorkflowMonitorCard({
   }, [loadAnalytics]);
 
   useEffect(() => {
-    if (!activeRunId) return;
+    if (!monitorRunId) return;
     let cancelled = false;
     void api<{ activity: Array<{ event: string; payload: Record<string, unknown>; emittedAt: string }> }>(
-      `/v1/runs/${activeRunId}/activity`,
+      `/v1/runs/${monitorRunId}/activity`,
     )
       .then((res) => {
         if (cancelled) return;
@@ -289,13 +296,13 @@ export function WorkflowMonitorCard({
             );
           })
           .filter((activity): activity is RealtimeActivity => (
-            Boolean(activity) && matchesWorkflowActivity(activity!, workflowId, activeRunId)
+            Boolean(activity) && matchesWorkflowActivity(activity!, workflowId, monitorRunId)
           ));
         setFeed(dedupeActivities(historical).reverse());
       })
       .catch(() => {  });
     return () => { cancelled = true; };
-  }, [activeRunId, nodeTitles, workflowId]);
+  }, [monitorRunId, nodeTitles, workflowId]);
 
 
   const selfHealIncident = useMemo(
@@ -795,7 +802,11 @@ export function WorkflowMonitorCard({
             </div>
           ) : (
             <div className="space-y-2">
-              {visibleFeed.map((item) => (
+              {visibleFeed.map((item, index) => {
+                const repeatedNode = Boolean(item.nodeId && visibleFeed[index - 1]?.nodeId === item.nodeId);
+                const badge = activityBadge(item, clock);
+                const elapsed = activityElapsed(item, clock);
+                return (
                 <button
                   key={activityKey(item)}
                   type="button"
@@ -810,8 +821,14 @@ export function WorkflowMonitorCard({
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center gap-1.5">
                       <span className="min-w-0 flex-1 truncate text-[12px] text-text-secondary">
-                        {item.nodeTitle ?? item.title}
+                        {repeatedNode ? item.title : item.nodeTitle ?? item.title}
                       </span>
+                      {badge && (
+                        <span className="shrink-0 rounded border border-border-subtle px-1 py-0.5 text-[9px] uppercase tracking-wide text-text-muted">
+                          {badge}
+                        </span>
+                      )}
+                      {elapsed && <span className="shrink-0 text-[9px] tabular-nums text-text-muted">{elapsed}</span>}
                       {item.nodeId && (
                         <Crosshair size={11} className="shrink-0 text-text-muted opacity-0 transition-opacity group-hover:opacity-100" />
                       )}
@@ -823,7 +840,8 @@ export function WorkflowMonitorCard({
                     )}
                   </div>
                 </button>
-              ))}
+                );
+              })}
             </div>
           ))}
 
@@ -848,13 +866,16 @@ export function WorkflowMonitorCard({
             </button>
           )}
           {tab === 'health' && (
-            <HealthDetails
-              health={health}
-              checking={healthChecking}
-              error={healthError}
-              onFocusNode={onFocusNode}
-              onRefresh={() => void loadHealth()}
-            />
+            <div className="space-y-3">
+              <HealthDetails
+                health={health}
+                checking={healthChecking}
+                error={healthError}
+                onFocusNode={onFocusNode}
+                onRefresh={() => void loadHealth()}
+              />
+              <RuntimeDiagnostics activity={feed} />
+            </div>
           )}
           {tab === 'analytics' && (
             <AnalyticsDetails
@@ -927,6 +948,33 @@ function HealthStrip({
       <span className="min-w-0 flex-1 truncate text-[11px] font-medium text-text-secondary">{label}</span>
       {health && !checking && <span className="font-mono text-[10px] text-text-muted">{health.durationMs}ms</span>}
     </button>
+  );
+}
+
+function RuntimeDiagnostics({ activity }: { activity: RealtimeActivity[] }) {
+  const diagnostics = activity.filter((item) => (
+    Boolean(item.transport)
+    || typeof item.durationMs === 'number'
+    || item.activityKind === 'fallback'
+  )).slice(0, 6);
+  if (diagnostics.length === 0) return null;
+  return (
+    <div className="border-t border-white/10 pt-2">
+      <div className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide text-text-muted">Runtime diagnostics</div>
+      <div className="space-y-1.5">
+        {diagnostics.map((item) => (
+          <div key={`diagnostic-${activityKey(item)}`} className="rounded-md bg-surface/45 px-2 py-1.5 text-[10px] text-text-muted">
+            <div className="flex gap-2">
+              <span className="min-w-0 flex-1 truncate text-text-secondary">{item.title}</span>
+              {item.transport && <span>{item.transport.replace('_', ' ')}</span>}
+              {typeof item.attempt === 'number' && <span>attempt {item.attempt}</span>}
+              {typeof item.durationMs === 'number' && <span>{formatActivityDuration(item.durationMs)}</span>}
+            </div>
+            {item.detail && <div className="mt-0.5 line-clamp-2">{item.detail}</div>}
+          </div>
+        ))}
+      </div>
+    </div>
   );
 }
 
@@ -1273,6 +1321,23 @@ function dedupeActivities(activities: RealtimeActivity[]): RealtimeActivity[] {
 }
 
 function activityKey(activity: RealtimeActivity): string {
+  // Runs created before stable typed activity IDs shipped persisted the CLI
+  // final-only heartbeat as a fresh generic work-step every 15 seconds. Collapse
+  // those historical rows too, even though each one now has a generated durable
+  // ID, so reopening an old run does not resurrect the original spam.
+  if (
+    /^Waiting for .+ to respond — .+ no output yet$/i.test(activity.detail.trim())
+    || /^Hermes is running — .+ elapsed; final-answer-only mode$/i.test(activity.detail.trim())
+  ) {
+    return [
+      activity.runId ?? activity.workflowId ?? 'activity',
+      activity.nodeId ?? 'node',
+      activity.agentId ?? activity.agentName ?? 'agent',
+      'provider-wait',
+    ].join(':');
+  }
+  const durableId = typeof activity.raw.activityId === 'string' ? activity.raw.activityId : null;
+  if (durableId) return `${activity.runId ?? activity.workflowId ?? 'activity'}:${durableId}`;
   if (
     activity.event === REALTIME_EVENTS.AGENT_TERMINAL_MESSAGE
     || activity.event === REALTIME_EVENTS.AGENT_TERMINAL_TOOL_CALL
@@ -1301,6 +1366,34 @@ function activityKey(activity: RealtimeActivity): string {
     activity.agentId ?? activity.agentName ?? activity.title,
     activity.detail,
   ].join(':');
+}
+
+function activityBadge(activity: RealtimeActivity, now: number): string | null {
+  if (activity.transport === 'hermes_acp') {
+    if (activity.phase !== 'waiting') return 'Hermes ACP';
+    const started = activity.startedAt ? Date.parse(activity.startedAt) : Number.NaN;
+    return Number.isFinite(started) && activity.status === 'running' && now - started >= 15_000
+      ? 'Hermes ACP · watchdog'
+      : 'Hermes ACP · waiting';
+  }
+  if (activity.transport === 'hermes_cli') return 'Hermes CLI · fallback';
+  if (activity.activityKind === 'tool_call' || activity.kind === 'tool') return 'Using tool';
+  if (activity.activityKind === 'thinking') return 'Reasoning';
+  if (activity.phase === 'waiting') return 'Waiting';
+  if (activity.phase === 'runtime') return 'Starting';
+  return activity.status ?? null;
+}
+
+function activityElapsed(activity: RealtimeActivity, now: number): string | null {
+  if (typeof activity.durationMs === 'number') return formatActivityDuration(activity.durationMs);
+  if (!activity.startedAt || activity.status === 'success' || activity.status === 'error') return null;
+  const started = Date.parse(activity.startedAt);
+  return Number.isFinite(started) ? formatActivityDuration(Math.max(0, now - started)) : null;
+}
+
+function formatActivityDuration(ms: number): string {
+  const seconds = Math.max(0, Math.floor(ms / 1000));
+  return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
 }
 
 function statusLabel(status: MonitorStatus, workflowTitle: string, terminalKind: 'run' | 'build' | null): string {

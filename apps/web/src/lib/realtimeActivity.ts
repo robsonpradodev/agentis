@@ -35,6 +35,13 @@ export interface RealtimeActivity {
   conversationId?: string;
   clientTurnId?: string;
   phase?: string;
+  status?: string;
+  activityKind?: string;
+  transport?: string;
+  attempt?: number;
+  startedAt?: string;
+  completedAt?: string;
+  durationMs?: number;
   tool?: string;
   approvalId?: string;
   progress?: { completed: number; total: number };
@@ -94,19 +101,22 @@ export function describeRealtimeActivity(
   const agentName = stringField(payload, ['agentName', 'actorName']);
   const conversationId = stringField(payload, ['conversationId']);
   const clientTurnId = stringField(payload, ['clientTurnId']);
-  const phase = stringField(payload, ['phase', 'status']);
+  const phase = stringField(payload, ['activityPhase', 'phase', 'status']);
+  const status = stringField(payload, ['activityStatus', 'status']);
+  const activityKind = stringField(payload, ['activityKind', 'kind']);
+  const transport = stringField(payload, ['transport']);
+  const attempt = numberField(payload, ['attempt']);
+  const startedAt = stringField(payload, ['startedAt']);
+  const completedAt = stringField(payload, ['completedAt']);
+  const durationMs = numberField(payload, ['durationMs']);
   const rawTool = stringField(payload, ['tool', 'toolName', 'name', 'command']);
   const invocation = normalizeToolInvocation(rawTool, payload.args ?? payload.input);
   const tool = invocation.tool === 'tool' && !rawTool ? undefined : invocation.tool;
   const approvalId = stringField(payload, ['approvalId', 'id']);
   const at = stringField(payload, ['at', 'timestamp']) ?? env.emittedAt;
-  const baseId = [
-    env.event,
-    at,
-    runId,
-    nodeId,
-    agentId,
-    approvalId,
+  const explicitActivityId = stringField(payload, ['activityId']);
+  const baseId = explicitActivityId ?? [
+    env.event, at, runId, nodeId, agentId, approvalId,
     stringField(payload, ['phase', 'status', 'tool']),
   ].filter(Boolean).join(':');
 
@@ -125,6 +135,13 @@ export function describeRealtimeActivity(
     conversationId,
     clientTurnId,
     phase,
+    status,
+    activityKind,
+    transport,
+    attempt,
+    startedAt,
+    completedAt,
+    durationMs,
     tool,
     approvalId,
     raw: payload,

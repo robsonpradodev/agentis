@@ -37,6 +37,7 @@ import { ApprovalInboxService } from './services/approvalInbox.js';
 import { ExtensionRuntime } from './services/extensionRuntime.js';
 import { SubflowExecutor } from './services/subflowExecutor.js';
 import { ConversationStore } from './services/conversation/conversationStore.js';
+import { TurnChangeJournal } from './services/conversation/turnChangeJournal.js';
 import { ConversationSummaryService } from './services/conversation/conversationSummaryService.js';
 import { ConversationHandoffService } from './services/conversation/conversationHandoffService.js';
 import { channelModelRole } from './services/conversation/channelConversationRole.js';
@@ -74,6 +75,7 @@ import { ConversationService } from './services/conversation/conversationService
 import { MediaService, compatibleAudioGenerationProvider, openAiImageProvider, openAiSpeechProvider } from './services/mediaService.js';
 import { resolveSynthesisCompleter } from './services/agentisToolHandlers/build.js';
 import { ChannelTurnQueue } from './services/conversation/channelTurnQueue.js';
+import { ChannelUtteranceBatchStore } from './services/conversation/channelUtteranceBatchStore.js';
 import { ChannelConnectionSupervisor } from './services/conversation/channelConnectionSupervisor.js';
 import { WorkspaceAwarenessService } from './services/workspace/workspaceAwarenessService.js';
 import { CapabilityIndex } from './services/capability/capabilityIndex.js';
@@ -87,6 +89,8 @@ import { DocumentExtractionService } from './services/documentExtractionService.
 import { ConversationAttachmentContextService } from './services/conversation/conversationAttachmentContext.js';
 import { RuntimeInputAttachmentStore } from './services/conversation/runtimeInputAttachmentStore.js';
 import { ChannelIdentityService } from './services/conversation/channelIdentityService.js';
+import { ChannelInboxService } from './services/conversation/channelInboxService.js';
+import { ChannelActionIntentService } from './services/conversation/channelActionIntentService.js';
 import { WorkspaceModelConfigService } from './services/workspace/workspaceModelConfigService.js';
 import { WorkspaceMediaConfigService } from './services/workspace/workspaceMediaConfigService.js';
 import { WorkspaceEvaluatorRuntimeFactory } from './services/workspace/workspaceEvaluatorRuntimeFactory.js';
@@ -129,6 +133,7 @@ import { buildAppStores } from '@agentis/app';
 import { AppStaffingService } from './services/app/appStaffing.js';
 import { AppPresenceService } from './services/app/appPresence.js';
 import { AppContactService } from './services/app/appContacts.js';
+import { RelationshipStateService } from './services/relationshipStateService.js';
 import { ConnectionGrantService } from './services/connectionGrants.js';
 import { DurableEntityService, DurableEntityDispatcher } from './services/durableEntities.js';
 import { SubjectRuntime, channelCorrelationId } from './services/subjectRuntime.js';
@@ -351,13 +356,30 @@ function publishAdapterRealtime(
     case 'task.progress':
       publishAgentWorkStep(deps.bus, {
         ...base,
-        phase: 'progress',
+        phase: event.phase ?? 'progress',
         step: 'agent_task',
         description: event.message,
+        activityId: event.activityId,
+        activityKind: event.kind,
+        activityStatus: event.status,
+        transport: event.transport,
+        attempt: event.attempt,
+        startedAt: event.startedAt,
+        completedAt: event.completedAt,
+        durationMs: event.durationMs,
       });
       deps.bus.publish(REALTIME_ROOMS.workspace(workspaceId), REALTIME_EVENTS.AGENT_TERMINAL_MESSAGE, {
         ...base,
         message: clipRealtimeText(event.message),
+        activityId: event.activityId,
+        activityKind: event.kind,
+        activityPhase: event.phase,
+        activityStatus: event.status,
+        transport: event.transport,
+        attempt: event.attempt,
+        startedAt: event.startedAt,
+        completedAt: event.completedAt,
+        durationMs: event.durationMs,
       }, workCorrelationId(base));
       break;
     case 'task.completed':
@@ -593,6 +615,8 @@ export async function bootstrap(envSource: NodeJS.ProcessEnv = process.env): Pro
   const voiceChannelAdapter = new VoiceChannelAdapter();
   const conversationHandoffs = new ConversationHandoffService({ db: sqlite, bus });
   const conversationSummaries = new ConversationSummaryService({ db: sqlite, logger });
+  const channelIdentity = new ChannelIdentityService({ db: sqlite, logger });
+  const channelInbox = new ChannelInboxService({ db: sqlite, identities: channelIdentity });
   const channelBridge = new ChannelBridge({
     db: sqlite,
     vault: credentialVault,
@@ -607,6 +631,7 @@ export async function bootstrap(envSource: NodeJS.ProcessEnv = process.env): Pro
     },
     artifacts: artifactService,
     handoffs: conversationHandoffs,
+    identity: channelIdentity,
   });
   const seed = await seedIfEmpty({ db: sqlite, env, auth, logger });
 
@@ -1063,7 +1088,8 @@ export async function bootstrap(envSource: NodeJS.ProcessEnv = process.env): Pro
     },
   });
 
-  const toolRegistry = new AgentisToolRegistry({ logger });
+  const turnChanges = new TurnChangeJournal({ sqlite: db.sqliteRaw!, logger, bus });
+  const toolRegistry = new AgentisToolRegistry({ logger, turnChanges });
   // The compressed, searchable map of the whole workspace (apps/workflows/nodes/
   // phases/agents/extensions/mounted MCP tools) — backs the agentis.capability.*
   // reach tools and the Command Model briefing. Reuses the per-workspace embedding
@@ -1191,6 +1217,9 @@ export async function bootstrap(envSource: NodeJS.ProcessEnv = process.env): Pro
     plans: planService,
     buildSessions: buildSessionService,
     channels: channelBridge,
+    channelIdentity,
+    channelInbox,
+    channelActions: undefined as ChannelActionIntentService | undefined,
     browserPool,
     browserSessions: browserSessionManager,
     artifacts: artifactService,
@@ -1489,11 +1518,22 @@ export async function bootstrap(envSource: NodeJS.ProcessEnv = process.env): Pro
   const mcpHarness = McpHarnessSessionService.fromEnv(env as unknown as NodeJS.ProcessEnv, sqlite, logger);
 
   // Cross-surface peer identity — recognizes the same human across channels.
-  const channelIdentity = new ChannelIdentityService({ db: sqlite, logger });
   const appContacts = new AppContactService(sqlite);
+  const relationships = new RelationshipStateService({ db: sqlite, entities: durableEntities, identities: channelIdentity });
+  const channelUtterances = new ChannelUtteranceBatchStore(sqlite);
   // Outbound safety envelope (G7): per-App rate limit + quiet hours + claim guard
   // over apps.policyJson.outbound. Gates the *unsupervised* outbound paths.
   const outboundPolicy = new OutboundPolicyService({ db: sqlite, logger });
+  const channelActions = new ChannelActionIntentService({
+    db: sqlite,
+    logger,
+    channels: channelBridge,
+    inbox: channelInbox,
+    grants: connectionGrants,
+    policy: outboundPolicy,
+    approvals,
+  });
+  toolHandlerDeps.channelActions = channelActions;
   // Multi-party threads (G1): customer + resident agent + escalation specialist +
   // human operator in one thread, with warm handoff via active 'specialist' routing.
   const conversationParticipants = new ConversationParticipantService(sqlite, logger);
@@ -1572,6 +1612,10 @@ export async function bootstrap(envSource: NodeJS.ProcessEnv = process.env): Pro
 
   // Deliver a held outbound message once the operator approves (drop on reject).
   approvals.bindOutboundHandler(async ({ approvalId, decision, payload }) => {
+    if (typeof payload.channelActionIntentId === 'string') {
+      await channelActions.resolveApproval(approvalId, decision, payload);
+      return;
+    }
     if (decision !== 'approve') return;
     const appId = typeof payload.appId === 'string' ? payload.appId : null;
     const conversationId = typeof payload.conversationId === 'string' ? payload.conversationId : null;
@@ -1653,7 +1697,11 @@ export async function bootstrap(envSource: NodeJS.ProcessEnv = process.env): Pro
     },
     setTyping: (connectionId, chatId, on) => channelBridge.setTyping(connectionId, chatId, on),
     identity: channelIdentity,
+    inbox: channelInbox,
+    channelActions,
     contacts: appContacts,
+    relationships,
+    utterances: channelUtterances,
     summaries: conversationSummaries,
     handoffs: conversationHandoffs,
     participants: conversationParticipants,
@@ -1665,7 +1713,7 @@ export async function bootstrap(envSource: NodeJS.ProcessEnv = process.env): Pro
     memoryCapture: chatMemoryCapture,
     // Coalesce consecutive WhatsApp-style bubbles without making a real person
     // wait a full second before the agent may begin thinking.
-    debounceMs: 350,
+    debounceMs: 1_200,
     compileAttachments: (args) => compileChannelAttachments
       ? compileChannelAttachments(args)
       : Promise.resolve({ prompt: args.body }),
@@ -1674,6 +1722,8 @@ export async function bootstrap(envSource: NodeJS.ProcessEnv = process.env): Pro
     await channelTurnDispatcher.runQueued(payload as unknown as ChannelTurnInput);
   });
   channelBridge.setTurnDispatcher(channelTurnDispatcher);
+  scheduler.registerSweep('channel_utterance_batches', 1_000, (now) => channelTurnDispatcher.flushDurableUtterances(now.toISOString()));
+  scheduler.registerSweep('channel_action_intents', 15_000, (now) => channelActions.sweep(now.toISOString()));
 
   // Living Apps proactivity (Phase 3 §4.5 + M2) — fire due follow-ups and sweep
   // abandoned relationships on the existing scheduler tick (throttled, isolated).
@@ -1812,6 +1862,36 @@ export async function bootstrap(envSource: NodeJS.ProcessEnv = process.env): Pro
         agentId = sqlite.select({ ownerAgentId: schema.apps.ownerAgentId }).from(schema.apps).where(eq(schema.apps.id, appId)).get()?.ownerAgentId ?? null;
       }
       if (!agentId) { logger.warn('subject.runAgent.no_agent', { entityId }); return; }
+      // Relationship next actions reuse the exact channel turn engine: compose,
+      // autonomy/approval gate, persist, deliver, and retain harness continuity.
+      // Scripted Subject agent steps without a live relationship keep the lower
+      // level runtime path below.
+      const connectionId = typeof facts.connectionId === 'string' ? facts.connectionId : null;
+      const to = typeof facts.to === 'string' ? facts.to : null;
+      if (facts.relationship && appId && connectionId && to) {
+        const conv = sqlite.select({
+          id: schema.conversations.id, userId: schema.conversations.userId,
+          agentId: schema.conversations.agentId,
+        }).from(schema.conversations).where(and(
+          eq(schema.conversations.workspaceId, workspaceId),
+          eq(schema.conversations.appId, appId),
+          eq(schema.conversations.channelConnectionId, connectionId),
+          eq(schema.conversations.channelChatId, to),
+        )).get();
+        const channelKind = typeof facts.channelKind === 'string' ? facts.channelKind : null;
+        if (conv && channelKind) {
+          const result = await channelTurnDispatcher.dispatch({
+            workspaceId, ambientId: null, userId: conv.userId, agentId: conv.agentId,
+            appId, conversationId: conv.id, connectionId, kind: channelKind, chatId: to,
+            text: instruction, initiatedBy: 'proactive', subjectId: entityId,
+          });
+          return {
+            outcome: result.replied
+              ? 'performed' as const
+              : result.reason === 'held_for_approval' ? 'held' as const : 'blocked' as const,
+          };
+        }
+      }
       const reg = adapters.get(agentId);
       const adapter = reg?.adapter?.chat ? reg.adapter : orchestratorRuntime;
       if (!adapter?.chat) return;
@@ -1950,6 +2030,7 @@ export async function bootstrap(envSource: NodeJS.ProcessEnv = process.env): Pro
     extractDocument: (bytes, mime, _workspaceId, fileName) => documentExtraction.extract({ bytes, mimeType: mime, ...(fileName ? { fileName } : {}) }),
     handoffs: conversationHandoffs,
     summaries: conversationSummaries,
+    identity: channelIdentity,
   });
   channelBridge.setPersistentTransport(channelSupervisor);
   // §PERF-BOOT (GAP B) — startAll() is NOT called here any more. Despite the
@@ -2020,7 +2101,21 @@ export async function bootstrap(envSource: NodeJS.ProcessEnv = process.env): Pro
       }
     } else if (event.eventType === 'task.progress') {
       if (event.runId && event.message) {
-        engine.notifyAgentActivity({ runId: event.runId, agentId, taskId: event.taskId, kind: 'text', text: event.message });
+        engine.notifyAgentActivity({
+          runId: event.runId,
+          agentId,
+          taskId: event.taskId,
+          kind: event.kind === 'reasoning' ? 'thinking' : event.kind === 'tool' ? 'tool_call' : 'text',
+          text: event.message,
+          activityId: event.activityId,
+          activityPhase: event.phase,
+          activityStatus: event.status,
+          transport: event.transport,
+          attempt: event.attempt,
+          startedAt: event.startedAt,
+          completedAt: event.completedAt,
+          durationMs: event.durationMs,
+        });
       }
     } else if (event.eventType === 'agent.tool_call') {
       if (event.runId) {
@@ -2075,6 +2170,8 @@ export async function bootstrap(envSource: NodeJS.ProcessEnv = process.env): Pro
     capabilityRegistry,
     channelBridge,
     channelIdentity,
+    channelInbox,
+    channelActions,
     channelSupervisor,
     chatMemoryCapture,
     commandAutonomyMaster,
@@ -2108,6 +2205,7 @@ export async function bootstrap(envSource: NodeJS.ProcessEnv = process.env): Pro
     specialistRuntime,
     specialistTemplates,
     toolRegistry,
+    turnChanges,
     triggerRuntime,
     voiceChannelAdapter,
     workspaceModelConfig,

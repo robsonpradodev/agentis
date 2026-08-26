@@ -17,7 +17,7 @@ apps powered by a workflow engine. No lock-in.
 
 **No token tax. No data extraction. No forgetting.**
 
-> **Status: 1.1.4 stable.** Agentis is now in public release, and the CLI,
+> **Status: 1.1.5 stable.** Agentis is now in public release, and the CLI,
 > dashboard, and core runtime are ready for production use across 1.x updates.
 
 This package launches the whole local runtime: API, WebSocket bridge, workflow engine,

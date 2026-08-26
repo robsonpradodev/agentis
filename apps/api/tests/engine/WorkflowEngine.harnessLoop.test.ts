@@ -25,7 +25,13 @@ let ctx: TestContext;
 beforeEach(async () => { ctx = await createTestContext(); });
 afterEach(() => ctx.close());
 
-function markerChatAdapter(seenTools: string[][], finalText: string): AgentAdapter {
+function markerChatAdapter(
+  seenTools: string[][],
+  finalText: string,
+  seenSessions: string[] = [],
+  forwarding: 'marker_protocol' | 'mcp_native' = 'marker_protocol',
+  finishReason: 'stop' | 'max_turns' | 'error' = 'stop',
+): AgentAdapter {
   return {
     adapterType: 'claude_code',
     connect: async () => {},
@@ -34,7 +40,7 @@ function markerChatAdapter(seenTools: string[][], finalText: string): AgentAdapt
     capabilities: () => ({
       interactiveChat: true,
       toolCalling: true,
-      toolForwarding: 'marker_protocol',
+      toolForwarding: forwarding,
       affordances: { fileSystem: true, terminal: true },
     }),
     dispatchTask: async () => {
@@ -42,10 +48,26 @@ function markerChatAdapter(seenTools: string[][], finalText: string): AgentAdapt
     },
     cancelTask: async () => {},
     onEvent: () => {},
-    chat: async function* (_messages, tools) {
+    chat: async function* (_messages, tools, options) {
       seenTools.push(tools.map((t) => t.name));
+      seenSessions.push(options?.sessionKey ?? '');
+      yield {
+        type: 'activity', id: 'provider-wait', phase: 'waiting', status: 'running',
+        label: 'Waiting for provider', detail: 'Authorization: Bearer abcdefghijklmnop', transport: 'test_acp',
+        startedAt: new Date().toISOString(),
+      };
+      yield {
+        type: 'activity', id: 'provider-wait', phase: 'waiting', status: 'success',
+        label: 'Provider responded', detail: 'Provider produced output.', transport: 'test_acp',
+        completedAt: new Date().toISOString(), durationMs: 10,
+      };
+      yield {
+        type: 'activity', id: 'secret-check', phase: 'runtime', status: 'running',
+        label: 'Safe diagnostic', detail: 'Authorization: Bearer abcdefghijklmnop', transport: 'test_acp',
+        startedAt: new Date().toISOString(),
+      };
       yield { type: 'text', delta: finalText };
-      yield { type: 'done', finishReason: 'stop' };
+      yield { type: 'done', finishReason };
     },
   } as unknown as AgentAdapter;
 }
@@ -79,8 +101,9 @@ describe('WorkflowEngine — E1 harness chat tool loop', () => {
     );
 
     const seenTools: string[][] = [];
+    const seenSessions: string[] = [];
     const adapters = new AdapterManager(ctx.logger);
-    adapters.register(agentId, markerChatAdapter(seenTools, 'Found 3 fashion stores on Instagram. Done.'));
+    adapters.register(agentId, markerChatAdapter(seenTools, 'Found 3 fashion stores on Instagram. Done.', seenSessions));
 
     const engine = new WorkflowEngine({
       db: ctx.db, bus: ctx.bus, logger: ctx.logger,
@@ -119,6 +142,121 @@ describe('WorkflowEngine — E1 harness chat tool loop', () => {
     // The harness was offered the integration catalog, minus the recursion blocklist.
     expect(seenTools[0]).toContain('agentis.channel.send');
     expect(seenTools[0]).not.toContain('agentis.build_workflow');
+    expect(seenSessions[0]).toBe(`agent-task:${runId}:A:attempt:1`);
+
+    const secondRunId = randomUUID();
+    ctx.db.insert(schema.workflowRuns).values({ id: secondRunId, workspaceId: ctx.workspace.id, ambientId: ctx.ambient.id, workflowId: wfId, userId: ctx.user.id, status: 'CREATED', runState: {} }).run();
+    const secondDone = Promise.race([waitForRunStatus(secondRunId, 'COMPLETED'), waitForRunStatus(secondRunId, 'FAILED')]);
+    await engine.startRun({
+      workspaceId: ctx.workspace.id,
+      ambientId: ctx.ambient.id,
+      workflowId: wfId,
+      userId: ctx.user.id,
+      triggerId: null,
+      inputs: {},
+      initialState: buildInitialRunState({ runId: secondRunId, workflowId: wfId, graph, inputs: {} }),
+      graph,
+    });
+    await secondDone;
+    expect(seenSessions[1]).toBe(`agent-task:${secondRunId}:A:attempt:1`);
+    expect(seenSessions[1]).not.toBe(seenSessions[0]);
+    const durableActivity = ctx.db.select().from(schema.runActivityEvents).where(eq(schema.runActivityEvents.runId, runId)).all();
+    expect(durableActivity.length).toBeGreaterThan(0);
+    const providerRows = durableActivity.filter((event) => event.activityId === 'provider-wait');
+    expect(providerRows).toHaveLength(1);
+    expect(providerRows[0]).toMatchObject({ status: 'success', transport: 'test_acp', durationMs: 10 });
+    expect(JSON.stringify(durableActivity)).not.toContain('abcdefghijklmnop');
+    expect(JSON.stringify(durableActivity)).toContain('«redacted»');
+    // Terminal cleanup removes the live run context; replay still comes from the
+    // durable store and therefore survives a process restart as well.
+    expect(engine.getRunActivity(runId).length).toBe(durableActivity.length);
+  });
+
+  it('routes an mcp_native adapter through the same caller-managed chat executor', async () => {
+    const agentId = randomUUID();
+    ctx.db.insert(schema.agents).values({
+      id: agentId, workspaceId: ctx.workspace.id, ambientId: ctx.ambient.id, userId: ctx.user.id,
+      name: 'Hermes Worker', role: 'specialist', adapterType: 'hermes_agent', capabilityTags: [], config: {}, status: 'online',
+    }).run();
+    const seenTools: string[][] = [];
+    const seenSessions: string[] = [];
+    const adapters = new AdapterManager(ctx.logger);
+    adapters.register(agentId, markerChatAdapter(seenTools, '{"result":"ok"}', seenSessions, 'mcp_native'));
+    const registry = new AgentisToolRegistry({ logger: ctx.logger });
+    registry.register(
+      { id: 'agentis.data.query', family: 'data', description: 'query data', inputSchema: { type: 'object', properties: {} }, mutating: false, mcpExposed: true },
+      async () => ({ ok: true }),
+    );
+    const engine = new WorkflowEngine({
+      db: ctx.db, bus: ctx.bus, logger: ctx.logger,
+      ledger: new LedgerService(ctx.db, ctx.bus), scratchpad: new ScratchpadService(ctx.bus, ctx.logger),
+      activity: new ActivityFeedService(ctx.db, ctx.bus), approvals: new ApprovalInboxService(ctx.db, ctx.bus),
+      extensions: {} as unknown as ExtensionRuntime, adapters, toolRegistry: registry,
+    });
+    const graph = {
+      version: 1, viewport: { x: 0, y: 0, zoom: 1 },
+      nodes: [
+        { id: 'T', type: 'trigger', title: 'trigger', position: { x: 0, y: 0 }, config: { kind: 'trigger', triggerType: 'manual' } },
+        { id: 'A', type: 'agent_task', title: 'Hermes task', position: { x: 1, y: 0 }, config: { kind: 'agent_task', agentId, agentRole: 'specialist', prompt: 'Return ok.', outputKeys: ['result'] } },
+      ], edges: [{ id: 'e', source: 'T', target: 'A' }],
+    } as unknown as WorkflowGraph;
+    const workflowId = randomUUID();
+    const runId = randomUUID();
+    ctx.db.insert(schema.workflows).values({ id: workflowId, workspaceId: ctx.workspace.id, ambientId: ctx.ambient.id, userId: ctx.user.id, title: 'native-harness', graph, settings: {} }).run();
+    ctx.db.insert(schema.workflowRuns).values({ id: runId, workspaceId: ctx.workspace.id, ambientId: ctx.ambient.id, workflowId, userId: ctx.user.id, status: 'CREATED', runState: {} }).run();
+    const done = Promise.race([waitForRunStatus(runId, 'COMPLETED'), waitForRunStatus(runId, 'FAILED')]);
+    await engine.startRun({ workspaceId: ctx.workspace.id, ambientId: ctx.ambient.id, workflowId, userId: ctx.user.id, triggerId: null, inputs: {}, initialState: buildInitialRunState({ runId, workflowId, graph, inputs: {} }), graph });
+    await done;
+
+    expect(seenTools[0]).toContain('agentis.data.query');
+    expect(seenSessions[0]).toBe(`agent-task:${runId}:A:attempt:1`);
+  });
+
+  it('pauses instead of treating max-turn guidance as a successful node result', async () => {
+    const agentId = randomUUID();
+    ctx.db.insert(schema.agents).values({
+      id: agentId, workspaceId: ctx.workspace.id, ambientId: ctx.ambient.id, userId: ctx.user.id,
+      name: 'Bounded Worker', role: 'specialist', adapterType: 'codex', capabilityTags: [], config: {}, status: 'online',
+    }).run();
+    const adapters = new AdapterManager(ctx.logger);
+    adapters.register(agentId, markerChatAdapter([], 'Turn limit reached. Say continue.', [], 'marker_protocol', 'max_turns'));
+    const registry = new AgentisToolRegistry({ logger: ctx.logger });
+    registry.register(
+      { id: 'agentis.data.query', family: 'data', description: 'query data', inputSchema: { type: 'object', properties: {} }, mutating: false, mcpExposed: true },
+      async () => ({ ok: true }),
+    );
+    const engine = new WorkflowEngine({
+      db: ctx.db, bus: ctx.bus, logger: ctx.logger,
+      ledger: new LedgerService(ctx.db, ctx.bus), scratchpad: new ScratchpadService(ctx.bus, ctx.logger),
+      activity: new ActivityFeedService(ctx.db, ctx.bus), approvals: new ApprovalInboxService(ctx.db, ctx.bus),
+      extensions: {} as unknown as ExtensionRuntime, adapters, toolRegistry: registry,
+    });
+    const graph = {
+      version: 1, viewport: { x: 0, y: 0, zoom: 1 },
+      nodes: [
+        { id: 'T', type: 'trigger', title: 'trigger', position: { x: 0, y: 0 }, config: { kind: 'trigger', triggerType: 'manual' } },
+        { id: 'A', type: 'agent_task', title: 'Bounded task', position: { x: 1, y: 0 }, config: { kind: 'agent_task', agentId, agentRole: 'specialist', prompt: 'Do bounded work.', outputKeys: [] } },
+      ], edges: [{ id: 'e', source: 'T', target: 'A' }],
+    } as unknown as WorkflowGraph;
+    const workflowId = randomUUID();
+    const runId = randomUUID();
+    ctx.db.insert(schema.workflows).values({ id: workflowId, workspaceId: ctx.workspace.id, ambientId: ctx.ambient.id, userId: ctx.user.id, title: 'bounded-harness', graph, settings: {} }).run();
+    ctx.db.insert(schema.workflowRuns).values({ id: runId, workspaceId: ctx.workspace.id, ambientId: ctx.ambient.id, workflowId, userId: ctx.user.id, status: 'CREATED', runState: {} }).run();
+
+    await engine.startRun({
+      workspaceId: ctx.workspace.id, ambientId: ctx.ambient.id, workflowId, userId: ctx.user.id, triggerId: null,
+      inputs: {}, initialState: buildInitialRunState({ runId, workflowId, graph, inputs: {} }), graph,
+    });
+    await expect.poll(
+      () => ctx.db.select().from(schema.workflowRuns).where(eq(schema.workflowRuns.id, runId)).get()?.status,
+      { timeout: 5_000 },
+    ).toBe('WAITING');
+    const row = ctx.db.select().from(schema.workflowRuns).where(eq(schema.workflowRuns.id, runId)).get()!;
+    const state = row.runState as { nodeStates?: Record<string, { status?: string; blockedReason?: string; outputData?: unknown }> };
+    expect(state.nodeStates?.A?.status).toBe('WAITING');
+    expect(state.nodeStates?.A?.outputData).toBeUndefined();
+    expect(state.nodeStates?.A?.blockedReason).toContain('stage=max_turns');
+    expect(state.nodeStates?.A?.blockedReason).toContain(`session=agent-task:${runId}:A:attempt:1`);
   });
 
   it('cancels the live harness turn and its adapter task when the run is cancelled', async () => {

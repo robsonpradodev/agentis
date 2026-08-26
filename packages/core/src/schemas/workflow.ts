@@ -640,8 +640,12 @@ export const runWorkflowSchema = z.object({
   inputs: z.record(z.string(), z.unknown()).default({}),
   /** Production runs omit this and always resolve the active revision. */
   revisionId: z.string().min(1).optional(),
-  /** Candidate revisions may only be executed through the explicit debug path. */
-  mode: z.enum(['active', 'debug']).default('active'),
+  /**
+   * `latest` is the editor's one-click path: run the current candidate when it
+   * exists, otherwise the active revision. Scheduled/production callers still
+   * default to `active`; `debug` remains the strict candidate-only API.
+   */
+  mode: z.enum(['active', 'debug', 'latest']).default('active'),
 });
 
 export const workflowDeploymentStatusSchema = z.object({

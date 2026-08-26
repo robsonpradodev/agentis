@@ -60,6 +60,34 @@ describe('<AgentChannelsTab />', () => {
     expect(calls.some((c) => c.url === '/v1/channels/c1/login' && c.method === 'POST')).toBe(true);
   });
 
+  it('replaces a closed pairing spinner with an immediate retry action', async () => {
+    const calls: Array<{ url: string; method: string }> = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = (init?.method ?? 'GET').toUpperCase();
+      calls.push({ url, method });
+      if (url === '/v1/channels' && method === 'GET') return jsonResponse({ connections: [] });
+      if (url === '/v1/channels' && method === 'POST') return jsonResponse({ connection: { id: 'c1', kind: 'whatsapp' } }, 201);
+      if (url === '/v1/channels/c1/login') {
+        return jsonResponse({
+          connectionId: 'c1', status: 'closed',
+          recovery: { reason: 'connection_closed', attempt: 2, nextRetryAt: '2026-08-17T14:13:50.512Z' },
+        });
+      }
+      return jsonResponse({});
+    }));
+
+    render(<AgentChannelsTab agentId="a1" agentName="Orchestrator" />);
+    await waitFor(() => expect(screen.getByText('WhatsApp')).toBeInTheDocument());
+    await userEvent.click(screen.getByRole('button', { name: /Connect WhatsApp/i }));
+    await userEvent.click(screen.getByRole('button', { name: /Show QR/i }));
+
+    expect(await screen.findByText(/closed the pairing transport/i)).toBeInTheDocument();
+    expect(screen.queryByAltText(/WhatsApp login QR/i)).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: /Retry now/i }));
+    await waitFor(() => expect(calls.filter((call) => call.url === '/v1/channels/c1/login' && call.method === 'POST')).toHaveLength(2));
+  });
+
   it('Telegram shows a token form with a long-polling toggle', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => jsonResponse({ connections: [] })));
     render(<AgentChannelsTab agentId="a1" agentName="Orchestrator" />);
@@ -125,7 +153,7 @@ describe('<AgentChannelsTab />', () => {
     expect(targetCall?.body).toContain('ownerName');
   });
 
-  it('exposes manual handoff controls and keeps the owner/operator exception configurable', async () => {
+  it('exposes manual handoff controls while keeping the owner/operator exception unconditional', async () => {
     const calls: Array<{ url: string; method: string; body?: string }> = [];
     const connection = {
       id: 'wa-owner', agentId: 'a1', kind: 'whatsapp', name: 'Owner WhatsApp', status: 'active', mode: 'qr_local',
@@ -149,13 +177,50 @@ describe('<AgentChannelsTab />', () => {
     await waitFor(() => expect(screen.getByDisplayValue('553171443148@s.whatsapp.net')).toBeInTheDocument());
     await userEvent.click(screen.getByRole('button', { name: /Behavior & safety/i }));
     expect(screen.getByLabelText(/Pause automation in a conversation/i)).toBeChecked();
-    const ownerControl = screen.getByLabelText(/Also pause automation for the owner\/operator chat/i);
-    expect(ownerControl).not.toBeDisabled();
-    await userEvent.click(ownerControl);
+    expect(screen.queryByLabelText(/Also pause automation for the owner\/operator chat/i)).not.toBeInTheDocument();
+    expect(screen.getByText(/owner\/operator conversation always remains active/i)).toBeInTheDocument();
+    expect(calls.some((call) => call.url === '/v1/channels/wa-owner/behavior')).toBe(false);
+  });
 
-    await waitFor(() => expect(calls.some((call) => call.url === '/v1/channels/wa-owner/behavior')).toBe(true));
-    const handoffCall = calls.find((call) => call.url === '/v1/channels/wa-owner/behavior');
-    expect(handoffCall?.body).toContain('ownerManualOutboundTakeover');
-    expect(handoffCall?.body).toContain('until_handback');
+  it('renders canonical contact context and the durable outbound action ledger', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === '/v1/channels') return jsonResponse({
+        connections: [{
+          id: 'wa1', agentId: 'a1', kind: 'whatsapp', name: 'Bia WhatsApp', status: 'active', mode: 'qr_local',
+          defaultChatId: null, ownerChatId: null, targetAliases: {}, health: { status: 'active', checks: [] },
+        }],
+      });
+      if (url.startsWith('/v1/channels/inbox?')) return jsonResponse({
+        peers: [{
+          recipientRef: 'peer:p1', peerIdentityId: 'p1', connectionId: 'wa1', channelKind: 'whatsapp',
+          displayName: 'atacadaosertaneja', conversationId: 'conv1', lastInboundAt: '2026-08-25T16:30:00.000Z',
+          lastOutboundAt: null, lastMessageAt: '2026-08-25T16:30:00.000Z', lastMessagePreview: 'Boa tarde',
+          lastMessageDirection: 'inbound', handoffState: 'agent', subjectId: 'subject1', stage: 'qualified',
+          goal: 'Book a product demonstration', aliases: [
+            { value: '5531999@s.whatsapp.net', kind: 'pn', verified: true },
+            { value: '8822@lid', kind: 'lid', verified: true },
+          ],
+        }],
+      });
+      if (url.startsWith('/v1/channels/actions?')) return jsonResponse({
+        actions: [{
+          id: 'action1', agentId: 'a1', connectionId: 'wa1', peerIdentityId: 'p1',
+          goal: 'Explain how AI helps', body: 'Nossa IA pode ajudar seu negócio.', authorizationBasis: 'standing_goal',
+          status: 'delivered', attempts: 1, scheduledFor: null, lastError: null,
+          deliveredAt: '2026-08-25T16:31:00.000Z', createdAt: '2026-08-25T16:31:00.000Z',
+        }],
+      });
+      return jsonResponse({});
+    }));
+
+    render(<AgentChannelsTab agentId="a1" agentName="Bia" />);
+    expect((await screen.findAllByText('atacadaosertaneja')).length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText('Boa tarde')).toBeInTheDocument();
+    expect(screen.getByText('qualified')).toBeInTheDocument();
+    expect(screen.getByText('2 linked identities')).toBeInTheDocument();
+    expect(screen.getByText('Nossa IA pode ajudar seu negócio.')).toBeInTheDocument();
+    expect(screen.getByText('Standing goal')).toBeInTheDocument();
+    expect(screen.getByText('delivered')).toBeInTheDocument();
   });
 });

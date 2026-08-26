@@ -18,7 +18,7 @@
 
 import { randomUUID, createHmac, timingSafeEqual } from 'node:crypto';
 import { and, eq } from 'drizzle-orm';
-import { CONSTANTS, AgentisError, type WorkflowGraph } from '@agentis/core';
+import { CONSTANTS, AgentisError, type WorkflowGraph, REALTIME_EVENTS, REALTIME_ROOMS } from '@agentis/core';
 import { schema } from '@agentis/db/sqlite';
 import type { AgentisSqliteDb } from '@agentis/db/sqlite';
 import type { Logger } from '../logger.js';
@@ -214,6 +214,11 @@ export class TriggerRuntime {
       .set({ lastFiredAt: new Date().toISOString() })
       .where(eq(schema.triggers.id, args.trigger.triggerId))
       .run();
+    this.deps.bus.publish(
+      REALTIME_ROOMS.workspace(args.trigger.workspaceId),
+      REALTIME_EVENTS.WORKFLOW_UPDATED,
+      { workflowId: args.trigger.workflowId, reason: 'deployment' },
+    );
     return result;
   }
 

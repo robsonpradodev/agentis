@@ -23,6 +23,8 @@ export type AgentisErrorCode =
   | 'GRAPH_PATCH_INVALID'
   | 'WORKFLOW_STOPPED'
   | 'TURN_CANCELLED'
+  | 'TURN_CHANGE_CONFLICT'
+  | 'TURN_CHANGE_CONFIRMATION_REQUIRED'
   // Adapters
   | 'ADAPTER_UNAVAILABLE'
   | 'ADAPTER_CAPABILITY_MISMATCH'
@@ -75,6 +77,7 @@ export type AgentisErrorCode =
   | 'CHANNEL_RATE_LIMITED'
   | 'CHANNEL_OPT_IN_REQUIRED'
   | 'CHANNEL_SEND_BLOCKED'
+  | 'CHANNEL_TARGET_AMBIGUOUS_OR_MISSING'
   | 'CHANNEL_HUMAN_TAKEOVER_ACTIVE'
   // Connection authority (Agent-Native Platform Plan §3.3)
   | 'CONNECTION_GRANTS_UNAVAILABLE'
@@ -171,6 +174,8 @@ function defaultStatusFor(code: AgentisErrorCode): number {
     case 'WORKSPACE_ORCHESTRATOR_EXISTS':
     case 'WORKFLOW_RUN_INVALID_STATE':
     case 'TURN_CANCELLED':
+    case 'TURN_CHANGE_CONFLICT':
+    case 'TURN_CHANGE_CONFIRMATION_REQUIRED':
     case 'GRAPH_REVISION_CONFLICT':
     case 'PACKAGE_SLUG_CONFLICT':
     case 'CHANNEL_HUMAN_TAKEOVER_ACTIVE':
@@ -209,6 +214,7 @@ function defaultStatusFor(code: AgentisErrorCode): number {
     case 'CHANNEL_DISCORD_INBOUND_UNAVAILABLE':
     case 'CHANNEL_OPT_IN_REQUIRED':
     case 'CHANNEL_SEND_BLOCKED':
+    case 'CHANNEL_TARGET_AMBIGUOUS_OR_MISSING':
     case 'INTEGRATION_CREDENTIAL_MISSING':
     case 'BUDGET_LIMIT_EXCEEDED':
       return 422;

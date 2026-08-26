@@ -169,11 +169,25 @@ export class WorkspacePackager {
 
     // Bare workflows only — App workflows already travel inside their AppManifest.
     const workflows = this.deps.db
-      .select({ title: schema.workflows.title, description: schema.workflows.description, graph: schema.workflows.graph, settings: schema.workflows.settings })
+      .select({
+        title: schema.workflows.title,
+        description: schema.workflows.description,
+        graph: schema.workflows.graph,
+        settings: schema.workflows.settings,
+        activeRevisionId: schema.workflows.activeRevisionId,
+        candidateRevisionId: schema.workflows.candidateRevisionId,
+      })
       .from(schema.workflows)
       .where(and(eq(schema.workflows.workspaceId, workspaceId), isNull(schema.workflows.appId)))
       .all()
-      .map((w) => ({ title: w.title, description: w.description ?? null, graph: w.graph, settings: objectRecord(w.settings) }));
+      .map((w) => {
+        const revisionId = w.candidateRevisionId ?? w.activeRevisionId;
+        const revision = revisionId
+          ? this.deps.db.select({ graph: schema.workflowGraphRevisions.graphJson })
+            .from(schema.workflowGraphRevisions).where(eq(schema.workflowGraphRevisions.id, revisionId)).get()
+          : null;
+        return { title: w.title, description: w.description ?? null, graph: revision?.graph ?? w.graph, settings: objectRecord(w.settings) };
+      });
 
     const extensions = this.deps.db
       .select()

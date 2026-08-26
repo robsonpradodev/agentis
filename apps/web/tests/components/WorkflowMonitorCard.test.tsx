@@ -286,4 +286,65 @@ describe('WorkflowMonitorCard', () => {
     expect(screen.getByText('2.3s')).toBeInTheDocument();
     expect(apiMock).toHaveBeenCalledWith('/v1/workflows/workflow-1/analytics');
   });
+
+  it('replays typed activity for the latched paused run after activeRunId clears', async () => {
+    apiMock.mockImplementation(async (path: string) => {
+      if (path === '/v1/runs/run-paused/activity') {
+        return { activity: [{
+          activityId: 'fallback-1',
+          event: REALTIME_EVENTS.AGENT_WORK_STEP,
+          emittedAt: '2026-08-23T12:00:20.000Z',
+          payload: {
+            activityId: 'fallback-1', workflowId: 'workflow-1', runId: 'run-paused', nodeId: 'node-1',
+            nodeTitle: 'Select lead', description: 'ACP stalled; continuing through Hermes CLI.',
+            activityKind: 'fallback', activityStatus: 'running', transport: 'hermes_cli', attempt: 1,
+            startedAt: '2026-08-23T12:00:00.000Z', durationMs: 20_000,
+          },
+        }] };
+      }
+      if (path.includes('/preflight')) return { status: 'healthy', durationMs: 1, nodes: {}, issues: [] };
+      if (path.includes('/analytics')) return { runs: 0, successRate: 0, avgDurationMs: 0, avgCostCents: 0, totalCostCents: 0, totalTokens: 0, avgTokensPerRun: 0, byStatus: {}, nodeFailures: [] };
+      return { activity: [] };
+    });
+    const props = {
+      workflowId: 'workflow-1', workflowTitle: 'Outbound', nodeTitles: new Map([['node-1', 'Select lead']]),
+      revision: 'rev-1', onFocusNode: vi.fn(), onOpenRun: vi.fn(), onRunStarted: vi.fn(), onOpenHistory: vi.fn(),
+    };
+    const { rerender } = render(<WorkflowMonitorCard {...props} activeRunId="run-paused" activeRunStatus="running" />);
+    emit(REALTIME_EVENTS.RUN_PAUSED, { workflowId: 'workflow-1', runId: 'run-paused' });
+    rerender(<WorkflowMonitorCard {...props} activeRunId={null} activeRunStatus={null} />);
+    await act(async () => { await Promise.resolve(); });
+
+    expect(apiMock).toHaveBeenCalledWith('/v1/runs/run-paused/activity');
+    expect(screen.getByText('ACP stalled; continuing through Hermes CLI.')).toBeInTheDocument();
+    expect(screen.getByText(/Hermes CLI · fallback/i)).toBeInTheDocument();
+  });
+
+  it('coalesces legacy Hermes final-only heartbeat rows from durable replay', async () => {
+    apiMock.mockImplementation(async (path: string) => {
+      if (path === '/v1/runs/run-legacy/activity') {
+        return { activity: [16, 31, 46].map((seconds) => ({
+          activityId: `legacy-${seconds}`,
+          event: REALTIME_EVENTS.AGENT_WORK_STEP,
+          emittedAt: `2026-08-23T12:00:${String(seconds % 60).padStart(2, '0')}.000Z`,
+          payload: {
+            activityId: `legacy-${seconds}`, workflowId: 'workflow-1', runId: 'run-legacy', nodeId: 'node-1',
+            agentId: 'agent-1', agentName: 'Bia', phase: 'thinking',
+            description: `Hermes is running — ${seconds}s elapsed; final-answer-only mode`,
+          },
+        })) };
+      }
+      return { activity: [] };
+    });
+    render(
+      <WorkflowMonitorCard
+        workflowId="workflow-1" workflowTitle="Outbound" activeRunId="run-legacy" activeRunStatus="running"
+        nodeTitles={new Map([['node-1', 'Select lead']])} revision="rev-1"
+        onFocusNode={vi.fn()} onOpenRun={vi.fn()} onRunStarted={vi.fn()} onOpenHistory={vi.fn()}
+      />,
+    );
+    await act(async () => { await Promise.resolve(); });
+
+    expect(screen.getAllByText(/Hermes is running/)).toHaveLength(1);
+  });
 });

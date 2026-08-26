@@ -49,12 +49,13 @@ function deps(): ToolHandlerDeps {
   };
 }
 
-function toolContext() {
+function toolContext(agentId?: string) {
   return {
     workspaceId: ctx.workspace.id,
     ambientId: ctx.ambient.id,
     userId: ctx.user.id,
     caller: 'test',
+    ...(agentId ? { agentId } : {}),
   };
 }
 
@@ -369,7 +370,7 @@ describe('agent-facing native channel tools', () => {
     const bound = await registry.execute({
       toolId: 'agentis.connection.bind_app',
       arguments: { connectionId: connection.id, appId },
-    }, toolContext());
+    }, toolContext(agentId));
     expect(bound.ok).toBe(true);
     expect(bound.output).toEqual(expect.objectContaining({ bound: true, connectionId: connection.id, appId }));
 
@@ -430,7 +431,7 @@ describe('agent-facing native channel tools', () => {
     const sent = await registry.execute({
       toolId: 'agentis.channel.send',
       arguments: { kind: 'telegram', to: 'default', body: 'hello over native channel', deliveryRole: 'progress' },
-    }, toolContext());
+    }, toolContext(agentId));
     expect(sent.ok).toBe(true);
     expect(sent.output).toEqual(expect.objectContaining({
       sent: true,
@@ -511,7 +512,7 @@ describe('agent-facing native channel tools', () => {
     const result = await registry.execute({
       toolId: 'agentis.channel.send',
       arguments: { kind: 'whatsapp', to: '+55 11 99999-9999', body: 'hello wa' },
-    }, toolContext());
+    }, toolContext(agentId));
 
     expect(result.ok).toBe(true);
     expect(result.output).toEqual(expect.objectContaining({

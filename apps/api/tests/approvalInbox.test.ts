@@ -63,6 +63,53 @@ describe('ApprovalInboxService', () => {
     expect(svc.list('ws1', 'all')).toHaveLength(1);
   });
 
+  it('expires a revision approval when its candidate was abandoned before review', async () => {
+    db.insert(schema.workflows).values({
+      id: 'workflow-1',
+      workspaceId: 'ws1',
+      userId: 'u1',
+      title: 'Prospecting',
+      graph: {},
+      settings: {},
+      activeRevisionId: 'active-revision',
+      candidateRevisionId: null,
+    }).run();
+    db.insert(schema.workflowGraphRevisions).values({
+      id: 'candidate-revision',
+      workspaceId: 'ws1',
+      workflowId: 'workflow-1',
+      graphJson: {},
+      semanticHash: 'reviewed-hash',
+      presentationHash: 'presentation-hash',
+      source: 'agent_patch',
+      status: 'rejected',
+    }).run();
+    const approval = await svc.create({
+      ...baseArgs,
+      runId: null,
+      taskId: null,
+      source: 'workflow_revision',
+      payload: {
+        workspaceId: 'ws1',
+        workflowId: 'workflow-1',
+        revisionId: 'candidate-revision',
+        semanticHash: 'reviewed-hash',
+        expectedActiveRevisionId: 'active-revision',
+      },
+    });
+
+    expect(svc.list('ws1', 'pending')).toEqual([]);
+    expect(svc.get('ws1', approval.id)).toMatchObject({
+      status: 'expired',
+      resolutionReason: 'Workflow revision is no longer the current candidate.',
+    });
+    await expect(svc.resolve({
+      workspaceId: 'ws1',
+      approvalId: approval.id,
+      decision: 'approve',
+    })).rejects.toThrow('Approval already expired');
+  });
+
   it('resolve(approve) on a checkpoint fires the resume handler with decision', async () => {
     let handlerCalled: { runId: string; approvalId: string; source: string; decision: string } | null = null;
     svc.bindCheckpointHandler(async (a) => {

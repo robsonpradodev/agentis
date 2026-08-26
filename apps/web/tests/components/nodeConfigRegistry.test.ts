@@ -60,6 +60,32 @@ describe('node config registry', () => {
 
     expect(evaluateNodeReadiness({
       kind: 'trigger',
+      triggerType: 'cron',
+      schedule: '*/3***',
+    })).toEqual({
+      ready: false,
+      message: 'Enter a valid five-field cron expression, for example: */5 * * * *',
+    });
+
+    expect(evaluateNodeReadiness({
+      kind: 'trigger',
+      triggerType: 'cron',
+      schedule: '*/3 * * * *',
+    })).toEqual({ ready: true, message: null });
+
+    expect(evaluateNodeReadiness({
+      kind: 'trigger',
+      triggerType: 'cron',
+      scheduleRules: [{ expression: '0 9 * * *' }, { expression: '0 18 * * 1-5' }],
+    })).toEqual({ ready: true, message: null });
+
+    expect(evaluateNodeReadiness({ kind: 'trigger', triggerType: 'rss_feed', rssFeed: {} }))
+      .toEqual({ ready: false, message: 'Enter an RSS feed URL.' });
+    expect(evaluateNodeReadiness({ kind: 'trigger', triggerType: 'email_imap', emailImap: {} }))
+      .toEqual({ ready: false, message: 'Enter the IMAP host.' });
+
+    expect(evaluateNodeReadiness({
+      kind: 'trigger',
       triggerType: 'persistent_listener',
       listenerConfig: {
         source: { kind: 'extension', operationName: 'watch' },

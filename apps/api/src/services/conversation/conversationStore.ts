@@ -98,6 +98,8 @@ export class ConversationStore {
     agentId: string;
     channelConnectionId: string;
     channelChatId: string;
+    /** Canonical peer identity; provider aliases resolve to the same live thread. */
+    channelPeerIdentityId?: string | null;
     /** When the channel belongs to an Agentic App, the thread is owned by it (Living Apps Phase 0). */
     appId?: string | null;
   }) {
@@ -113,7 +115,12 @@ export class ConversationStore {
         and(
           eq(schema.conversations.workspaceId, args.workspaceId),
           eq(schema.conversations.channelConnectionId, args.channelConnectionId),
-          eq(schema.conversations.channelChatId, args.channelChatId),
+          args.channelPeerIdentityId
+            ? or(
+                eq(schema.conversations.channelPeerIdentityId, args.channelPeerIdentityId),
+                eq(schema.conversations.channelChatId, args.channelChatId),
+              )!
+            : eq(schema.conversations.channelChatId, args.channelChatId),
         ),
       )
       .orderBy(
@@ -128,7 +135,8 @@ export class ConversationStore {
       const changed = existing.agentId !== args.agentId
         || existing.appId !== nextAppId
         || existing.archivedAt !== null
-        || existing.ambientId !== args.ambientId;
+        || existing.ambientId !== args.ambientId
+        || (args.channelPeerIdentityId && existing.channelPeerIdentityId !== args.channelPeerIdentityId);
       if (changed) {
         const now = new Date().toISOString();
         this.deps.db
@@ -137,6 +145,7 @@ export class ConversationStore {
             agentId: args.agentId,
             appId: nextAppId,
             ambientId: args.ambientId,
+            ...(args.channelPeerIdentityId ? { channelPeerIdentityId: args.channelPeerIdentityId } : {}),
             archivedAt: null,
             updatedAt: now,
           })
@@ -147,6 +156,7 @@ export class ConversationStore {
           agentId: args.agentId,
           appId: nextAppId,
           ambientId: args.ambientId,
+          channelPeerIdentityId: args.channelPeerIdentityId ?? existing.channelPeerIdentityId ?? null,
           archivedAt: null,
           updatedAt: now,
         };
@@ -163,6 +173,7 @@ export class ConversationStore {
       mirroredSessionId: null,
       channelConnectionId: args.channelConnectionId,
       channelChatId: args.channelChatId,
+      channelPeerIdentityId: args.channelPeerIdentityId ?? null,
       appId: args.appId ?? null,
       title: null,
       archivedAt: null,

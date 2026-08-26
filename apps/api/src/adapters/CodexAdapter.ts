@@ -44,7 +44,7 @@ import {
 import { probeCliRuntime } from './cliRuntimeProbe.js';
 import { nativeRuntimeCapabilities } from './runtimeCapabilityDeclarations.js';
 import type { RuntimeSessionStore } from '../services/runtime/runtimeSessionStore.js';
-import { toolActivityLabel } from './runtimeProgress.js';
+import { runtimeAttemptFromSessionKey, toolActivityLabel } from './runtimeProgress.js';
 
 const DEFAULT_INTERACTIVE_CHAT_TIMEOUT_MS = 15_000;
 const DEFAULT_STRUCTURED_CHAT_TIMEOUT_MS = 30_000;
@@ -508,6 +508,9 @@ export class CodexAdapter implements AgentAdapter {
       signal: options?.signal,
       idleTimeoutMs,
       hardCeilingMs: chatHardCeilingMs(idleTimeoutMs, 'AGENTIS_CODEX_CHAT_HARD_CEILING_MS'),
+      activityId: `codex-cli-${sessionKey}`,
+      transport: 'codex_cli',
+      attempt: runtimeAttemptFromSessionKey(sessionKey),
       interpret,
       formatExitError: (code, stderr, stdoutErr) => formatCodexExitError(code, stderr, stdoutErr),
       onEmptyResult: () => this.opts.logger.warn('codex.chat.no_output_parsed', { types: [...seenTypes].slice(0, 40) }),

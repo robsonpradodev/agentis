@@ -99,6 +99,147 @@ export function registerChannelTools(registry: AgentisToolRegistry, deps: ToolHa
     },
     {
       definition: {
+        id: 'agentis.channel.inbox',
+        family: 'inspect',
+        description: 'See the authorized channel inbox holistically: recent contacts, names, last inbound/outbound messages, relationship state, and stable recipientRef values. Use selector:"last_inbound" for “the last person who messaged”; never ask for a phone number or JID when this tool resolves a recipient.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            operation: { type: 'string', enum: ['recent', 'search', 'get', 'history', 'resolve'], description: 'Default: recent.' },
+            connectionId: { type: 'string' },
+            query: { type: 'string', description: 'Contact name, alias, phone, username, or other provider identity.' },
+            recipientRef: { type: 'string', description: 'Stable peer:<id> reference returned by this tool.' },
+            conversationId: { type: 'string' },
+            selector: { type: 'string', enum: ['last_inbound', 'last_contact'] },
+            limit: { type: 'number', minimum: 1, maximum: 50 },
+            cursor: { type: 'string' },
+          },
+        },
+        mutating: false,
+        mcpExposed: true,
+      },
+      handler: (args, ctx) => {
+        if (!deps.channelInbox) throw new AgentisError('CHANNEL_BRIDGE_UNAVAILABLE', 'channel inbox is not configured');
+        const operation = typeof args.operation === 'string' ? args.operation : 'recent';
+        const connectionId = typeof args.connectionId === 'string' ? args.connectionId : ctx.channelOrigin?.connectionId ?? null;
+        if (operation === 'get') {
+          const ref = typeof args.recipientRef === 'string' ? args.recipientRef : '';
+          const peer = deps.channelInbox.get(ctx.workspaceId, ref);
+          if (!peer) throw new AgentisError('RESOURCE_NOT_FOUND', 'channel recipient not found');
+          return { peer };
+        }
+        if (operation === 'history') {
+          const ref = typeof args.recipientRef === 'string' ? args.recipientRef : '';
+          return { recipientRef: ref, messages: deps.channelInbox.history(ctx.workspaceId, ref, numericLimit(args.limit, 30)) };
+        }
+        if (operation === 'resolve') {
+          return deps.channelInbox.resolve({
+            workspaceId: ctx.workspaceId,
+            connectionId,
+            recipientRef: typeof args.recipientRef === 'string' ? args.recipientRef : null,
+            conversationId: typeof args.conversationId === 'string' ? args.conversationId : null,
+            query: typeof args.query === 'string' ? args.query : null,
+            selector: args.selector === 'last_inbound' ? 'last_inbound' : args.selector === 'last_contact' ? 'last_contact' : undefined,
+          });
+        }
+        return deps.channelInbox.list({
+          workspaceId: ctx.workspaceId,
+          connectionId,
+          query: operation === 'search' && typeof args.query === 'string' ? args.query : null,
+          excludeOwner: true,
+          limit: numericLimit(args.limit, 20),
+          cursor: typeof args.cursor === 'string' ? args.cursor : null,
+        });
+      },
+    },
+    {
+      definition: {
+        id: 'agentis.channel.action.create',
+        family: 'run',
+        description: 'Create and, when authorized and due now, execute a durable goal-scoped outbound action to a canonical recipientRef. Verified-owner commands execute immediately; autonomous outreach must reference a subjectId or goalRef. Delivery is idempotent and resumable.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            connectionId: { type: 'string' },
+            recipientRef: { type: 'string' },
+            goal: { type: 'string' },
+            goalRef: { type: 'string' },
+            subjectId: { type: 'string' },
+            body: { type: 'string' },
+            messages: { type: 'array', items: { type: 'object', properties: { body: { type: 'string' } } } },
+            scheduledFor: { type: 'string' },
+            requireApproval: { type: 'boolean' },
+          },
+          required: ['recipientRef', 'goal'],
+        },
+        mutating: true,
+        approval: { riskLevel: 'medium', reversible: false, externalSideEffects: true },
+        mcpExposed: true,
+      },
+      handler: async (args, ctx) => {
+        if (!deps.channelActions) throw new AgentisError('CHANNEL_BRIDGE_UNAVAILABLE', 'channel action engine is not configured');
+        if (!ctx.agentId) throw new AgentisError('VALIDATION_FAILED', 'an operating agent is required');
+        const connectionId = typeof args.connectionId === 'string' ? args.connectionId : ctx.channelOrigin?.connectionId ?? '';
+        const recipientRef = typeof args.recipientRef === 'string' ? args.recipientRef : '';
+        const goal = typeof args.goal === 'string' ? args.goal : '';
+        const ownerIdentity = ctx.channelOrigin?.ownerVerified && deps.channelIdentity
+          ? deps.channelIdentity.principal({ workspaceId: ctx.workspaceId, connectionId: ctx.channelOrigin.connectionId, channelKind: ctx.channelOrigin.kind, handle: ctx.channelOrigin.chatId }).identityId
+          : null;
+        return deps.channelActions.createAndExecute({
+          workspaceId: ctx.workspaceId,
+          appId: ctx.appId,
+          agentId: ctx.agentId,
+          requesterIdentityId: ownerIdentity,
+          connectionId,
+          recipientRef,
+          conversationId: null,
+          subjectId: typeof args.subjectId === 'string' ? args.subjectId : null,
+          goalRef: typeof args.goalRef === 'string' ? args.goalRef : null,
+          goal,
+          body: typeof args.body === 'string' ? args.body : '',
+          messages: Array.isArray(args.messages) ? parseMessages(args.messages) : undefined,
+          authorizationBasis: ctx.channelOrigin?.ownerVerified ? 'verified_owner_command' : 'standing_goal',
+          scheduledFor: typeof args.scheduledFor === 'string' ? args.scheduledFor : null,
+          requireApproval: args.requireApproval === true,
+          userId: ctx.userId,
+        });
+      },
+    },
+    {
+      definition: {
+        id: 'agentis.channel.action.list',
+        family: 'inspect',
+        description: 'List durable planned, approval-held, executing, delivered, failed, or cancelled channel actions.',
+        inputSchema: { type: 'object', properties: { connectionId: { type: 'string' }, status: { type: 'string' }, limit: { type: 'number', minimum: 1, maximum: 100 } } },
+        mutating: false,
+        mcpExposed: true,
+      },
+      handler: (args, ctx) => {
+        if (!deps.channelActions) throw new AgentisError('CHANNEL_BRIDGE_UNAVAILABLE', 'channel action engine is not configured');
+        return { actions: deps.channelActions.list(ctx.workspaceId, {
+          ...(typeof args.connectionId === 'string' ? { connectionId: args.connectionId } : {}),
+          ...(typeof args.status === 'string' ? { status: args.status as never } : {}),
+          limit: numericLimit(args.limit, 30),
+        }) };
+      },
+    },
+    {
+      definition: {
+        id: 'agentis.channel.action.cancel',
+        family: 'run',
+        description: 'Cancel a pending durable channel action before delivery.',
+        inputSchema: { type: 'object', properties: { actionId: { type: 'string' }, reason: { type: 'string' } }, required: ['actionId'] },
+        mutating: true,
+        approval: { riskLevel: 'low', reversible: false, externalSideEffects: false },
+        mcpExposed: true,
+      },
+      handler: (args, ctx) => {
+        if (!deps.channelActions) throw new AgentisError('CHANNEL_BRIDGE_UNAVAILABLE', 'channel action engine is not configured');
+        return { action: deps.channelActions.cancel(ctx.workspaceId, String(args.actionId ?? ''), typeof args.reason === 'string' ? args.reason : 'cancelled by agent') };
+      },
+    },
+    {
+      definition: {
         id: 'agentis.connection.bind_app',
         family: 'run',
         description: 'Bind a native channel connection to an Agentic App so inbound conversations run in that App context. Pass appId:null to unbind. Both resources must belong to this workspace.',
@@ -150,13 +291,18 @@ export function registerChannelTools(registry: AgentisToolRegistry, deps: ToolHa
       definition: {
         id: 'agentis.channel.send',
         family: 'run',
-        description: 'Send a message — optionally with media attachments, or a natural burst of several messages — through a native Agentis channel connection. In a turn that already came from a channel, omit `to` only to address that same conversation; always pass the explicit address when the person asks you to contact someone else. Media kinds: image, video, audio, voice note, sticker, file. WhatsApp accepts explicit phone numbers with country code (for example +12345678901) or WhatsApp JIDs. To send a screenshot, first call agentis.browser.screenshot and pass its `ref` (e.g. "artifact:<id>") as an attachment url. Use `messages[]` to send several messages in sequence (e.g. a photo, then a follow-up line).',
+        description: 'Send a message through a native Agentis channel. Prefer recipientRef from agentis.channel.inbox for another contact; Agentis resolves provider addresses internally and records an idempotent action. Raw `to` remains for explicit phone/JID/backward compatibility. In a channel-origin turn, omit the destination only for the current conversation.',
         inputSchema: {
           type: 'object',
           properties: {
             connectionId: { type: 'string', description: 'Specific channel connection id. Optional when kind resolves to one active channel.' },
             kind: { type: 'string', enum: [...CHANNEL_KINDS], description: 'Channel kind to use when connectionId is omitted.' },
             to: { type: 'string', description: 'Channel destination. Use "default" or omit for the saved default target. WhatsApp may be a phone number, JID, or saved alias.' },
+            recipientRef: { type: 'string', description: 'Stable peer:<id> returned by agentis.channel.inbox. Preferred for known contacts.' },
+            conversationId: { type: 'string', description: 'Resolve the canonical recipient from an existing channel conversation.' },
+            goal: { type: 'string', description: 'Why this cross-recipient send advances the owner command or standing goal.' },
+            goalRef: { type: 'string', description: 'Durable plan/goal id for autonomous outreach.' },
+            subjectId: { type: 'string', description: 'Durable relationship Subject for goal-scoped outreach.' },
             body: { type: 'string', description: 'Message body / caption. May be empty when sending attachments only. Ignored when messages[] is provided.' },
             deliveryRole: {
               type: 'string',
@@ -193,6 +339,61 @@ export function registerChannelTools(registry: AgentisToolRegistry, deps: ToolHa
         let kind = typeof args.kind === 'string' ? args.kind : null;
         let to = typeof args.to === 'string' ? args.to : null;
         const origin = ctx.channelOrigin;
+        const recipientRef = typeof args.recipientRef === 'string' ? args.recipientRef : null;
+        const targetConversationId = typeof args.conversationId === 'string' ? args.conversationId : null;
+        if ((recipientRef || targetConversationId) && deps.channelInbox) {
+          const resolved = deps.channelInbox.resolve({
+            workspaceId: ctx.workspaceId,
+            connectionId,
+            recipientRef,
+            conversationId: targetConversationId,
+          });
+          if (!resolved.resolved) throw new AgentisError('CHANNEL_TARGET_AMBIGUOUS_OR_MISSING', 'The canonical recipient could not be resolved.', { details: { candidates: resolved.candidates } });
+          if (origin && !origin.ownerVerified) {
+            const originPeerId = deps.channelIdentity?.principal({
+              workspaceId: ctx.workspaceId,
+              connectionId: origin.connectionId,
+              channelKind: origin.kind,
+              handle: origin.chatId,
+            }).identityId ?? null;
+            const sameCanonicalPeer = originPeerId
+              ? originPeerId === resolved.peer.peerIdentityId
+              : resolved.peer.connectionId === origin.connectionId
+                && sameChannelRecipient(origin.kind, resolved.to, origin.chatId);
+            if (!sameCanonicalPeer) {
+              throw new AgentisError(
+                'CONNECTION_SCOPE_MISSING',
+                'A customer-originated turn cannot initiate an action toward another contact.',
+                { remediation: 'Cross-recipient actions require a verified owner command or an authorized goal-driven background task.' },
+              );
+            }
+          }
+          connectionId = resolved.peer.connectionId;
+          kind = resolved.peer.channelKind;
+          to = resolved.to;
+          if (deps.channelActions && ctx.agentId) {
+            const requesterIdentityId = origin?.ownerVerified && deps.channelIdentity
+              ? deps.channelIdentity.principal({ workspaceId: ctx.workspaceId, connectionId: origin.connectionId, channelKind: origin.kind, handle: origin.chatId }).identityId
+              : null;
+            const action = await deps.channelActions.createAndExecute({
+              workspaceId: ctx.workspaceId,
+              appId: ctx.appId,
+              agentId: ctx.agentId,
+              requesterIdentityId,
+              connectionId,
+              recipientRef: resolved.peer.recipientRef,
+              conversationId: resolved.peer.conversationId,
+              subjectId: typeof args.subjectId === 'string' ? args.subjectId : resolved.peer.subjectId,
+              goalRef: typeof args.goalRef === 'string' ? args.goalRef : null,
+              goal: typeof args.goal === 'string' && args.goal.trim() ? args.goal : 'fulfil the explicit outbound messaging instruction',
+              body: typeof args.body === 'string' ? args.body : '',
+              messages: Array.isArray(args.messages) ? parseMessages(args.messages) : undefined,
+              authorizationBasis: origin?.ownerVerified ? 'verified_owner_command' : 'standing_goal',
+              userId: ctx.userId,
+            });
+            return { ...action.result, action: action.action };
+          }
+        }
         if (origin) {
           const explicitlyNamedThirdParties = (origin.explicitRecipients ?? [])
             .filter((recipient) => !sameChannelRecipient(origin.kind, recipient, origin.chatId));
@@ -530,6 +731,10 @@ function parseNativeContent(value: unknown): OutboundNativeContent {
 function parseKind(value: unknown): ChannelKind | null {
   if (typeof value !== 'string') return null;
   return CHANNEL_KINDS.has(value as ChannelKind) ? value as ChannelKind : null;
+}
+
+function numericLimit(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) ? Math.max(1, Math.floor(value)) : fallback;
 }
 
 /** Resolve a connection id from explicit id, or a kind that maps to one active/default connection. */

@@ -128,6 +128,64 @@ export function nextCronFire(expression: string, from: Date = new Date()): Date 
   return null;
 }
 
+/**
+ * Next fire for a cron whose fields are interpreted in an IANA timezone.
+ * Scanning absolute minutes keeps DST transitions correct: skipped local times
+ * do not fire, while repeated local times remain distinct instants.
+ */
+export function nextCronFireInTimezone(
+  expression: string,
+  timezone = 'UTC',
+  from: Date = new Date(),
+): Date | null {
+  if (!timezone || timezone.toUpperCase() === 'UTC') return nextCronFire(expression, from);
+  const spec = parseCron(expression);
+  if (!spec) return null;
+  let formatter: Intl.DateTimeFormat;
+  try {
+    formatter = new Intl.DateTimeFormat('en-US', {
+      timeZone: timezone,
+      hourCycle: 'h23',
+      year: 'numeric',
+      month: 'numeric',
+      day: 'numeric',
+      weekday: 'short',
+      hour: 'numeric',
+      minute: 'numeric',
+    });
+  } catch {
+    return null;
+  }
+  const weekday = new Map([
+    ['Sun', 0], ['Mon', 1], ['Tue', 2], ['Wed', 3], ['Thu', 4], ['Fri', 5], ['Sat', 6],
+  ]);
+  const cursor = new Date(from.getTime());
+  cursor.setUTCSeconds(0, 0);
+  cursor.setUTCMinutes(cursor.getUTCMinutes() + 1);
+  const limit = from.getTime() + 400 * 24 * 60 * 60 * 1000;
+  while (cursor.getTime() <= limit) {
+    const parts = Object.fromEntries(
+      formatter.formatToParts(cursor).map((part) => [part.type, part.value]),
+    );
+    const month = Number(parts.month);
+    const dom = Number(parts.day);
+    const dow = weekday.get(parts.weekday ?? '') ?? -1;
+    const hour = Number(parts.hour);
+    const minute = Number(parts.minute);
+    const domMatch = spec.dayOfMonth.has(dom);
+    const dowMatch = spec.dayOfWeek.has(dow);
+    const dayMatch = (!spec.domAny && !spec.dowAny) ? (domMatch || dowMatch) : (domMatch && dowMatch);
+    if (
+      spec.month.has(month)
+      && dayMatch
+      && spec.hour.has(hour)
+      && spec.minute.has(minute)
+    ) return new Date(cursor);
+    cursor.setUTCMinutes(cursor.getUTCMinutes() + 1);
+  }
+  return null;
+}
+
 /** Human hint for a cron expression ("daily 09:00", "every 15 min", …); falls back to the raw expr. */
 export function describeCron(expression: string): string {
   const spec = parseCron(expression);

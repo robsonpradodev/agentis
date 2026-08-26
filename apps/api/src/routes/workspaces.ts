@@ -10,6 +10,7 @@ import { AgentisError, REALTIME_EVENTS, REALTIME_ROOMS, schemas } from '@agentis
 import { schema } from '@agentis/db/sqlite';
 import type { AgentisSqliteDb } from '@agentis/db/sqlite';
 import type { AuthService } from '../services/auth.js';
+import type { ApprovalInboxService } from '../services/approvalInbox.js';
 import type { BusMessage, EventBus } from '../event-bus.js';
 import type { GroundingDiscoveryService } from '../grounding/discovery.js';
 import type { GroundingRuntime } from '../grounding/groundingRuntime.js';
@@ -21,6 +22,7 @@ export function buildWorkspaceRoutes(deps: {
   db: AgentisSqliteDb;
   auth: AuthService;
   bus: EventBus;
+  approvals?: ApprovalInboxService;
   groundingDiscovery?: GroundingDiscoveryService;
   groundingRuntime?: GroundingRuntime;
 }) {
@@ -89,7 +91,7 @@ export function buildWorkspaceRoutes(deps: {
       if (typeof heartbeat === 'object' && 'unref' in heartbeat) heartbeat.unref();
 
       c.req.raw.signal.addEventListener('abort', close, { once: true });
-      await write('snapshot', buildCanvasSnapshot(deps.db, workspaceId));
+      await write('snapshot', buildCanvasSnapshot(deps.db, workspaceId, deps.approvals));
       await new Promise<void>((resolve) => {
         c.req.raw.signal.addEventListener('abort', () => resolve(), { once: true });
       });
@@ -318,7 +320,7 @@ async function ensureWorkspaceBrainInternal(
   await deps.groundingRuntime.tickWorkspace(workspaceId).catch(() => {});
 }
 
-function buildCanvasSnapshot(db: AgentisSqliteDb, workspaceId: string) {
+function buildCanvasSnapshot(db: AgentisSqliteDb, workspaceId: string, approvalsService?: ApprovalInboxService) {
   const agents = db
     .select({
       id: schema.agents.id,
@@ -347,7 +349,7 @@ function buildCanvasSnapshot(db: AgentisSqliteDb, workspaceId: string) {
     .all()
     .filter((run) => run.status === 'RUNNING' || run.status === 'CREATED' || run.status === 'WAITING')
     .slice(0, 50);
-  const approvals = db
+  const approvals = approvalsService?.list(workspaceId, 'pending') ?? db
     .select({
       id: schema.approvalRequests.id,
       runId: schema.approvalRequests.runId,

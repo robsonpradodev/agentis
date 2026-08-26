@@ -16,7 +16,7 @@ import type {
 import type { Logger } from '../logger.js';
 import { resolveSpawnCwd, resolveSpawnTarget, withExpandedPath } from '../services/pathExpander.js';
 import { buildMarkerToolPrompt } from './markerToolProtocol.js';
-import { toolActivityLabel } from './runtimeProgress.js';
+import { runtimeAttemptFromSessionKey, toolActivityLabel } from './runtimeProgress.js';
 import { linkAbortSignal } from './abort.js';
 import {
   chatHardCeilingMs,
@@ -370,6 +370,9 @@ export class CursorAdapter implements AgentAdapter {
       signal: options?.signal,
       idleTimeoutMs,
       hardCeilingMs: chatHardCeilingMs(idleTimeoutMs, 'AGENTIS_CURSOR_CHAT_HARD_CEILING_MS'),
+      activityId: `cursor-cli-${sessionKey}`,
+      transport: 'cursor_cli',
+      attempt: runtimeAttemptFromSessionKey(sessionKey),
       interpret,
       formatExitError: (_code, stderr, stdoutError) => stdoutError.trim() || stderr.trim(),
     });

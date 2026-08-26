@@ -12,7 +12,7 @@ import {
   type WorkflowGraph,
   type WorkflowNode,
 } from '@agentis/core';
-import { nextCronFire } from '../cronNextFire.js';
+import { nextCronFire, nextCronFireInTimezone } from '../cronNextFire.js';
 import { schema } from '@agentis/db/sqlite';
 import type { AgentisSqliteDb } from '@agentis/db/sqlite';
 import type { TriggerRuntime } from '../../engine/TriggerRuntime.js';
@@ -27,9 +27,12 @@ export interface WorkflowTriggerDeployment {
   triggerId: string;
   workflowId: string;
   triggerType: TriggerType;
+  /** Canvas-facing type before runtime normalization. */
+  authoredTriggerType: TriggerType;
   status: 'active' | 'paused' | 'error';
   updatedAt: string;
   lastFiredAt: string | null;
+  nextRunAt: string | null;
   webhookUrl?: string;
   webhookSecret?: string;
   config: Record<string, unknown>;
@@ -44,7 +47,7 @@ export class WorkflowTriggerDeploymentService {
 
   get(workspaceId: string, workflowId: string): WorkflowTriggerDeployment | null {
     const workflow = this.#loadWorkflow(workspaceId, workflowId);
-    const graph = workflow.graph as WorkflowGraph;
+    const graph = this.#deploymentGraph(workflow);
     const triggerNode = findTriggerNode(graph, false);
     const triggerId = triggerNode?.config.kind === 'trigger' ? triggerNode.config.triggerId : undefined;
     const rows = this.#workflowTriggers(workspaceId, workflowId);
@@ -62,7 +65,11 @@ export class WorkflowTriggerDeploymentService {
     override?: { ack: string };
   }): Promise<WorkflowTriggerDeployment> {
     const workflow = this.#loadWorkflow(args.workspaceId, args.workflowId);
-    const graph = workflow.graph as WorkflowGraph;
+    // Activation is an explicit request to apply what the operator currently
+    // sees in the editor. Trigger settings live on the candidate head while
+    // ordinary autosave/revision policy remains isolated, so reading only the
+    // published graph can silently arm the previous trigger type (often manual).
+    const graph = this.#deploymentGraph(workflow);
     const health = preflightWorkflow({
       db: this.db,
       workspaceId: args.workspaceId,
@@ -91,14 +98,14 @@ export class WorkflowTriggerDeploymentService {
       const stage = deriveLoopStage(readBuildLoop(workflow.settings), graphContentHash(graph));
       const revisionProven = workflow.trustState === 'proven' || workflow.trustState === 'break_glass';
       if (!revisionProven || (stage !== 'hardened' && stage !== 'production')) {
-        if (args.override?.ack?.trim()) {
-          const operator = this.db.select({ isAdmin: schema.users.isAdmin })
-            .from(schema.users)
-            .where(eq(schema.users.id, args.userId))
-            .get();
-          if (!operator?.isAdmin) {
-            throw new AgentisError('AUTH_FORBIDDEN', 'Only an administrator may arm an unproven unattended workflow.');
-          }
+        const operator = this.db.select({ isAdmin: schema.users.isAdmin })
+          .from(schema.users)
+          .where(eq(schema.users.id, args.userId))
+          .get();
+
+        const ackReason = args.override?.ack?.trim() || (operator?.isAdmin ? 'Administrator direct activation' : null);
+
+        if (ackReason) {
           this.db.insert(schema.auditEntries).values({
             id: randomUUID(),
             workspaceId: args.workspaceId,
@@ -110,7 +117,7 @@ export class WorkflowTriggerDeploymentService {
             actorType: 'user',
             actorId: args.userId,
             inputSummary: `stage=${stage}; revisionTrust=${workflow.trustState}`,
-            outputSummary: `override ack: ${args.override.ack.slice(0, 300)}`,
+            outputSummary: `override ack: ${ackReason.slice(0, 300)}`,
             at: new Date().toISOString(),
           }).run();
         } else {
@@ -138,6 +145,10 @@ export class WorkflowTriggerDeploymentService {
         }
       }
     }
+    const persistedConfig = {
+      ...runtimeConfig,
+      __authoredTriggerType: authored.triggerType,
+    };
     const existingRows = this.#workflowTriggers(args.workspaceId, args.workflowId);
     const existing = (authored.triggerId
       ? existingRows.find((candidate) => candidate.id === authored.triggerId)
@@ -166,7 +177,7 @@ export class WorkflowTriggerDeploymentService {
           ambientId: args.ambientId,
           userId: args.userId,
           triggerType,
-          config: runtimeConfig,
+          config: persistedConfig,
           status: 'paused',
           webhookSecret,
           updatedAt: now,
@@ -183,7 +194,7 @@ export class WorkflowTriggerDeploymentService {
           workflowId: args.workflowId,
           userId: args.userId,
           triggerType,
-          config: runtimeConfig,
+          config: persistedConfig,
           status: 'paused',
           webhookSecret,
           createdAt: now,
@@ -210,7 +221,7 @@ export class WorkflowTriggerDeploymentService {
         ambientId: args.ambientId,
         userId: args.userId,
         triggerType,
-        config: runtimeConfig,
+        config: persistedConfig,
       });
       try {
         await this.runtime.activate(active);
@@ -490,19 +501,39 @@ export class WorkflowTriggerDeploymentService {
       .all();
   }
 
+  #deploymentGraph(workflow: typeof schema.workflows.$inferSelect): WorkflowGraph {
+    if (workflow.candidateRevisionId) {
+      const candidate = this.db.select({ graphJson: schema.workflowGraphRevisions.graphJson })
+        .from(schema.workflowGraphRevisions)
+        .where(and(
+          eq(schema.workflowGraphRevisions.id, workflow.candidateRevisionId),
+          eq(schema.workflowGraphRevisions.workflowId, workflow.id),
+          eq(schema.workflowGraphRevisions.workspaceId, workflow.workspaceId),
+        ))
+        .get();
+      if (candidate?.graphJson) return candidate.graphJson as WorkflowGraph;
+    }
+    return workflow.graph as WorkflowGraph;
+  }
+
   #present(
     row: typeof schema.triggers.$inferSelect,
     webhookSecret?: string,
   ): WorkflowTriggerDeployment {
     const triggerType = row.triggerType as TriggerType;
+    const storedConfig = objectRecord(row.config);
+    const authoredType = deployedAuthoredTriggerType(triggerType, storedConfig);
+    const { __authoredTriggerType: _authoredType, ...config } = storedConfig;
     return {
       triggerId: row.id,
       workflowId: row.workflowId,
       triggerType,
+      authoredTriggerType: authoredType,
       status: normalizeStatus(row.status),
       updatedAt: row.updatedAt,
       lastFiredAt: row.lastFiredAt,
-      config: objectRecord(row.config),
+      nextRunAt: nextDeploymentFire(triggerType, config),
+      config,
       ...(triggerType === 'webhook' ? { webhookUrl: `/v1/webhooks/trigger/${row.id}` } : {}),
       ...(webhookSecret ? { webhookSecret } : {}),
       ...(triggerType === 'persistent_listener'
@@ -565,6 +596,21 @@ export class WorkflowTriggerDeploymentService {
   }
 }
 
+function deployedAuthoredTriggerType(
+  triggerType: TriggerType,
+  config: Record<string, unknown>,
+): TriggerType {
+  const stored = config.__authoredTriggerType;
+  if (typeof stored === 'string' && [
+    'manual', 'cron', 'webhook', 'persistent_listener', 'error_trigger', 'email_imap', 'rss_feed',
+  ].includes(stored)) return stored as TriggerType;
+  if (triggerType !== 'persistent_listener') return triggerType;
+  const source = objectRecord(config.source);
+  if (source.kind === 'rss') return 'rss_feed';
+  if (source.kind === 'email_imap') return 'email_imap';
+  return 'persistent_listener';
+}
+
 function findTriggerNode(graph: WorkflowGraph, required: boolean): WorkflowNode | null {
   const triggers = graph.nodes.filter((node) => node.config.kind === 'trigger');
   if (triggers.length === 1) return triggers[0]!;
@@ -596,6 +642,28 @@ function authoredTriggerType(graph: WorkflowGraph | null | undefined): TriggerNo
   const node = graph?.nodes?.find((n) => n.config?.kind === 'trigger');
   if (!node || node.config.kind !== 'trigger') return null;
   return (node.config as TriggerNodeConfig).triggerType ?? null;
+}
+
+function nextDeploymentFire(
+  triggerType: TriggerType,
+  config: Record<string, unknown>,
+): string | null {
+  if (triggerType !== 'cron') return null;
+  const fallbackTimezone = typeof config.timezone === 'string' ? config.timezone : 'UTC';
+  const rules = Array.isArray(config.scheduleRules)
+    ? config.scheduleRules as Array<{ expression?: unknown; timezone?: unknown }>
+    : [{ expression: config.expression, timezone: fallbackTimezone }];
+  const next = rules
+    .map((rule) => {
+      if (typeof rule.expression !== 'string' || !rule.expression.trim()) return null;
+      const timezone = typeof rule.timezone === 'string' && rule.timezone.trim()
+        ? rule.timezone
+        : fallbackTimezone;
+      return nextCronFireInTimezone(rule.expression, timezone);
+    })
+    .filter((value): value is Date => Boolean(value))
+    .sort((left, right) => left.getTime() - right.getTime())[0];
+  return next?.toISOString() ?? null;
 }
 
 function runtimeConfigFromNode(config: TriggerNodeConfig): Record<string, unknown> {

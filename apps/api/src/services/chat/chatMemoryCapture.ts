@@ -493,8 +493,8 @@ function isExternalSender(args: { senderTrust?: SenderTrust }): boolean {
 function extractImmediateAgentCorrection(message: string, actorLabel: string): OperatorMemorySignal | null {
   const text = cleanSignal(message);
   if (!text || looksSensitive(text) || isQuestion(text)) return null;
-  const binding = /\b(do not|don'?t|never|must not|stop|keep|preserve|leave)\b/i.test(text);
-  const correction = /\b(again|one more time|next time|correction|you (?:changed|removed|deleted|replaced|overwrote|broke)|simply (?:changed|removed|deleted)|from now on|going forward)\b/i.test(text);
+  const binding = /\b(do not|don'?t|never|must not|stop|keep|preserve|leave|não|nao|nunca|pare|mantenha|preserve|deixe)\b/i.test(text);
+  const correction = /\b(again|one more time|next time|correction|you (?:changed|removed|deleted|replaced|overwrote|broke)|simply (?:changed|removed|deleted)|from now on|going forward|a partir de agora|de agora em diante|está errado|esta errado|entendeu errado|não confunda|nao confunda|você confundiu|voce confundiu|corrija)\b/i.test(text);
   if (!binding || !correction) return null;
   return {
     kind: 'rule',

@@ -29,16 +29,20 @@ const ctx = { runId: 'run-1' } as Parameters<SelfHealController['relayChatDelta'
 const node = { id: 'node-1' } as Parameters<SelfHealController['relayChatDelta']>[1];
 const clip = (s: string, n: number) => s.slice(0, n);
 
-describe('relayChatDelta — activity phase mapping', () => {
-  it('flags a real failed tool call (phase:tool, status:error) as fail', () => {
+describe('relayChatDelta — single typed activity projection', () => {
+  it('retains a failed tool status without creating a lossy work-step duplicate', () => {
     const emitWorkStep = vi.fn();
-    const controller = makeController(emitWorkStep);
+    const notifyAgentActivity = vi.fn();
+    const controller = makeController(emitWorkStep, notifyAgentActivity);
     const delta: ChatDelta = {
       type: 'activity', id: 'a1', phase: 'tool', status: 'error',
       label: 'Failed agentis.build_workflow', detail: 'schema expects node "kind"',
     };
     controller.relayChatDelta(ctx, node, 'agent-1', delta, clip);
-    expect(emitWorkStep).toHaveBeenCalledWith(ctx, node, 'fail', expect.stringContaining('Failed agentis.build_workflow'));
+    expect(emitWorkStep).not.toHaveBeenCalled();
+    expect(notifyAgentActivity).toHaveBeenCalledWith(expect.objectContaining({
+      activityId: 'a1', activityPhase: 'tool', activityStatus: 'error', kind: 'tool_call',
+    }));
   });
 
   it('does not flag a successful tool call as fail', () => {
@@ -49,7 +53,7 @@ describe('relayChatDelta — activity phase mapping', () => {
       label: 'Used agentis.workflow.patch',
     };
     controller.relayChatDelta(ctx, node, 'agent-1', delta, clip);
-    expect(emitWorkStep).toHaveBeenCalledWith(ctx, node, 'thinking', expect.stringContaining('Used agentis.workflow.patch'));
+    expect(emitWorkStep).not.toHaveBeenCalled();
   });
 
   it('still flags a terminal turn-level error (phase:error) as fail', () => {
@@ -60,7 +64,7 @@ describe('relayChatDelta — activity phase mapping', () => {
       label: 'Interactive chat unavailable',
     };
     controller.relayChatDelta(ctx, node, 'agent-1', delta, clip);
-    expect(emitWorkStep).toHaveBeenCalledWith(ctx, node, 'fail', expect.stringContaining('Interactive chat unavailable'));
+    expect(emitWorkStep).not.toHaveBeenCalled();
   });
 
   it('maps a terminal complete phase to complete', () => {
@@ -71,7 +75,7 @@ describe('relayChatDelta — activity phase mapping', () => {
       label: 'Repair finished',
     };
     controller.relayChatDelta(ctx, node, 'agent-1', delta, clip);
-    expect(emitWorkStep).toHaveBeenCalledWith(ctx, node, 'complete', expect.stringContaining('Repair finished'));
+    expect(emitWorkStep).not.toHaveBeenCalled();
   });
 });
 
@@ -85,13 +89,16 @@ describe('relayChatDelta — run-scoped reasoning mirror', () => {
       label: 'Claude Code', detail: 'Checking whether the packager already hashes raw bytes',
     };
     controller.relayChatDelta(ctx, node, 'agent-1', delta, clip);
-    expect(notifyAgentActivity).toHaveBeenCalledWith({
+    expect(notifyAgentActivity).toHaveBeenCalledWith(expect.objectContaining({
       runId: 'run-1',
       agentId: 'agent-1',
       taskId: 'node-1',
       kind: 'thinking',
       text: expect.stringContaining('Checking whether the packager already hashes raw bytes'),
-    });
+      activityId: 'runtime-progress-claude',
+      activityPhase: 'runtime',
+      activityStatus: 'running',
+    }));
   });
 
   it('mirrors tool-phase activity too, so the run terminal shows the full stream', () => {

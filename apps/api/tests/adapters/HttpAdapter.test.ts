@@ -77,4 +77,35 @@ describe('HttpAdapter chat', () => {
     });
     expect(deltas.at(-1)).toEqual({ type: 'done', finishReason: 'tool_calls' });
   });
+
+  it('uses marker calls when a text-only HTTP model runs a caller-managed agent_task', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      text: 'AGENTIS_TOOL_CALL {"name":"agentis.data.query","arguments":{"collection":"leads"}}',
+      finishReason: 'stop',
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    vi.stubEnv('AGENTIS_EXTENSION_HTTP_ALLOW_PRIVATE', 'true');
+    const adapter = new HttpAdapter({
+      agentId: 'agent-http', dispatchUrl: 'http://127.0.0.1/dispatch', chatUrl: 'http://127.0.0.1/chat', logger,
+    });
+
+    const deltas = await collect(adapter.chat(
+      [{ role: 'user', content: 'Select the next lead.' }],
+      [{ name: 'agentis.data.query', description: 'Query data.', parameters: { type: 'object' } }],
+      { toolMode: 'caller_loop', sessionKey: 'agent-task:run-1:node-1:attempt:1' },
+    ));
+
+    const body = JSON.parse(String(fetchMock.mock.calls[0]![1]!.body)) as { messages: ChatMessage[]; tools: unknown[]; supportsTools: boolean };
+    expect(body.supportsTools).toBe(false);
+    expect(body.tools).toHaveLength(0);
+    expect(body.messages[0]?.role).toBe('system');
+    expect(String(body.messages[0]?.content)).toContain('agentis.data.query');
+    expect(deltas).toContainEqual(expect.objectContaining({
+      type: 'tool_call', name: 'agentis.data.query', args: { collection: 'leads' },
+    }));
+    expect(deltas.at(-1)).toEqual({ type: 'done', finishReason: 'tool_calls' });
+  });
 });

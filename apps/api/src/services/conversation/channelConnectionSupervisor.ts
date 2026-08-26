@@ -42,6 +42,8 @@ import { chunkText, sleep, typingDelayMs, type HumanizeConfig } from './humanize
 import type { ConversationHandoffService } from './conversationHandoffService.js';
 import type { ConversationSummaryService } from './conversationSummaryService.js';
 import { resolveWhatsAppConnectionProfile, shouldClaimWhatsAppManualOutbound } from './channelBridge.js';
+import { isVerifiedChannelOwner } from './channelIdentityService.js';
+import type { ChannelIdentityService } from './channelIdentityService.js';
 
 type LiveSession = WhatsAppSession | TelegramSession | DiscordSession;
 
@@ -91,6 +93,8 @@ export interface ChannelConnectionSupervisorDeps {
   extractDocument?: (bytes: Buffer, mimeType: string, workspaceId: string, fileName?: string) => Promise<string | null>;
   handoffs?: ConversationHandoffService;
   summaries?: ConversationSummaryService;
+  /** Canonical provider-peer directory (PN/LID/name folding). */
+  identity?: ChannelIdentityService;
 }
 
 export interface LoginState {
@@ -98,6 +102,8 @@ export interface LoginState {
   qr?: string;
   qrDataUrl?: string;
   selfId?: string;
+  /** Safe, provider-agnostic reconnect progress for the QR pairing UI. */
+  recovery?: WhatsAppRecoveryState;
 }
 
 function discordIsGateway(settings: unknown): boolean {
@@ -232,6 +238,7 @@ export class ChannelConnectionSupervisor {
         ...(session.qr ? { qr: session.qr } : {}),
         ...(session.qrDataUrl ? { qrDataUrl: session.qrDataUrl } : {}),
         ...(session.selfId ? { selfId: session.selfId } : {}),
+        ...(session.recovery ? { recovery: session.recovery } : {}),
       };
     }
     return { status: session.status };
@@ -490,6 +497,19 @@ export class ChannelConnectionSupervisor {
         logger: this.deps.logger,
         onInbound: (msg) => this.#onInbound(connectionId, msg),
         onOutboundObserved: (msg) => this.observeOutbound(connectionId, msg),
+        onPeerObserved: (peer) => {
+          this.deps.identity?.observeAliases({
+            workspaceId: row.workspaceId,
+            connectionId: row.id,
+            channelKind: row.kind,
+            primaryHandle: peer.primaryChatId,
+            aliases: peer.aliases,
+            ...(peer.displayName ? { displayName: peer.displayName } : {}),
+            source: peer.source,
+            verified: peer.verified,
+            countMessage: false,
+          });
+        },
         ...(profile.historyReconciliation === 'recent'
           ? { onHistoryReconciled: (messages: WhatsAppHistoryEntry[]) => this.#reconcileWhatsAppHistory(connectionId, messages) }
           : {}),
@@ -546,6 +566,7 @@ export class ChannelConnectionSupervisor {
     chatId: string;
     body: string;
     from?: string;
+    alternateChatIds?: string[];
     threadId?: string;
     attachmentIds?: string[];
   }): void {
@@ -583,6 +604,16 @@ export class ChannelConnectionSupervisor {
     // Workspace-owned (null-agent) connection routes inbound to the orchestrator.
     const inboundAgentId = row.agentId ?? this.#resolveInboundAgentId(row.workspaceId);
     if (!inboundAgentId) return;
+    const peer = this.deps.identity?.observeAliases({
+      workspaceId: row.workspaceId,
+      connectionId: row.id,
+      channelKind: row.kind,
+      primaryHandle: msg.chatId,
+      aliases: msg.alternateChatIds,
+      ...(msg.from ? { displayName: msg.from } : {}),
+      source: 'inbound_message',
+      countMessage: false,
+    });
     const conversation = this.deps.conversations.getOrCreateByChannel({
       workspaceId: row.workspaceId,
       ambientId: row.ambientId,
@@ -590,6 +621,7 @@ export class ChannelConnectionSupervisor {
       agentId: inboundAgentId,
       channelConnectionId: row.id,
       channelChatId: msg.chatId,
+      channelPeerIdentityId: peer?.id ?? null,
       appId: row.appId ?? null,
     });
     const fromTag = msg.from ? `[${msg.from}] ` : '';
@@ -667,6 +699,15 @@ export class ChannelConnectionSupervisor {
 
     const agentId = row.agentId ?? this.#resolveInboundAgentId(row.workspaceId);
     if (!agentId) return;
+    const peer = this.deps.identity?.observeAliases({
+      workspaceId: row.workspaceId,
+      connectionId: row.id,
+      channelKind: row.kind,
+      primaryHandle: msg.chatId,
+      aliases: msg.alternateChatIds,
+      source: 'observed_outbound',
+      countMessage: false,
+    });
     const conversation = this.deps.conversations.getOrCreateByChannel({
       workspaceId: row.workspaceId,
       ambientId: row.ambientId,
@@ -674,12 +715,22 @@ export class ChannelConnectionSupervisor {
       agentId,
       channelConnectionId: row.id,
       channelChatId: msg.chatId,
+      channelPeerIdentityId: peer?.id ?? null,
       appId: row.appId ?? null,
     });
     const settings = row.settings && typeof row.settings === 'object' && !Array.isArray(row.settings)
       ? row.settings as { whatsappProfile?: unknown; ownerChatId?: unknown }
       : {};
-    if (shouldClaimWhatsAppManualOutbound(settings, msg.chatId)) {
+    const observedHandles = [...new Set([msg.chatId, ...(msg.alternateChatIds ?? [])].filter(Boolean))];
+    const shouldClaimHuman = observedHandles.every((handle) =>
+      shouldClaimWhatsAppManualOutbound(settings, handle, isVerifiedChannelOwner(this.deps.db, {
+        workspaceId: row.workspaceId,
+        connectionId: row.id,
+        channelKind: row.kind,
+        handle,
+      })),
+    );
+    if (shouldClaimHuman) {
       this.deps.handoffs?.claimHuman({
         workspaceId: row.workspaceId,
         conversationId: conversation.id,
@@ -737,6 +788,14 @@ export class ChannelConnectionSupervisor {
     if (!agentId) return;
     const touched = new Set<string>();
     for (const entry of [...entries].sort((a, b) => a.occurredAt.localeCompare(b.occurredAt))) {
+      const peer = this.deps.identity?.observeAliases({
+        workspaceId: row.workspaceId,
+        connectionId: row.id,
+        channelKind: row.kind,
+        primaryHandle: entry.chatId,
+        source: 'history_reconciliation',
+        countMessage: false,
+      });
       const conversation = this.deps.conversations.getOrCreateByChannel({
         workspaceId: row.workspaceId,
         ambientId: row.ambientId,
@@ -744,6 +803,7 @@ export class ChannelConnectionSupervisor {
         agentId,
         channelConnectionId: row.id,
         channelChatId: entry.chatId,
+        channelPeerIdentityId: peer?.id ?? null,
         appId: row.appId ?? null,
       });
       this.deps.conversations.appendReconciledChannelMessage({

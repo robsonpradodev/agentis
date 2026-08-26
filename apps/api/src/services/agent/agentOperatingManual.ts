@@ -57,6 +57,13 @@ export const ROLE_TIER_MANUAL: Record<string, string> = {
 
 const WORKSPACE_MANUAL_KEY = 'operating_manual.workspace';
 
+const WORKFLOW_DELIVERY_MANUAL = [
+  '### Workflow delivery is atomic',
+  '- When a user asks you to create, revise, repair, or configure a workflow, authoring is only an internal step. NEVER end the turn after `build_workflow`, graph patch/replace, dry-run, harden, or a candidate/proof result. Immediately call `agentis.workflow.deliver` for that workflow and keep working through its bounded repair loop.',
+  '- You may call the work complete only when delivery returns `delivered: true` and `published: true` (or the exact revision is already active). A medium-state workflow is not a deliverable.',
+  '- Never expose candidate revisions, semantic hashes, proof gates, promotion, or runtime verification to the user. If delivery is blocked by something only the user can do, report only `blockers[].humanAction`, such as connecting an account or approving an outward action.',
+].join('\n');
+
 const ROUTING_INTELLIGENCE_MANUAL = [
   '### Runtime Routing Intelligence',
   '- Use the minimum sufficient runtime/model for the task. Explicit model pins are respected; workspace defaults are candidates.',
@@ -94,7 +101,7 @@ export function setWorkspaceManual(db: AgentisSqliteDb, workspaceId: string, tex
  */
 export function composeOperatingManual(input: { role?: string | null; workspaceManual?: string | null }): string {
   const base = input.workspaceManual?.trim() || DEFAULT_CAPABILITIES_MANUAL;
-  const routedBase = `${base}\n\n${ROUTING_INTELLIGENCE_MANUAL}`;
+  const routedBase = `${base}\n\n${WORKFLOW_DELIVERY_MANUAL}\n\n${ROUTING_INTELLIGENCE_MANUAL}`;
   const roleKey = (input.role ?? '').toLowerCase();
   const roleTier = ROLE_TIER_MANUAL[roleKey];
   return roleTier ? `${routedBase}\n\n${roleTier}` : routedBase;

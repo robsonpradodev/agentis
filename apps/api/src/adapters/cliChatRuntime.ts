@@ -149,6 +149,16 @@ export interface CliChatRuntimeConfig {
   idleTimeoutMs: number;
   /** Absolute ceiling regardless of streaming activity. */
   hardCeilingMs: number;
+  /** The child intentionally withholds progress and emits only its final answer. */
+  progressVisibility?: 'streaming' | 'final_only';
+  /** Stable activity identity supplied by the owning runtime/session. */
+  activityId?: string;
+  /** Typed transport metadata retained by workflow activity replay. */
+  transport?: string;
+  /** Workflow retry attempt retained by workflow activity replay. */
+  attempt?: number;
+  /** Adapter-specific filter for non-JSON stdout retained as a final-answer fallback. */
+  keepRawFallbackLine?: (line: string) => boolean;
   /** Classify one parsed stdout event. */
   interpret: CliChatInterpreter;
   /**
@@ -209,7 +219,9 @@ export async function* runCliChatTurn(cfg: CliChatRuntimeConfig): AsyncIterable<
   // output resets the silence ceiling; self-emitted heartbeats do not. Set
   // `hardCeilingMs <= 0` to disable the ceiling entirely (unlimited).
   const turnStartedAt = Date.now();
+  const turnStartedAtIso = new Date(turnStartedAt).toISOString();
   const hardCeilingMs = cfg.hardCeilingMs;
+  const finalOnly = cfg.progressVisibility === 'final_only';
   const heartbeatMs = Math.max(5_000, Math.min(cfg.idleTimeoutMs, HEARTBEAT_INTERVAL_MS));
   let heartbeatTimer: NodeJS.Timeout | undefined;
   let silenceTimer: NodeJS.Timeout | undefined;
@@ -225,16 +237,20 @@ export async function* runCliChatTurn(cfg: CliChatRuntimeConfig): AsyncIterable<
   const armHeartbeat = () => {
     if (heartbeatTimer) clearTimeout(heartbeatTimer);
     heartbeatTimer = setTimeout(() => {
-      const elapsed = Date.now() - turnStartedAt;
       queue.push(runtimeProgressActivity({
-        id: `${cfg.logTag}-heartbeat`,
+        id: cfg.activityId ?? `${cfg.logTag}-heartbeat`,
         runtimeName: cfg.displayName,
+        // Elapsed time belongs to the UI clock, not the activity identity/text.
+        // Keeping this label stable lets durable and live projections replace the
+        // same row instead of appending one row every heartbeat.
         safeLabel: firstOutputSeen
-          ? `${cfg.displayName} is working — ${formatElapsed(elapsed)} elapsed`
-          : `Waiting for ${cfg.displayName} to respond — ${formatElapsed(elapsed)} so far, no output yet`,
-        text: firstOutputSeen
-          ? `${cfg.displayName} is working — ${formatElapsed(elapsed)} elapsed`
-          : `Waiting for ${cfg.displayName} to respond — ${formatElapsed(elapsed)} so far, no output yet`,
+          ? `${cfg.displayName} is working`
+          : finalOnly
+            ? `Waiting for ${cfg.displayName} CLI final response`
+            : `Waiting for ${cfg.displayName} provider output`,
+        transport: cfg.transport,
+        attempt: cfg.attempt,
+        startedAt: turnStartedAtIso,
       }));
       armHeartbeat(); // keep beating; a heartbeat is NOT real output, so silence keeps counting
     }, heartbeatMs);
@@ -283,6 +299,12 @@ export async function* runCliChatTurn(cfg: CliChatRuntimeConfig): AsyncIterable<
   // (so we never duplicate the answer when both a stream and a final event come).
   let lastAgentMessage = '';
   let rawFallback = '';
+  // Preserve assistant-facing stdout in its original order. Quiet CLIs may emit
+  // a marker keyword as plain text and its JSON payload on the next line; that
+  // JSON line is parsed as an ordinary object, so rebuilding from separate
+  // `lastAgentMessage`/`rawFallback` buckets reverses the pair and loses the tool
+  // call. This ordered projection is used only for marker extraction.
+  let orderedAssistantOutput = '';
   let stdoutError = '';
   const pendingToolCalls: ChatDelta[] = [];
   let reportedUsage: Extract<ChatDelta, { type: 'done' }>['usage'];
@@ -348,7 +370,10 @@ export async function* runCliChatTurn(cfg: CliChatRuntimeConfig): AsyncIterable<
         // These CLIs run in JSON mode, so non-JSON lines are environment noise
         // (e.g. Windows taskkill chatter). Never surface them as assistant text;
         // retain a filtered copy only as a last-resort fallback.
-        if (!isProcessNoiseLine(line)) rawFallback += `${line}\n`;
+        if (!isProcessNoiseLine(line) && (cfg.keepRawFallbackLine?.(line) ?? true)) {
+          rawFallback += `${line}\n`;
+          orderedAssistantOutput += `${line}\n`;
+        }
         continue;
       }
       const interpreted = cfg.interpret(event);
@@ -356,6 +381,7 @@ export async function* runCliChatTurn(cfg: CliChatRuntimeConfig): AsyncIterable<
       for (const part of parts) {
         switch (part.kind) {
           case 'text':
+            if (part.text) orderedAssistantOutput += `${part.text}\n`;
             transcript += part.text;
             // CLI harnesses commonly use assistant-message events for the same
             // public progress prose their native chat UI shows ("I found X; I am
@@ -388,7 +414,10 @@ export async function* runCliChatTurn(cfg: CliChatRuntimeConfig): AsyncIterable<
             }
             break;
           case 'final':
-            if (part.text) lastAgentMessage = part.text;
+            if (part.text) {
+              orderedAssistantOutput += `${part.text}\n`;
+              lastAgentMessage = part.text;
+            }
             break;
           case 'thinking':
             if (part.text) {
@@ -399,11 +428,15 @@ export async function* runCliChatTurn(cfg: CliChatRuntimeConfig): AsyncIterable<
                 runtimeName: cfg.displayName,
                 text: part.text,
                 reasoning: true,
+                transport: cfg.transport,
+                attempt: cfg.attempt,
+                startedAt: turnStartedAtIso,
               }));
             }
             break;
           case 'commentary':
             if (part.text.trim()) {
+              orderedAssistantOutput += `${part.text}\n`;
               latestAssistantText = '';
               activeAssistantProgressId = null;
               queue.push({
@@ -418,7 +451,11 @@ export async function* runCliChatTurn(cfg: CliChatRuntimeConfig): AsyncIterable<
           case 'activity':
             latestAssistantText = '';
             activeAssistantProgressId = null;
-            queue.push(part.delta);
+            queue.push({
+              ...part.delta,
+              ...(part.delta.transport || !cfg.transport ? {} : { transport: cfg.transport }),
+              ...(part.delta.attempt !== undefined || cfg.attempt === undefined ? {} : { attempt: cfg.attempt }),
+            });
             break;
           case 'tool':
             latestAssistantText = '';
@@ -450,6 +487,23 @@ export async function* runCliChatTurn(cfg: CliChatRuntimeConfig): AsyncIterable<
     unlinkAbort();
     clearTimers();
     if (timedOut && flushPartialOnTimeout()) {
+      queue.close();
+      return;
+    }
+    // A silence-ceiling abort normally makes a CLI exit non-zero. Preserve the
+    // actual timeout cause instead of collapsing it into the opaque
+    // "<runtime> exited 1" that hides whether the model, provider, or process
+    // failed. This also gives the workflow failure classifier a stable transient
+    // resource signal, so it never authorizes graph mutation for a stalled host.
+    if (timedOut) {
+      queue.push({
+        type: 'tool_result',
+        id: 'adapter',
+        name: 'adapter.chat',
+        result: null,
+        error: `${cfg.displayName} produced no observable output for ${formatElapsed(hardCeilingMs)} and appears stuck; the runtime was stopped`,
+      });
+      queue.push({ type: 'done', finishReason: 'error', ...(reportedUsage ? { usage: reportedUsage } : {}) });
       queue.close();
       return;
     }
@@ -521,7 +575,12 @@ export async function* runCliChatTurn(cfg: CliChatRuntimeConfig): AsyncIterable<
       : latestAssistantText.trim().length > 0
         ? latestAssistantText
         : stripProcessNoise(rawFallback);
-    const markerSource = `${transcript}\n${lastAgentMessage}`.trim();
+    // Quiet/final-answer CLI modes (notably Hermes `-Q`) write their final
+    // response directly to stdout rather than wrapping it in a structured
+    // assistant event. Marker calls are part of that response, so excluding the
+    // raw fallback here silently discarded otherwise valid Agentis tool calls.
+    const markerSource = orderedAssistantOutput.trim()
+      || `${transcript}\n${lastAgentMessage}\n${rawFallback}`.trim();
     const { calls: markerCalls } = extractMarkerToolCalls(markerSource);
     const { cleaned } = extractMarkerToolCalls(source);
     // The latest public assistant message becomes the final answer on runtimes

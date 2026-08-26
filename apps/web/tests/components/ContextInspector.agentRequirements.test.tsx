@@ -68,4 +68,45 @@ describe('<ContextInspector /> agent requirements', () => {
       requires: { browser: true },
     })));
   });
+
+  it('does not label a node ready when its assigned agent runtime is offline', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input) => {
+      if (String(input) === '/v1/agents') {
+        return json({
+          agents: [{
+            id: 'agent-offline',
+            name: 'Bia Outreacher',
+            status: 'offline',
+            adapterType: 'hermes_agent',
+            adapterCapabilities: { affordances: { browser: true, terminal: true } },
+          }],
+        });
+      }
+      return json({});
+    }));
+
+    render(
+      <ContextInspector
+        selection={{
+          kind: 'node',
+          nodeId: 'select_draft',
+          nodeType: 'agent_task',
+          data: {
+            kind: 'agent_task',
+            agentId: 'agent-offline',
+            prompt: 'Choose a lead.',
+            capabilityTags: [],
+            inputKeys: [],
+            outputKeys: [],
+          },
+        }}
+        onClose={vi.fn()}
+        onSave={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText('Setup required')).toBeInTheDocument();
+    expect(screen.getByText(/Bia Outreacher has no connected runtime/)).toBeInTheDocument();
+    expect(screen.queryByText('Ready to run')).not.toBeInTheDocument();
+  });
 });

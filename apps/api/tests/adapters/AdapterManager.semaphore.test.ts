@@ -36,6 +36,7 @@ function task(id: string): NormalizedTask {
 class MockAdapter implements AgentAdapter {
   readonly adapterType = 'http' as const;
   readonly dispatched: string[] = [];
+  readonly cancelled: string[] = [];
   #handler: ((e: NormalizedAgentEvent) => void) | null = null;
   async connect(): Promise<void> {}
   async disconnect(): Promise<void> {}
@@ -48,7 +49,7 @@ class MockAdapter implements AgentAdapter {
   async dispatchTask(t: NormalizedTask): Promise<void> {
     this.dispatched.push(t.taskId);
   }
-  async cancelTask(): Promise<void> {}
+  async cancelTask(taskId: string): Promise<void> { this.cancelled.push(taskId); }
   onEvent(handler: (e: NormalizedAgentEvent) => void): void {
     this.#handler = handler;
   }
@@ -135,5 +136,21 @@ describe('AdapterManager — global process semaphore', () => {
     await expect(am.dispatchTask(task('t1'), 'agent')).rejects.toThrow('boom');
     // Slot was reclaimed so the next dispatch isn't blocked forever.
     expect(am.processConcurrency.active).toBe(0);
+  });
+
+  it('releases the slot immediately when a task is cancelled without a terminal adapter event', async () => {
+    const am = new AdapterManager(logger, undefined, 1);
+    const adapter = new MockAdapter();
+    am.register('agent', adapter);
+
+    await am.dispatchTask(task('t1'), 'agent');
+    const queued = am.dispatchTask(task('t2'), 'agent');
+    await flush();
+    expect(adapter.dispatched).toEqual(['t1']);
+
+    await am.cancelTask('agent', 't1');
+    await queued;
+    expect(adapter.cancelled).toEqual(['t1']);
+    expect(adapter.dispatched).toEqual(['t1', 't2']);
   });
 });

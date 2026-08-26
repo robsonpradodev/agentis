@@ -55,6 +55,9 @@ import type { WorkflowRevisionService } from '../workflow/workflowRevisionServic
 import type { WorkflowExperienceService } from '../workflow/workflowExperienceService.js';
 import type { BuildSessionService } from '../buildSessionService.js';
 import type { AgentConsultationService } from '../agent/agentConsultationService.js';
+import type { ChannelIdentityService } from '../conversation/channelIdentityService.js';
+import type { ChannelInboxService } from '../conversation/channelInboxService.js';
+import type { ChannelActionIntentService } from '../conversation/channelActionIntentService.js';
 
 export interface ToolHandlerDeps {
   db: AgentisSqliteDb;
@@ -136,6 +139,9 @@ export interface ToolHandlerDeps {
   /** Server-owned App construction state and evidence gate. */
   buildSessions?: BuildSessionService;
   channels?: ChannelBridge;
+  channelIdentity?: ChannelIdentityService;
+  channelInbox?: ChannelInboxService;
+  channelActions?: ChannelActionIntentService;
   /** Headless Chromium pool — backs the `agentis.browser.*` tools. */
   browserPool?: BrowserPool;
   /** Persistent browser sessions — backs `agentis.browser.session`. */

@@ -751,6 +751,30 @@ export const CHAT_TOOL_CATALOG: ToolDefinition[] = [
     },
   },
   {
+    name: 'agentis.knowledge.delete',
+    description:
+      'Permanently delete one or more knowledge documents and their indexed chunks. This cannot be undone. ' +
+      'Use knowledge.archive instead unless the operator explicitly wants permanent deletion or cleanup.',
+    parameters: {
+      type: 'object',
+      properties: {
+        documentIds: { type: 'array', items: { type: 'string' }, minItems: 1, maxItems: 500 },
+        knowledgeBaseId: { type: 'string' },
+      },
+      required: ['documentIds', 'knowledgeBaseId'],
+    },
+  },
+  {
+    name: 'agentis.knowledge_base.delete',
+    description:
+      'Permanently delete an entire knowledge base and all documents and chunks inside it. This cannot be undone.',
+    parameters: {
+      type: 'object',
+      properties: { knowledgeBaseId: { type: 'string' } },
+      required: ['knowledgeBaseId'],
+    },
+  },
+  {
     name: 'agentis.brain.search',
     description:
       'Search YOUR Brain by meaning, mid-task — durable memories, workspace knowledge, and (on request) your Skill library — instead of guessing when you need a fact, rule, or procedure you were not handed up front. Especially useful after a PRE-TASK MEMORY note says nothing matched: try again with different or broader terms before concluding it doesn\'t exist. Returns ranked atoms ({ id, kind, title, snippet, score }). Skills/examples are EXCLUDED by default; pass kind:"skill" (or "example"/"all") to include them, then read a skill\'s full procedure with agentis.skill.load. Prefer short keyword-first queries. Example: {"query":"deploy migrations safely","kind":"skill"}.',

@@ -265,6 +265,48 @@ export const openApiDocument = {
         responses: { '200': { description: 'Replayable text/event-stream' } },
       },
     },
+    '/v1/conversations/{agentId}/turns/{turnId}/changes': {
+      get: {
+        tags: ['conversations'], summary: 'Read the redacted Undo/Redo summary for a durable turn',
+        parameters: [
+          { name: 'agentId', in: 'path', required: true, schema: { type: 'string' } },
+          { name: 'turnId', in: 'path', required: true, schema: { type: 'string' } },
+        ],
+        responses: { '200': { description: 'Turn change-set summary, or null for pre-journal turns' } },
+      },
+    },
+    '/v1/conversations/{agentId}/turns/{turnId}/undo': {
+      post: {
+        tags: ['conversations'], summary: 'Atomically undo the local changes owned by a durable turn',
+        parameters: [
+          { name: 'agentId', in: 'path', required: true, schema: { type: 'string' } },
+          { name: 'turnId', in: 'path', required: true, schema: { type: 'string' } },
+        ],
+        requestBody: { required: true, content: { 'application/json': { schema: {
+          type: 'object', required: ['expectedVersion'], properties: {
+            expectedVersion: { type: 'integer', minimum: 1 },
+            confirmSensitive: { type: 'boolean', default: false },
+          },
+        } } } },
+        responses: { '200': { description: 'Changes undone' }, '409': { description: 'Conflict preview or sensitive confirmation required' } },
+      },
+    },
+    '/v1/conversations/{agentId}/turns/{turnId}/redo': {
+      post: {
+        tags: ['conversations'], summary: 'Atomically reapply a previously undone durable turn',
+        parameters: [
+          { name: 'agentId', in: 'path', required: true, schema: { type: 'string' } },
+          { name: 'turnId', in: 'path', required: true, schema: { type: 'string' } },
+        ],
+        requestBody: { required: true, content: { 'application/json': { schema: {
+          type: 'object', required: ['expectedVersion'], properties: {
+            expectedVersion: { type: 'integer', minimum: 1 },
+            confirmSensitive: { type: 'boolean', default: false },
+          },
+        } } } },
+        responses: { '200': { description: 'Changes reapplied' }, '409': { description: 'Conflict preview or sensitive confirmation required' } },
+      },
+    },
     '/v1/conversations/{agentId}/turns/active': {
       get: {
         tags: ['conversations'], summary: 'List resumable turns for a conversation',

@@ -31,7 +31,7 @@ export interface Migration {
   readonly sql: string;
 }
 
-export const SQLITE_MIGRATIONS: readonly Migration[] = [
+export const SQLITE_MIGRATIONS: readonly Migration[] = ([
   {
     version: 1,
     name: 'init',
@@ -3417,7 +3417,261 @@ CREATE UNIQUE INDEX uq_agent_consultation_messages_sequence ON agent_consultatio
 CREATE INDEX idx_agent_consultation_messages_consultation ON agent_consultation_messages(consultation_id, created_at);
 `,
   },
-];
+  {
+    version: 134,
+    name: 'conversation_turn_change_journal',
+    sql: `
+CREATE TABLE conversation_turn_change_payloads (
+  id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  hash TEXT NOT NULL,
+  encoding TEXT NOT NULL DEFAULT 'gzip-json',
+  payload TEXT NOT NULL,
+  byte_length INTEGER NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE UNIQUE INDEX uq_conversation_turn_change_payloads_hash
+  ON conversation_turn_change_payloads(workspace_id, hash);
+
+CREATE TABLE conversation_turn_change_sets (
+  id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+  turn_id TEXT NOT NULL REFERENCES conversation_turns(id) ON DELETE CASCADE,
+  state TEXT NOT NULL DEFAULT 'recording',
+  version INTEGER NOT NULL DEFAULT 1,
+  reversible_count INTEGER NOT NULL DEFAULT 0,
+  sensitive_count INTEGER NOT NULL DEFAULT 0,
+  external_effect_count INTEGER NOT NULL DEFAULT 0,
+  affected_resources TEXT NOT NULL DEFAULT '[]',
+  last_error TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE UNIQUE INDEX uq_conversation_turn_change_sets_turn ON conversation_turn_change_sets(turn_id);
+CREATE INDEX idx_conversation_turn_change_sets_conversation
+  ON conversation_turn_change_sets(workspace_id, conversation_id, updated_at);
+
+CREATE TABLE conversation_turn_changes (
+  id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  change_set_id TEXT NOT NULL REFERENCES conversation_turn_change_sets(id) ON DELETE CASCADE,
+  turn_id TEXT NOT NULL REFERENCES conversation_turns(id) ON DELETE CASCADE,
+  tool_call_id TEXT NOT NULL,
+  tool_id TEXT NOT NULL,
+  commit_ordinal INTEGER NOT NULL,
+  resource_kind TEXT NOT NULL,
+  resource_id TEXT NOT NULL,
+  resource_label TEXT NOT NULL,
+  operation TEXT NOT NULL,
+  row_key TEXT,
+  before_payload_id TEXT REFERENCES conversation_turn_change_payloads(id) ON DELETE SET NULL,
+  after_payload_id TEXT REFERENCES conversation_turn_change_payloads(id) ON DELETE SET NULL,
+  sensitive INTEGER NOT NULL DEFAULT 0,
+  reversible INTEGER NOT NULL DEFAULT 1,
+  external_effect INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE UNIQUE INDEX uq_conversation_turn_changes_order
+  ON conversation_turn_changes(change_set_id, commit_ordinal);
+CREATE INDEX idx_conversation_turn_changes_turn
+  ON conversation_turn_changes(workspace_id, turn_id, commit_ordinal);
+`,
+  },
+  {
+    version: 135,
+    name: 'relationship_runtime_and_channel_principals',
+    sql: `
+CREATE TABLE IF NOT EXISTS channel_peer_identities (
+  id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  channel_kind TEXT NOT NULL,
+  connection_id TEXT REFERENCES channel_connections(id) ON DELETE CASCADE,
+  handle TEXT NOT NULL,
+  display_name TEXT,
+  user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+  peer_key TEXT,
+  grounding_entity_id TEXT REFERENCES durable_entities(id) ON DELETE SET NULL,
+  authority_role TEXT NOT NULL DEFAULT 'external',
+  authority_method TEXT,
+  verified_at TEXT,
+  grant_expires_at TEXT,
+  blocked INTEGER NOT NULL DEFAULT 0,
+  message_count INTEGER NOT NULL DEFAULT 0,
+  first_seen_at TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL
+);
+ALTER TABLE channel_peer_identities ADD COLUMN connection_id TEXT REFERENCES channel_connections(id) ON DELETE CASCADE;
+ALTER TABLE channel_peer_identities ADD COLUMN grounding_entity_id TEXT REFERENCES durable_entities(id) ON DELETE SET NULL;
+ALTER TABLE channel_peer_identities ADD COLUMN authority_role TEXT NOT NULL DEFAULT 'external';
+ALTER TABLE channel_peer_identities ADD COLUMN authority_method TEXT;
+ALTER TABLE channel_peer_identities ADD COLUMN verified_at TEXT;
+ALTER TABLE channel_peer_identities ADD COLUMN grant_expires_at TEXT;
+DROP INDEX IF EXISTS uq_channel_peer;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_channel_peer_principal
+  ON channel_peer_identities(workspace_id, connection_id, channel_kind, handle);
+CREATE INDEX IF NOT EXISTS idx_channel_peer_user ON channel_peer_identities(workspace_id, user_id);
+CREATE INDEX IF NOT EXISTS idx_channel_peer_key ON channel_peer_identities(workspace_id, peer_key);
+CREATE INDEX IF NOT EXISTS idx_channel_peer_authority
+  ON channel_peer_identities(workspace_id, connection_id, authority_role);
+ALTER TABLE app_contacts ADD COLUMN subject_id TEXT REFERENCES durable_entities(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_app_contacts_subject ON app_contacts(workspace_id, subject_id);
+
+CREATE TABLE IF NOT EXISTS channel_utterance_batches (
+  id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+  connection_id TEXT NOT NULL REFERENCES channel_connections(id) ON DELETE CASCADE,
+  chat_id TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'collecting',
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  message_ids_json TEXT NOT NULL DEFAULT '[]',
+  attachment_ids_json TEXT NOT NULL DEFAULT '[]',
+  soft_deadline_at TEXT NOT NULL,
+  hard_deadline_at TEXT NOT NULL,
+  settled_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_channel_utterance_open
+  ON channel_utterance_batches(workspace_id, connection_id, chat_id, status);
+CREATE INDEX IF NOT EXISTS idx_channel_utterance_due ON channel_utterance_batches(status, soft_deadline_at);
+`,
+  },
+  {
+    version: 136,
+    name: 'repair_connection_scoped_channel_principal_index',
+    sql: `
+-- Embedded startup code in builds containing v135 could recreate this legacy
+-- workspace/channel-wide index after v135 had removed it. Drop it again in a
+-- new recorded migration so already-upgraded databases are repaired as well.
+DROP INDEX IF EXISTS uq_channel_peer;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_channel_peer_principal
+  ON channel_peer_identities(workspace_id, connection_id, channel_kind, handle);
+CREATE INDEX IF NOT EXISTS idx_channel_peer_authority
+  ON channel_peer_identities(workspace_id, connection_id, authority_role);
+`,
+  },
+  {
+    version: 137,
+    name: 'durable_run_activity_events',
+    sql: `
+CREATE TABLE IF NOT EXISTS run_activity_events (
+  id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  run_id TEXT NOT NULL REFERENCES workflow_runs(id) ON DELETE CASCADE,
+  node_id TEXT,
+  agent_id TEXT,
+  activity_id TEXT NOT NULL,
+  event TEXT NOT NULL,
+  kind TEXT,
+  phase TEXT,
+  status TEXT,
+  title TEXT,
+  detail TEXT,
+  transport TEXT,
+  attempt INTEGER,
+  started_at TEXT,
+  completed_at TEXT,
+  duration_ms INTEGER,
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_run_activity_owner
+  ON run_activity_events(run_id, activity_id);
+CREATE INDEX IF NOT EXISTS idx_run_activity_timeline
+  ON run_activity_events(workspace_id, run_id, created_at);
+`,
+  },
+  {
+    version: 138,
+    name: 'canonical_channel_peers_and_action_intents',
+    sql: `
+CREATE TABLE IF NOT EXISTS channel_peer_aliases (
+  id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  connection_id TEXT NOT NULL REFERENCES channel_connections(id) ON DELETE CASCADE,
+  channel_kind TEXT NOT NULL,
+  peer_identity_id TEXT NOT NULL REFERENCES channel_peer_identities(id) ON DELETE CASCADE,
+  alias TEXT NOT NULL,
+  alias_kind TEXT NOT NULL DEFAULT 'provider',
+  source TEXT NOT NULL DEFAULT 'observed',
+  verified INTEGER NOT NULL DEFAULT 0,
+  display_name TEXT,
+  last_seen_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_channel_peer_alias
+  ON channel_peer_aliases(workspace_id, connection_id, channel_kind, alias);
+CREATE INDEX IF NOT EXISTS idx_channel_peer_alias_peer
+  ON channel_peer_aliases(workspace_id, peer_identity_id);
+
+ALTER TABLE conversations ADD COLUMN channel_peer_identity_id TEXT REFERENCES channel_peer_identities(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_conversations_channel_peer
+  ON conversations(workspace_id, channel_peer_identity_id, last_message_at);
+
+INSERT OR IGNORE INTO channel_peer_aliases
+  (id, workspace_id, connection_id, channel_kind, peer_identity_id, alias, alias_kind, source, verified, display_name, last_seen_at, created_at, updated_at)
+SELECT
+  'legacy:' || id, workspace_id, connection_id, channel_kind, id, handle, 'primary', 'legacy_backfill',
+  CASE WHEN verified_at IS NOT NULL THEN 1 ELSE 0 END, display_name, last_seen_at, first_seen_at, last_seen_at
+FROM channel_peer_identities
+WHERE connection_id IS NOT NULL;
+
+UPDATE conversations
+SET channel_peer_identity_id = (
+  SELECT i.id FROM channel_peer_identities i
+  WHERE i.workspace_id = conversations.workspace_id
+    AND i.connection_id = conversations.channel_connection_id
+    AND i.channel_kind = (SELECT kind FROM channel_connections c WHERE c.id = conversations.channel_connection_id)
+    AND i.handle = conversations.channel_chat_id
+  LIMIT 1
+)
+WHERE channel_connection_id IS NOT NULL AND channel_peer_identity_id IS NULL;
+
+CREATE TABLE IF NOT EXISTS channel_action_intents (
+  id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  app_id TEXT REFERENCES apps(id) ON DELETE SET NULL,
+  agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
+  requester_identity_id TEXT REFERENCES channel_peer_identities(id) ON DELETE SET NULL,
+  connection_id TEXT NOT NULL REFERENCES channel_connections(id) ON DELETE CASCADE,
+  peer_identity_id TEXT NOT NULL REFERENCES channel_peer_identities(id) ON DELETE CASCADE,
+  conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
+  subject_id TEXT REFERENCES durable_entities(id) ON DELETE SET NULL,
+  goal_ref TEXT,
+  goal TEXT NOT NULL,
+  body TEXT NOT NULL DEFAULT '',
+  messages_json TEXT NOT NULL DEFAULT '[]',
+  authorization_basis TEXT NOT NULL,
+  risk_category TEXT NOT NULL DEFAULT 'ordinary',
+  status TEXT NOT NULL DEFAULT 'planned',
+  approval_id TEXT REFERENCES approval_requests(id) ON DELETE SET NULL,
+  idempotency_key TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  scheduled_for TEXT,
+  provider_receipt_json TEXT,
+  last_error TEXT,
+  authorized_at TEXT,
+  executed_at TEXT,
+  delivered_at TEXT,
+  cancelled_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_channel_action_idempotency
+  ON channel_action_intents(workspace_id, idempotency_key);
+CREATE INDEX IF NOT EXISTS idx_channel_action_due
+  ON channel_action_intents(status, scheduled_for);
+CREATE INDEX IF NOT EXISTS idx_channel_action_peer
+  ON channel_action_intents(workspace_id, peer_identity_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_channel_action_requester
+  ON channel_action_intents(workspace_id, requester_identity_id, status, created_at);
+`,
+  },
+] satisfies Migration[]).sort((a, b) => a.version - b.version);
 
 
 

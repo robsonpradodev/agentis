@@ -252,11 +252,20 @@ export function whatsappNativeContent(native: OutboundNativeContent): any {
   return { poll: { name: native.question, values: native.options, selectableCount: native.selectableCount ?? 1 } };
 }
 
-export function observedWhatsAppChatJid(key: { remoteJid?: unknown; remoteJidAlt?: unknown }): string | null {
+export function observedWhatsAppChatJids(key: { remoteJid?: unknown; remoteJidAlt?: unknown }): string[] {
   const remoteJid = typeof key.remoteJid === 'string' ? key.remoteJid : '';
-  if (!remoteJid) return null;
+  if (!remoteJid) return [];
   const remoteJidAlt = typeof key.remoteJidAlt === 'string' ? key.remoteJidAlt : '';
-  return remoteJid.endsWith('@lid') && remoteJidAlt.includes('@s.whatsapp.net') ? remoteJidAlt.replace(/:\d+@/u, '@') : remoteJid;
+  const cleanAlt = remoteJidAlt.replace(/:\d+@/u, '@');
+  // Prefer the real phone-number address when Baileys supplies it for a LID,
+  // but retain every provider alias for connection-scoped ownership policy.
+  return [...new Set(remoteJid.endsWith('@lid') && cleanAlt.includes('@s.whatsapp.net')
+    ? [cleanAlt, remoteJid]
+    : [remoteJid, ...(cleanAlt ? [cleanAlt] : [])])];
+}
+
+export function observedWhatsAppChatJid(key: { remoteJid?: unknown; remoteJidAlt?: unknown }): string | null {
+  return observedWhatsAppChatJids(key)[0] ?? null;
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any

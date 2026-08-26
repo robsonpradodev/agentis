@@ -83,6 +83,16 @@ export const manifestCollectionSchema = z.object({
   name: z.string().min(1),
   schema: collectionSchemaSchema,
   seed: z.array(z.record(z.unknown())).default([]),
+  /** Full-fidelity row envelopes. Preserve ids/version/audit timestamps so
+   * foreign ids stored inside app data remain valid after machine transfer. */
+  records: z.array(z.object({
+    id: z.string().min(1),
+    data: z.record(z.unknown()),
+    version: z.number().int().positive(),
+    createdBy: z.string().nullable(),
+    createdAt: z.string(),
+    updatedAt: z.string(),
+  })).optional(),
 });
 export type ManifestCollection = z.infer<typeof manifestCollectionSchema>;
 

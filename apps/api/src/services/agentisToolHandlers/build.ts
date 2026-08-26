@@ -454,7 +454,7 @@ export function registerBuildTools(registry: AgentisToolRegistry, deps: ToolHand
       next: {
         tool: 'agentis.workflow.deliver',
         args: { workflowId: input.wf.id },
-        why: 'The edit is a candidate. Verify its exact hash with self-healing disabled before promotion.',
+        why: 'Required continuation: finish, verify, repair, and publish this workflow before replying to the user.',
       },
     };
   };
@@ -493,7 +493,7 @@ export function registerBuildTools(registry: AgentisToolRegistry, deps: ToolHand
         id: 'agentis.workflow.create',
         family: 'build',
         description:
-          'Create a new workflow from a complete graph payload. Alias of agentis.build_workflow with graphDraft: '
+          'AUTHORING STEP ONLY — never present its result as a completed user request. Create a new workflow from a complete graph payload, then immediately call agentis.workflow.deliver with the returned workflowId. Alias of agentis.build_workflow with graphDraft: '
           + 'the graph passes the SAME gates (structural validation, expression lint, edge couplings, intent manifest, '
           + 'robustness audit + deterministic repairs) — there is no ungated door. Prefer agentis.build_workflow directly.',
         inputSchema: {
@@ -630,7 +630,7 @@ export function registerBuildTools(registry: AgentisToolRegistry, deps: ToolHand
         id: 'agentis.workflow.graph.replace',
         family: 'build',
         description:
-          'Atomically replace a STORED workflow with a complete graph. This is intentionally whole-graph; use agentis.workflow.graph.patch for field-level edits. ' +
+          'AUTHORING STEP ONLY: after committing, immediately call agentis.workflow.deliver and do not reply to the user with an intermediate revision state. Atomically replace a STORED workflow with a complete graph. This is intentionally whole-graph; use agentis.workflow.graph.patch for field-level edits. ' +
           'Pass baseHash or baseUpdatedAt from inspection to reject stale writes. Returns a structured graph diff and before/after revision hashes.',
         inputSchema: {
           type: 'object',
@@ -661,7 +661,7 @@ export function registerBuildTools(registry: AgentisToolRegistry, deps: ToolHand
         id: 'agentis.workflow.graph.patch',
         family: 'build',
         description:
-          'Atomically patch selected fields or structure of a STORED workflow without restating complete nodes or the graph. ' +
+          'AUTHORING STEP ONLY: after committing, immediately call agentis.workflow.deliver and do not reply to the user with an intermediate revision state. Atomically patch selected fields or structure of a STORED workflow without restating complete nodes or the graph. ' +
           'Supported operations: add_node, patch_node, remove_node, add_edge, patch_edge, remove_edge, patch_viewport. Object patches merge recursively; omitted fields are preserved. ' +
           'Pass baseHash or baseUpdatedAt from inspection to reject stale writes. Returns exact changed paths and before/after revision hashes.',
         inputSchema: {
@@ -854,8 +854,7 @@ export function registerBuildTools(registry: AgentisToolRegistry, deps: ToolHand
         const refreshed = deps.revisions.proofState(ctx.workspaceId, String(args.workflowId), candidate.revision.id);
         const active = deps.revisions.active(ctx.workspaceId, String(args.workflowId));
         const alreadyActive = active.revision.id === candidate.revision.id;
-        const appDeliveryRequired = Boolean(active.workflow.appId && !alreadyActive);
-        const autoPromotion = refreshed.readyForPromotion && !refreshed.approvalRequired && !alreadyActive && !appDeliveryRequired
+        const autoPromotion = refreshed.readyForPromotion && !refreshed.approvalRequired && !alreadyActive
           ? deps.revisions.promote({
               workspaceId: ctx.workspaceId,
               workflowId: String(args.workflowId),
@@ -870,13 +869,17 @@ export function registerBuildTools(registry: AgentisToolRegistry, deps: ToolHand
           run: result.output,
           revisionState: autoPromotion || alreadyActive
             ? 'active'
-            : appDeliveryRequired && refreshed.readyForPromotion
-              ? 'awaiting_app_delivery'
             : refreshed.approvalRequired && refreshed.missing.every((gate) => gate === 'operator_approval')
               ? 'awaiting_approval'
               : refreshed.failed.length > 0 ? 'needs_attention' : 'verifying',
           ...(autoPromotion || alreadyActive ? { autoPromoted: true, ...(autoPromotion ? { promotion: autoPromotion } : {}) } : {}),
-          ...(appDeliveryRequired ? { appId: active.workflow.appId, next: { tool: 'agentis.app.deliver', args: { appId: active.workflow.appId } } } : {}),
+          ...(active.workflow.appId ? {
+            appId: active.workflow.appId,
+            appReadiness: {
+              independent: true,
+              note: 'This workflow publication is independent. App-wide health may still report advisory issues in sibling workflows.',
+            },
+          } : {}),
           proof: refreshed,
         };
       },
@@ -885,7 +888,7 @@ export function registerBuildTools(registry: AgentisToolRegistry, deps: ToolHand
       definition: {
         id: 'agentis.workflow.revision.promote',
         family: 'build',
-        description: 'Promote the exact proven candidate with compare-and-swap protection for standalone workflows. App-owned workflows must use agentis.app.deliver, the sole App production publication authority.',
+        description: 'Promote the exact proven candidate with compare-and-swap protection. Works independently for standalone and App-owned workflows; sibling App issues are not publication blockers.',
         inputSchema: { type: 'object', properties: { workflowId: { type: 'string' }, revisionId: { type: 'string' } }, required: ['workflowId'] },
         mutating: true,
         mcpExposed: true,
@@ -894,12 +897,6 @@ export function registerBuildTools(registry: AgentisToolRegistry, deps: ToolHand
         if (!deps.revisions) throw new AgentisError('WORKFLOW_DRAFT_INVALID', 'Immutable workflow revision service is unavailable.');
         const workflowId = String(args.workflowId);
         const active = deps.revisions.active(ctx.workspaceId, workflowId);
-        if (active.workflow.appId) {
-          throw new AgentisError('WORKFLOW_GRAPH_INVALID', 'App-owned workflow revisions can only be published by agentis.app.deliver.', {
-            httpStatus: 409,
-            details: { code: 'APP_DELIVERY_REQUIRED', appId: active.workflow.appId, workflowId },
-          });
-        }
         const candidate = deps.revisions.candidate(ctx.workspaceId, workflowId);
         if (!candidate) throw new AgentisError('RESOURCE_NOT_FOUND', 'No candidate revision is available to promote.');
         if (args.revisionId && String(args.revisionId) !== candidate.revision.id) {
@@ -1086,8 +1083,8 @@ export function registerBuildTools(registry: AgentisToolRegistry, deps: ToolHand
         id: 'agentis.build_workflow',
         family: 'build',
         description:
-          '[PAVED ROAD 1/5 — AUTHOR] Validate, enrich, save, and stream an agent-authored workflow draft, or synthesize with a configured fast model. '
-          + 'The result includes compass.next — the exact next call (normally agentis.workflow.dry_run). '
+          '[PAVED ROAD — INTERNAL AUTHORING, NEVER A FINAL USER DELIVERABLE] Validate, enrich, save, and stream an agent-authored workflow, or synthesize with a configured fast model. '
+          + 'For every user-requested create or edit, immediately follow this call with agentis.workflow.deliver using the returned workflowId. Do not stop or reply between these calls. '
           + 'To refine the workflow you just built in this conversation, call again WITHOUT a workflowId — '
           + 'it updates that same workflow in place. Pass workflowId to target a specific one, or set '
           + 'newWorkflow=true to deliberately create a separate workflow. '
@@ -1892,7 +1889,9 @@ export function registerBuildTools(registry: AgentisToolRegistry, deps: ToolHand
             evidence: { graphHash: hash, suite: loop.suite },
           });
           proofState = deps.revisions!.proofState(ctx.workspaceId, wf.id, candidateRevision.revision.id);
-          if (proofState.readyForPromotion && !proofState.approvalRequired && !wf.appId) {
+          // Publication is scoped to this exact proven revision. App membership
+          // must not turn unrelated sibling health into a release blocker.
+          if (proofState.readyForPromotion && !proofState.approvalRequired) {
             promotion = deps.revisions!.promote({
               workspaceId: ctx.workspaceId,
               workflowId: wf.id,
@@ -1951,7 +1950,7 @@ export function registerBuildTools(registry: AgentisToolRegistry, deps: ToolHand
         id: 'agentis.workflow.deliver',
         family: 'build',
         description:
-          '[SWIFT — DELIVER IN ONE CALL] Autonomously drive the ENTIRE quality loop and return one honest result. '
+          '[SWIFT — REQUIRED FINALIZATION FOR EVERY USER-REQUESTED WORKFLOW CREATE OR EDIT] Autonomously drive the ENTIRE quality loop and return one honest result. '
           + 'Given a `goal` it BUILDS an App-of-one (or pass `workflowId` to deliver an existing one), then loops: '
           + 'dry-run → run it for REAL (self-heal off) → VERIFY the outcome against the world (probes + judge) → '
           + 'repair the deficient nodes → repeat, bounded. Returns exactly one of: `accomplished` (built + ran + '
@@ -2451,6 +2450,14 @@ export async function createWorkflowFromDescription(deps: ToolHandlerDeps, args:
     repairs.push({ rule: 6, kind: 'robustness_bound', message: r });
     if (args.stream) phase('repairing', r);
   }
+  const missingDeliverySink = robustness.warnings.find((warning) => warning.code === 'MISSING_DELIVERY_SINK');
+  if (missingDeliverySink) {
+    phase('blocked', 'External delivery is not backed by a native executable node');
+    throw new AgentisError(
+      'WORKFLOW_DRAFT_INVALID',
+      `Workflow preflight failed before save: ${missingDeliverySink.message}`,
+    );
+  }
   // Tidy the graph with the shared layered layout so it's readable and framable
   // the instant it lands on the canvas — AI models place nodes arbitrarily.
   const laidOutGraph = layoutBuiltWorkflowGraph(robustness.graph, {
@@ -2776,9 +2783,6 @@ export async function createWorkflowFromDescription(deps: ToolHandlerDeps, args:
     teamRoster,
     plan: brief.classification.archetype === 'enterprise' ? planWorkflow(description, brief.classification) : undefined,
     graph,
-    activeRevisionId: deps.revisions.active(args.workspaceId, workflowId).revision.id,
-    candidateRevisionId: candidateRevision.id,
-    trustState: 'candidate',
     health,
     trace,
     compass,
@@ -2798,10 +2802,8 @@ export async function createWorkflowFromDescription(deps: ToolHandlerDeps, args:
       // at the next single step, but the standing instruction is to keep going,
       // autonomously, until the run is ACCOMPLISHED (or a genuine human blocker),
       // exactly as a coding agent runs and fixes the code it just wrote.
-      + ` NEXT — RUN WHAT YOU BUILT: you authored this, so you verify it, the way a coding agent runs the code it just wrote — do NOT hand an unverified workflow to the operator.`
-      + ` Continue now: call ${compass.next[0]?.tool ?? 'agentis.workflow.dry_run'} (${JSON.stringify(compass.next[0]?.args ?? { workflowId })}) — ${compass.next[0]?.why ?? 'prove the data flow before any real run.'}`
-      + ` — then keep going through the loop (dry_run → debug-run → read the verdict → fix the deficient nodes → repeat) until it is ACCOMPLISHED, or call agentis.workflow.deliver to run that whole build→verify→fix loop in one shot.`
-      + ` Only stop to ask the operator when you hit a real blocker — a missing credential/config or a decision only they can make.`,
+      + ` REQUIRED CONTINUATION: call agentis.workflow.deliver now with workflowId ${workflowId}. Do not reply to the user before that call returns.`
+      + ` The workflow is deliverable only when that call returns delivered:true and published:true. If it returns blockers, communicate only each concrete humanAction; never expose internal revision, proof, or publication mechanics.`,
   };
 }
 

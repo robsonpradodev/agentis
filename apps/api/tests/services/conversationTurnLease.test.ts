@@ -44,6 +44,20 @@ describe('ConversationTurnLeaseRegistry', () => {
     expect(handler).not.toHaveBeenCalled();
   });
 
+  it('publishes an explicit restoration behavior for every mutating registration', () => {
+    const registry = new AgentisToolRegistry({ logger: createLogger({ level: 'error' }) });
+    registry.register({
+      id: 'agentis.agents.update', family: 'build', description: 'local', inputSchema: {}, mutating: true,
+    }, () => ({}));
+    registry.register({
+      id: 'agentis.channel.send', family: 'run', description: 'external', inputSchema: {}, mutating: true,
+    }, () => ({}));
+    expect(registry.catalog().tools.map((tool) => [tool.id, tool.mutationBehavior])).toEqual([
+      ['agentis.agents.update', 'local'],
+      ['agentis.channel.send', 'external'],
+    ]);
+  });
+
   it('records unlimited-capability compact experience and coalesces unchanged reads', () => {
     const leases = new ConversationTurnLeaseRegistry();
     const token = leases.issue('ws', 'conv');

@@ -101,7 +101,7 @@ describe('WorkflowEngine output and integration contracts', () => {
       workspaceId: ctx.workspace.id,
       ambientId: ctx.ambient.id,
       userId: ctx.user.id,
-      name: 'Digest Writer',
+      name: 'Delivery Agent',
       adapterType: 'codex',
       capabilityTags: [],
       config: {},
@@ -310,7 +310,7 @@ describe('WorkflowEngine output and integration contracts', () => {
     expect(state.nodeStates.draft?.outputData?.sentStoryKeys).not.toEqual(state.nodeStates.draft?.outputData?.topStories);
   });
 
-  it('completes agent nodes with contractDeviation when declared keys remain missing', async () => {
+  it('fails honestly when an agent returns none of a multi-field declared contract', async () => {
     const agentId = randomUUID();
     ctx.db.insert(schema.agents).values({
       id: agentId,
@@ -327,7 +327,7 @@ describe('WorkflowEngine output and integration contracts', () => {
 
     const adapters = new AdapterManager(ctx.logger);
     adapters.register(agentId, new JsonEnvelopeAgentAdapter(agentId, {
-      text: 'Useful digest draft, but not a strict JSON contract.',
+      text: 'The runtime printed activity but returned no delivery receipt.',
     }));
     const engine = makeEngine(adapters);
     adapters.onEvent((event) => {
@@ -354,14 +354,14 @@ describe('WorkflowEngine output and integration contracts', () => {
         {
           id: 'draft',
           type: 'agent_task',
-          title: 'Draft',
+          title: 'Send',
           position: { x: 200, y: 0 },
           config: {
             kind: 'agent_task',
             agentId,
-            prompt: 'Return a digest payload.',
+            prompt: 'Send one message and return its receipt.',
             inputKeys: [],
-            outputKeys: ['subject', 'htmlBody', 'topStories', 'sentStoryKeys', 'sentCount'],
+            outputKeys: ['sent_count', 'failed_count', 'status'],
             capabilityTags: [],
           },
         },
@@ -402,17 +402,9 @@ describe('WorkflowEngine output and integration contracts', () => {
       }>;
       contractViolations?: string[];
     };
-    expect(run.status).toBe('COMPLETED_WITH_CONTRACT_VIOLATION');
-    expect(state.nodeStates.draft?.status).toBe('COMPLETED');
-    expect(state.nodeStates.draft?.outputData?.text).toBe('Useful digest draft, but not a strict JSON contract.');
-    expect(state.nodeStates.draft?.contractDeviation).toMatchObject({
-      kind: 'missing_declared_output_keys',
-      declaredKeys: ['subject', 'htmlBody', 'topStories', 'sentStoryKeys', 'sentCount'],
-      missingKeys: ['subject', 'htmlBody', 'topStories', 'sentStoryKeys', 'sentCount'],
-      recoveredKeys: [],
-    });
-    expect(state.nodeStates.draft?.contractDeviation?.message).toContain("agent node 'draft'");
-    expect(state.contractViolations?.[0]).toContain("agent node 'draft'");
+    expect(run.status).toBe('FAILED');
+    expect(state.nodeStates.draft?.status).toBe('FAILED');
+    expect((state.nodeStates.draft as { error?: string })?.error).toMatch(/OUTPUT_CONTRACT_UNSATISFIED/);
   });
 
   it('executes custom manifest integrations through the engine path', async () => {

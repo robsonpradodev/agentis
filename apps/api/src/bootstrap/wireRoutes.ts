@@ -99,6 +99,7 @@ import { buildWorkspaceBundleRoutes } from '../routes/workspaceBundle.js';
 import { buildWorkspaceContextRoutes } from '../routes/workspaceContext.js';
 import { buildWorkspaceIntelligenceRoutes } from '../routes/workspaceIntelligence.js';
 import { buildWorkspaceRoutes } from '../routes/workspaces.js';
+import { buildHubPackageRoutes } from '../routes/hubPackages.js';
 import { AppPresenceService } from '../services/app/appPresence.js';
 import { AppStaffingService } from '../services/app/appStaffing.js';
 import { BroadcastDispatcher } from '../services/broadcastDispatcher.js';
@@ -133,9 +134,12 @@ import type { ChatMemoryCaptureService } from '../services/chat/chatMemoryCaptur
 import type { ChannelBridge } from '../services/conversation/channelBridge.js';
 import type { ChannelConnectionSupervisor } from '../services/conversation/channelConnectionSupervisor.js';
 import type { ChannelIdentityService } from '../services/conversation/channelIdentityService.js';
+import type { ChannelInboxService } from '../services/conversation/channelInboxService.js';
+import type { ChannelActionIntentService } from '../services/conversation/channelActionIntentService.js';
 import type { ConnectionGrantService } from '../services/connectionGrants.js';
 import type { ConversationParticipantService } from '../services/conversation/conversationParticipants.js';
 import type { ConversationHandoffService } from '../services/conversation/conversationHandoffService.js';
+import type { TurnChangeJournal } from '../services/conversation/turnChangeJournal.js';
 import type { ConversationSimulatorService } from '../services/conversation/conversationSimulator.js';
 import type { AgentConsultationService } from '../services/agent/agentConsultationService.js';
 import type { EmbeddingBackfillService } from '../services/embedding/embeddingBackfill.js';
@@ -195,6 +199,8 @@ type WireRoutesDeps = Awaited<ReturnType<typeof wireFoundation>> & {
   capabilityRegistry: CapabilityRegistry;
   channelBridge: ChannelBridge;
   channelIdentity: ChannelIdentityService;
+  channelInbox: ChannelInboxService;
+  channelActions: ChannelActionIntentService;
   channelSupervisor: ChannelConnectionSupervisor;
   chatMemoryCapture: ChatMemoryCaptureService;
   connectionGrants: ConnectionGrantService;
@@ -229,6 +235,7 @@ type WireRoutesDeps = Awaited<ReturnType<typeof wireFoundation>> & {
   specialistRuntime: SpecialistRuntimeService;
   specialistTemplates: SpecialistTemplateService;
   toolRegistry: AgentisToolRegistry;
+  turnChanges: TurnChangeJournal;
   triggerRuntime: TriggerRuntime;
   voiceChannelAdapter: VoiceChannelAdapter;
   workspaceModelConfig: WorkspaceModelConfigService;
@@ -276,6 +283,8 @@ export function wireRoutes(deps: WireRoutesDeps) {
     capabilityRegistry,
     channelBridge,
     channelIdentity,
+    channelInbox,
+    channelActions,
     channelSupervisor,
     chatMemoryCapture,
     commandAutonomyMaster,
@@ -433,6 +442,17 @@ export function wireRoutes(deps: WireRoutesDeps) {
   app.route('/v1/runs', buildAuditRoutes({ db: sqlite, auth, audit: auditTrail }));
   app.route('/v1/extensions', buildExtensionRoutes({ db: sqlite, auth, extensionLibrary, runtime: extensions, kv: extensionKv }));
   app.route('/v1/packages', buildPackageRoutes({ db: sqlite, auth, bus, logger, skills: skillService, episodes: episodicMemoryStore }));
+  app.route('/v1/hub', buildHubPackageRoutes({
+    db: sqlite,
+    auth,
+    vault: credentialVault,
+    hubUrl: env.AGENTIS_HUB_URL,
+    publicKeysJson: env.AGENTIS_HUB_PUBLIC_KEYS,
+    bus,
+    logger,
+    skills: skillService,
+    episodes: episodicMemoryStore,
+  }));
   app.route('/v1/skills', buildSkillRoutes({ db: sqlite, auth, skills: skillService }));
   app.route('/v1/workspace/bundle', buildWorkspaceBundleRoutes({ db: sqlite, auth, bus, logger, dataDir: env.AGENTIS_DATA_DIR, signer: { privateKeyPem: secrets.jwtPrivateKeyPem, publicKeyPem: secrets.jwtPublicKeyPem }, episodes: episodicMemoryStore }));
   app.route('/v1/artifacts', buildArtifactRoutes({ db: sqlite, auth, bus, artifacts: artifactService, assets: assetStore }));
@@ -493,6 +513,7 @@ export function wireRoutes(deps: WireRoutesDeps) {
     db: sqlite,
     auth,
     bus,
+    approvals,
     groundingDiscovery,
     groundingRuntime,
   }));
@@ -630,11 +651,12 @@ export function wireRoutes(deps: WireRoutesDeps) {
     runtimeProfiles,
     handoffs: conversationHandoffs,
     consultations,
+    turnChanges: deps.turnChanges,
   }));
   const broadcastDispatcher = new BroadcastDispatcher({ db: sqlite, adapters, conversations, bus, logger });
   app.route('/v1/rooms', buildRoomRoutes({ db: sqlite, auth, bus, broadcast: broadcastDispatcher }));
   app.route('/v1/history', buildHistoryRoutes({ db: sqlite, auth }));
-  app.route('/v1/channels', buildChannelRoutes({ db: sqlite, auth, bridge: channelBridge, supervisor: channelSupervisor, identity: channelIdentity, connectionGrants }));
+  app.route('/v1/channels', buildChannelRoutes({ db: sqlite, auth, bridge: channelBridge, supervisor: channelSupervisor, identity: channelIdentity, inbox: channelInbox, actions: channelActions, connectionGrants }));
   app.route('/v1/orchestrator/models', buildOrchestratorModelRoutes({
     db: sqlite,
     auth,

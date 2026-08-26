@@ -7,7 +7,7 @@ language they are fluent in, not by choreographing dozens of discrete tool calls
 ## The `agentis.*` tool registry
 
 `services/agentisToolRegistry.ts` + `services/agentisToolHandlers/`. One registry, dispatched
-through a single path to chat, the workflow engine, MCP, and code-mode. **132 tools**; every
+through a single path to chat, the workflow engine, MCP, and code-mode. **More than 130 tools**; every
 result is `{ ok, result | error, costCents, durationMs }` — errors are data, never thrown, and
 every settled state carries `compass.next` (the Paved Road: an actionable next call).
 
@@ -22,7 +22,7 @@ Families (representative, not exhaustive):
 - **Channels & conversations** — `channel.{list,send}`, `connection.{request,grant,grants}`, `conversation.{define,enroll,flag_needs_attention}`.
 - **Agents & specialists** — `agents.{list,create}`, `agent.{spawn,dispatch}`, `specialist.{create,request}`, `routing.preview`.
 - **Extensions & capabilities** — `extension.{create,test,resolve,inspect}`, `extensions.list`, `capability.{search,load,invoke}`.
-- **Experiments, tasks, subjects** — `experiment.{define,assign,record,results}`, `task.{accept,set_steps,advance_step,record_decision,flag_deviation,bind_run}`, `subject.{enroll,post,get,list}`.
+- **Experiments, tasks, subjects** — `experiment.{define,assign,record,results}`, `task.{accept,set_steps,advance_step,record_decision,flag_deviation,bind_run}`, `subject.{enroll,post,get,list,update_relationship}`. Relationship Subjects keep bounded goals, facts, commitments, blockers, and a restart-durable next action; they do not duplicate Brain episodes or transcripts.
 - **Inspect & govern** — `orient`, `space.summary`, `audit_trail`, `approval.{list,resolve}`, `command.{review,note}`, `gateways.status`.
 
 External CLI/IDE harnesses (Claude Code, Codex, Cursor) see a compact MCP gateway rather than a

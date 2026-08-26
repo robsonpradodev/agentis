@@ -1,4 +1,4 @@
-﻿import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Check, ChevronDown, Code2, ExternalLink, HelpCircle, LayoutTemplate, Search, Settings2 } from 'lucide-react';
 import clsx from 'clsx';
 import * as Collapsible from '@radix-ui/react-collapsible';
@@ -251,6 +251,7 @@ export function ContextInspector({
     setEditData((prev) => {
       const next = { ...prev, ...patch };
       setJsonText(JSON.stringify(next, null, 2));
+      onSave?.(next);
       return next;
     });
   }
@@ -258,8 +259,10 @@ export function ContextInspector({
   function handleJsonChange(val: string) {
     setJsonText(val);
     try {
-      setEditData(JSON.parse(val) as Record<string, unknown>);
+      const parsed = JSON.parse(val) as Record<string, unknown>;
+      setEditData(parsed);
       setJsonError(null);
+      onSave?.(parsed);
     } catch {
       setJsonError('Invalid JSON');
     }
@@ -283,9 +286,34 @@ export function ContextInspector({
   const nodeReason = selection.kind === 'node'
     ? (explainNode(kind, editData, { resolveExtensionName }) || meta.reason)
     : null;
-  const readiness = selection.kind === 'node'
+  const configReadiness = selection.kind === 'node'
     ? evaluateNodeReadiness(editData, { integrations, credentialTypes: credentials.map((credential) => credential.credentialType) })
     : null;
+  const readiness = (() => {
+    if (!configReadiness || !configReadiness.ready || kind !== 'agent_task') return configReadiness;
+    const agentId = typeof editData.agentId === 'string' ? editData.agentId.trim() : '';
+    const requirements = normalizeAgentRequirements(editData.requires);
+    const liveStatuses = new Set(['online', 'busy', 'active', 'running']);
+    if (agentId) {
+      const bound = agents.find((agent) => agent.id === agentId);
+      if (!bound) return { ready: false, message: 'The assigned agent no longer exists. Choose another agent.' };
+      if (!liveStatuses.has(String(bound.status ?? '').toLowerCase())) {
+        return { ready: false, message: `${bound.name} has no connected runtime. Reconnect it or choose an online agent.` };
+      }
+      if (hasAgentRequirements(requirements)) {
+        const match = agentRequirementMatches(agents, requirements).find((candidate) => candidate.id === agentId);
+        if (match?.state !== 'ready') {
+          return { ready: false, message: `${bound.name}'s runtime does not provide every capability required by this step.` };
+        }
+      }
+      return configReadiness;
+    }
+    if (hasAgentRequirements(requirements)
+      && !agentRequirementMatches(agents, requirements).some((candidate) => candidate.state === 'ready')) {
+      return { ready: false, message: 'No connected agent provides every capability required by this step.' };
+    }
+    return configReadiness;
+  })();
 
   return (
     <aside className={clsx('flex w-[360px] shrink-0 flex-col border-l border-line bg-surface text-xs', className)}>

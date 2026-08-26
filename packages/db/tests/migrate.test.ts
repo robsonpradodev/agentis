@@ -19,6 +19,79 @@ function tempDbPath(): string {
 }
 
 describe('runSqliteMigrations', () => {
+  it('removes the legacy cross-connection channel identity index on every open', () => {
+    const path = tempDbPath();
+    const first = openSqlite({ path });
+    try {
+      // Reproduce the regression from an already-upgraded build: embedded
+      // startup recreated the obsolete index after migration v135 completed.
+      first.sqlite.exec('CREATE UNIQUE INDEX IF NOT EXISTS uq_channel_peer ON channel_peer_identities(workspace_id, channel_kind, handle)');
+    } finally {
+      first.sqlite.close();
+    }
+
+    const reopened = openSqlite({ path });
+    try {
+      const indexes = reopened.sqlite.prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='channel_peer_identities'").all() as Array<{ name: string }>;
+      const names = indexes.map((row) => row.name);
+      expect(names).not.toContain('uq_channel_peer');
+      expect(names).toContain('uq_channel_peer_principal');
+      expect(SQLITE_MIGRATIONS.find((migration) => migration.version === 136)?.name)
+        .toBe('repair_connection_scoped_channel_principal_index');
+    } finally {
+      reopened.sqlite.close();
+    }
+  });
+
+  it('creates the durable chat-turn change journal', () => {
+    const { sqlite } = openSqlite({ path: tempDbPath() });
+    try {
+      for (const table of ['conversation_turn_change_payloads', 'conversation_turn_change_sets', 'conversation_turn_changes']) {
+        expect(sqlite.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = ?").get(table)).toBeDefined();
+      }
+      expect(SQLITE_MIGRATIONS.find((migration) => migration.version === 134)?.name).toBe('conversation_turn_change_journal');
+      expect(sqliteSchema.conversationTurnChangeSets).toBeDefined();
+      expect(sqliteSchema.conversationTurnChanges).toBeDefined();
+    } finally {
+      sqlite.close();
+    }
+  });
+  it('creates durable workflow run activity storage in both schemas', () => {
+    const { sqlite } = openSqlite({ path: tempDbPath() });
+    try {
+      expect(sqlite.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='run_activity_events'").get()).toBeDefined();
+      expect(SQLITE_MIGRATIONS.find((migration) => migration.version === 137)?.name).toBe('durable_run_activity_events');
+      expect(sqliteSchema.runActivityEvents).toBeDefined();
+      expect(pgSchema.runActivityEvents).toBeDefined();
+    } finally {
+      sqlite.close();
+    }
+  });
+  it('creates canonical channel aliases and the durable outbound action ledger', () => {
+    const { sqlite } = openSqlite({ path: tempDbPath() });
+    try {
+      expect(SQLITE_MIGRATIONS.find((migration) => migration.version === 138)?.name)
+        .toBe('canonical_channel_peers_and_action_intents');
+      expect(sqlite.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='channel_peer_aliases'").get()).toBeDefined();
+      expect(sqlite.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='channel_action_intents'").get()).toBeDefined();
+      const conversationColumns = sqlite.prepare("PRAGMA table_info('conversations')").all() as Array<{ name: string }>;
+      expect(conversationColumns.map((column) => column.name)).toContain('channel_peer_identity_id');
+      const actionColumns = sqlite.prepare("PRAGMA table_info('channel_action_intents')").all() as Array<{ name: string }>;
+      expect(actionColumns.map((column) => column.name)).toEqual(expect.arrayContaining([
+        'requester_identity_id', 'peer_identity_id', 'goal', 'authorization_basis',
+        'idempotency_key', 'scheduled_for', 'provider_receipt_json',
+      ]));
+      const indexes = sqlite.prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name IN ('channel_peer_aliases','channel_action_intents')").all() as Array<{ name: string }>;
+      expect(indexes.map((row) => row.name)).toEqual(expect.arrayContaining([
+        'uq_channel_peer_alias', 'idx_channel_peer_alias_peer', 'uq_channel_action_idempotency',
+        'idx_channel_action_due', 'idx_channel_action_peer', 'idx_channel_action_requester',
+      ]));
+      expect(sqliteSchema.channelPeerAliases).toBeDefined();
+      expect(sqliteSchema.channelActionIntents).toBeDefined();
+    } finally {
+      sqlite.close();
+    }
+  });
   it('uses an external-content ledger FTS index instead of duplicating payload storage', () => {
     const { sqlite } = openSqlite({ path: tempDbPath() });
     try {

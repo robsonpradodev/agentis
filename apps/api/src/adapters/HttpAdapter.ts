@@ -8,7 +8,7 @@
  * which then calls back into adapter.handleCallback().
  */
 
-import { createHmac, timingSafeEqual } from 'node:crypto';
+import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 import type {
   AgentAdapter,
   AdapterCapabilities,
@@ -29,6 +29,7 @@ import { CircuitBreaker } from './CircuitBreaker.js';
 import { assertSafeUrl } from '../services/safeUrl.js';
 import { linkAbortSignal } from './abort.js';
 import { nativeRuntimeCapabilities } from './runtimeCapabilityDeclarations.js';
+import { buildMarkerToolPrompt, extractMarkerToolCalls } from './markerToolProtocol.js';
 
 export interface HttpAdapterOptions {
   agentId: string;
@@ -192,6 +193,12 @@ export class HttpAdapter implements AgentAdapter {
       () => controller.abort(),
       options?.timeoutMs ?? this.opts.chatTimeoutMs ?? this.opts.dispatchTimeoutMs ?? CONSTANTS.AGENT_TASK_RESPONSE_TIMEOUT_MS,
     ).unref?.();
+    const markerFallback = this.opts.supportsTools !== true
+      && options?.toolMode === 'caller_loop'
+      && tools.length > 0;
+    const requestMessages = markerFallback
+      ? [{ role: 'system' as const, content: buildMarkerToolPrompt(tools, { compact: true }) }, ...messages]
+      : messages;
     try {
       const response = await this.#breaker.exec(() => fetch(safe, {
         method: 'POST',
@@ -205,7 +212,7 @@ export class HttpAdapter implements AgentAdapter {
           model: options?.preferredModel ?? this.opts.model,
           sessionKey: options?.sessionKey,
           timeoutMs: options?.timeoutMs,
-          messages,
+          messages: requestMessages,
           tools: this.opts.supportsTools === true ? tools : [],
           supportsTools: this.opts.supportsTools === true,
         }),
@@ -223,7 +230,27 @@ export class HttpAdapter implements AgentAdapter {
         yield { type: 'done', finishReason: 'error' };
         return;
       }
-      yield* parseHttpChatResponse(response);
+      if (!markerFallback) {
+        yield* parseHttpChatResponse(response);
+      } else {
+        let text = '';
+        let terminal: Extract<ChatDelta, { type: 'done' }> | undefined;
+        for await (const delta of parseHttpChatResponse(response)) {
+          if (delta.type === 'text') text += delta.delta;
+          else if (delta.type === 'done') terminal = delta;
+          else yield delta;
+        }
+        const { cleaned, calls } = extractMarkerToolCalls(text);
+        if (cleaned.trim()) yield { type: 'text', delta: cleaned.trim() };
+        for (const call of calls) {
+          yield { type: 'tool_call', id: randomUUID(), name: call.name, args: call.args };
+        }
+        yield {
+          type: 'done',
+          finishReason: calls.length > 0 ? 'tool_calls' : (terminal?.finishReason ?? 'stop'),
+          ...(terminal?.usage ? { usage: terminal.usage } : {}),
+        };
+      }
     } catch (err) {
       yield {
         type: 'tool_result',

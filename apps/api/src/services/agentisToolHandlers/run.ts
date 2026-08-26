@@ -758,7 +758,26 @@ export function registerRunTools(registry: AgentisToolRegistry, deps: ToolHandle
         const title = String(args.title);
         const content = String(args.content);
         const kind = String(args.kind ?? 'fact');
-        const scopeId = String(args.agentId ?? '');
+        let scopeId = String(args.agentId ?? '');
+
+        // A non-control-plane agent speaking through a channel may remember for
+        // itself, but it may not write workspace constitution or alter another
+        // agent's mind. If it omits agentId, safely narrow the write to itself;
+        // an explicit cross-agent target is rejected. Orchestrators/managers keep
+        // their existing supervisory behavior.
+        if (ctx.channelOrigin && ctx.agentId) {
+          const caller = deps.db.select({ role: schema.agents.role }).from(schema.agents).where(and(
+            eq(schema.agents.workspaceId, ctx.workspaceId),
+            eq(schema.agents.id, ctx.agentId),
+          )).get();
+          const controlPlane = caller?.role === 'orchestrator' || caller?.role === 'manager';
+          if (!controlPlane) {
+            if (scopeId && scopeId !== ctx.agentId) {
+              throw new AgentisError('AUTH_FORBIDDEN', 'A bounded channel agent may write only to its own Brain.');
+            }
+            scopeId = ctx.agentId;
+          }
+        }
 
         let importanceVal = 0.5;
         if (args.importance !== undefined && args.importance !== null) {
@@ -950,6 +969,50 @@ export function registerRunTools(registry: AgentisToolRegistry, deps: ToolHandle
         const knowledgeBaseId = String(args.knowledgeBaseId);
         const result = deps.knowledgeBases.archiveDocument(ctx.workspaceId, knowledgeBaseId, documentId);
         return result;
+      },
+    },
+    {
+      definition: {
+        id: 'agentis.knowledge.delete',
+        family: 'run',
+        description: 'Permanently delete one or more documents and all of their indexed chunks from a knowledge base. This is irreversible; use archive when recoverability is desired.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            documentIds: { type: 'array', items: { type: 'string' }, minItems: 1, maxItems: 500 },
+            knowledgeBaseId: { type: 'string' },
+          },
+          required: ['documentIds', 'knowledgeBaseId'],
+        },
+        mutating: true,
+      },
+      handler: async (args, ctx) => {
+        if (!deps.knowledgeBases) throw new Error('Knowledge base service not available');
+        const knowledgeBaseId = String(args.knowledgeBaseId);
+        const documentIds = Array.isArray(args.documentIds)
+          ? [...new Set(args.documentIds.map(String).filter(Boolean))]
+          : [];
+        if (documentIds.length === 0) throw new AgentisError('VALIDATION_FAILED', 'documentIds must contain at least one id');
+        const deleted = documentIds.map((documentId) =>
+          deps.knowledgeBases!.deleteDocument(ctx.workspaceId, knowledgeBaseId, documentId));
+        return { knowledgeBaseId, deleted, count: deleted.length };
+      },
+    },
+    {
+      definition: {
+        id: 'agentis.knowledge_base.delete',
+        family: 'run',
+        description: 'Permanently delete an entire knowledge base, including every document and indexed chunk in it. This is irreversible.',
+        inputSchema: {
+          type: 'object',
+          properties: { knowledgeBaseId: { type: 'string' } },
+          required: ['knowledgeBaseId'],
+        },
+        mutating: true,
+      },
+      handler: async (args, ctx) => {
+        if (!deps.knowledgeBases) throw new Error('Knowledge base service not available');
+        return deps.knowledgeBases.deleteKnowledgeBase(ctx.workspaceId, String(args.knowledgeBaseId));
       },
     },
   ]);

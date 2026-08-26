@@ -46,6 +46,8 @@ import { normalizePersona, resolveHumanize, type ChannelPersona, type HumanizeCo
 import { ChannelSendGuard } from './channelGuards.js';
 import { channelCapabilities, type ChannelCapabilities } from '../../adapters/channels/channelCapabilities.js';
 import type { ConversationHandoffService } from './conversationHandoffService.js';
+import { isVerifiedChannelOwner } from './channelIdentityService.js';
+import type { ChannelIdentityService } from './channelIdentityService.js';
 
 export interface ChannelBridgeDeps {
   db: AgentisSqliteDb;
@@ -62,6 +64,7 @@ export interface ChannelBridgeDeps {
   /** Voice model — turns an attachment's `text` into a spoken Opus voice note. */
   speech?: { synthesize(input: { text: string; voice?: string }): Promise<{ bytes: Buffer; mimeType: string } | null> };
   handoffs?: ConversationHandoffService;
+  identity?: ChannelIdentityService;
 }
 
 export interface CreateConnectionInput {
@@ -169,9 +172,8 @@ export const DEFAULT_WHATSAPP_CONNECTION_PROFILE: WhatsAppConnectionProfile = {
   observability: { structuredDiagnostics: true, chatSocketLogs: false },
   ownerReasoningVisibility: 'off',
   manualOutboundTakeover: 'until_handback',
-  // The owner/operator can keep using their own chat with the agent. This is
-  // deliberately opt-in because an explicit owner chat is a convenience, not
-  // an authority boundary.
+  // Invariant: the configured, authenticated owner/operator conversation can
+  // never be parked by last-human-responder handoff. Customer chats still can.
   ownerManualOutboundTakeover: 'off',
   historyReconciliation: 'recent',
 };
@@ -208,12 +210,13 @@ export const isConfiguredWhatsAppOwnerChat = isConfiguredChannelOwnerChat;
  * owner/operator exception is explicit; a routing default can never disable
  * handoff protection for an arbitrary customer conversation.
  */
-export function shouldClaimWhatsAppManualOutbound(settings: unknown, chatId: string): boolean {
+export function shouldClaimWhatsAppManualOutbound(settings: unknown, chatId: string, verifiedOwner = false): boolean {
   const value = settings && typeof settings === 'object' && !Array.isArray(settings)
     ? settings as { whatsappProfile?: unknown }
     : {};
   const profile = resolveWhatsAppConnectionProfile(value.whatsappProfile);
   if (profile.manualOutboundTakeover === 'off') return false;
+  if (verifiedOwner) return false;
   return !isConfiguredChannelOwnerChat(settings, chatId);
 }
 
@@ -462,14 +465,41 @@ export class ChannelBridge {
       .where(eq(schema.channelConnections.id, args.connectionId))
       .get();
     if (!row) throw new AgentisError('RESOURCE_NOT_FOUND', `channel connection ${args.connectionId} not found`);
-    const targetConversation = this.#conversationForDelivery(
-      row,
-      args.chatId,
-      args.actor === 'human' || args.persistOutboundContext === true,
-    );
+    const explicitConversation = args.conversationId
+      ? this.deps.db.select().from(schema.conversations).where(and(
+          eq(schema.conversations.workspaceId, row.workspaceId),
+          eq(schema.conversations.id, args.conversationId),
+        )).get()
+      : null;
+    if (args.conversationId && !explicitConversation) {
+      throw new AgentisError('RESOURCE_NOT_FOUND', `conversation ${args.conversationId} not found`);
+    }
+    if (explicitConversation?.channelConnectionId !== undefined
+      && explicitConversation.channelConnectionId !== row.id) {
+      throw new AgentisError('VALIDATION_FAILED', 'channel delivery conversation belongs to a different connection');
+    }
+    if (explicitConversation?.channelPeerIdentityId && this.deps.identity) {
+      const addressedPeer = this.deps.identity.resolve(row.workspaceId, row.kind, args.chatId, row.id);
+      if (!addressedPeer || addressedPeer.id !== explicitConversation.channelPeerIdentityId) {
+        throw new AgentisError('VALIDATION_FAILED', 'channel delivery recipient does not match the canonical conversation peer');
+      }
+    }
+    const targetConversation = explicitConversation
+      ? { id: explicitConversation.id }
+      : this.#conversationForDelivery(
+          row,
+          args.chatId,
+          args.actor === 'human' || args.persistOutboundContext === true,
+        );
     if (args.actor === 'human') {
+      const verifiedOwner = isVerifiedChannelOwner(this.deps.db, {
+        workspaceId: row.workspaceId,
+        connectionId: row.id,
+        channelKind: row.kind,
+        handle: args.chatId,
+      });
       const shouldClaimHuman = row.kind !== 'whatsapp'
-        || shouldClaimWhatsAppManualOutbound(row.settings, args.chatId);
+        || shouldClaimWhatsAppManualOutbound(row.settings, args.chatId, verifiedOwner);
       if (targetConversation && shouldClaimHuman) this.deps.handoffs?.claimHuman({
         workspaceId: row.workspaceId,
         conversationId: targetConversation.id,
@@ -849,6 +879,14 @@ export class ChannelBridge {
         lastError: null,
       })
       .run();
+    this.deps.identity?.syncConfiguredOwner({
+      workspaceId: input.workspaceId,
+      connectionId: id,
+      channelKind: input.kind,
+      handle: settings.ownerChatId ?? null,
+      userId: input.userId,
+      displayName: settings.ownerName ?? null,
+    });
     // Start polling sessions immediately (WhatsApp links via explicit QR login).
     this.#persistent?.onCreated?.(ref);
     const connection = this.get(input.workspaceId, id);
@@ -955,6 +993,14 @@ export class ChannelBridge {
       .set({ settings, updatedAt: new Date().toISOString() })
       .where(eq(schema.channelConnections.id, row.id))
       .run();
+    this.deps.identity?.syncConfiguredOwner({
+      workspaceId,
+      connectionId: row.id,
+      channelKind: row.kind,
+      handle: settings.ownerChatId ?? null,
+      userId: row.userId,
+      displayName: settings.ownerName ?? null,
+    });
     return this.get(workspaceId, id);
   }
 
@@ -1169,6 +1215,15 @@ export class ChannelBridge {
       this.#markActive(row.id);
       return { accepted: false, idempotent: false };
     }
+    const peer = this.deps.identity?.observeAliases({
+      workspaceId: row.workspaceId,
+      connectionId: row.id,
+      channelKind: row.kind,
+      primaryHandle: parsed.chatId,
+      ...(parsed.from ? { displayName: parsed.from } : {}),
+      source: 'webhook_inbound',
+      countMessage: false,
+    });
     const conversation = this.deps.conversations.getOrCreateByChannel({
       workspaceId: row.workspaceId,
       ambientId: row.ambientId,
@@ -1176,6 +1231,7 @@ export class ChannelBridge {
       agentId: inboundAgentId,
       channelConnectionId: row.id,
       channelChatId: parsed.chatId,
+      channelPeerIdentityId: peer?.id ?? null,
       appId: row.appId ?? null,
     });
     const fromTag = parsed.from ? `[${parsed.from}] ` : '';
@@ -1620,6 +1676,14 @@ export class ChannelBridge {
     if (!create || !this.deps.handoffs) return null;
     const agentId = row.agentId ?? this.#resolveInboundAgentId(row.workspaceId);
     if (!agentId) throw new AgentisError('RESOURCE_NOT_FOUND', 'No agent is available to own this channel conversation');
+    const peer = this.deps.identity?.observeAliases({
+      workspaceId: row.workspaceId,
+      connectionId: row.id,
+      channelKind: row.kind,
+      primaryHandle: chatId,
+      source: 'programmatic_outbound',
+      countMessage: false,
+    });
     return this.deps.conversations.getOrCreateByChannel({
       workspaceId: row.workspaceId,
       ambientId: row.ambientId,
@@ -1627,6 +1691,7 @@ export class ChannelBridge {
       agentId,
       channelConnectionId: row.id,
       channelChatId: chatId,
+      channelPeerIdentityId: peer?.id ?? null,
       appId: row.appId,
     });
   }

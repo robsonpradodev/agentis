@@ -2,6 +2,7 @@
 
 import { z } from 'zod';
 import { CONSTANTS } from '../constants.js';
+import { relationshipAutonomyPolicySchema } from './relationship.js';
 
 // Local, single-operator lifecycle: an app either exists and is usable (`active`)
 // or is retired (`archived`). Publishing ("draft"→"published") is a Hub concept
@@ -122,6 +123,8 @@ export const appPolicySchema = z.object({
   })).default([]),
   /** Outbound safety envelope (G7) — rate/quiet-hours/claim limits on unsupervised sends. Absent = unrestricted. */
   outbound: appOutboundPolicySchema.optional(),
+  /** Goal-directed authority envelope for replies, follow-ups, and external side effects. */
+  autonomy: relationshipAutonomyPolicySchema.optional(),
 });
 export type AppPolicy = z.infer<typeof appPolicySchema>;
 

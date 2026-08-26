@@ -3,6 +3,8 @@ import { AgentisError, type ChannelToolOrigin, type ProofReceipt } from '@agenti
 
 export interface ConversationTurnLeaseContext {
   channelOrigin?: ChannelToolOrigin;
+  /** Exact catalog this turn may invoke, including through MCP-native harnesses. */
+  allowedToolIds?: string[];
 }
 
 export interface TurnToolObservation {

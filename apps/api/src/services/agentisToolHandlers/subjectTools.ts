@@ -10,6 +10,7 @@
 import { AgentisError } from '@agentis/core';
 import type { AgentisToolRegistry } from '../agentisToolRegistry.js';
 import type { ToolHandlerDeps } from './deps.js';
+import { normalizeRelationshipState } from '../relationshipStateService.js';
 
 export function registerSubjectTools(registry: AgentisToolRegistry, deps: ToolHandlerDeps): void {
   const svc = () => {
@@ -17,6 +18,52 @@ export function registerSubjectTools(registry: AgentisToolRegistry, deps: ToolHa
     return deps.durableEntities;
   };
   registry.registerMany([
+    {
+      definition: {
+        id: 'agentis.subject.update_relationship',
+        family: 'run',
+        mcpExposed: true,
+        autoExecute: true,
+        description: 'Update the compact durable state for one relationship Subject: its active goal/stage, verified facts with provenance, commitments, blockers, and exactly one next action. Use this after a material relationship change; do not copy the transcript. Setting nextAction.dueAt arms a restart-durable wake. Set obsolete actions/commitments to cancelled or done.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            subjectId: { type: 'string' },
+            key: { type: 'string' },
+            facts: { type: 'array', description: 'Full bounded fact list. Each fact includes key,value,confidence,source,observedAt,lastConfirmedAt and optional expiresAt.' },
+            engagements: { type: 'array' },
+            commitments: { type: 'array' },
+            openQuestions: { type: 'array', items: { type: 'string' } },
+            blockers: { type: 'array', items: { type: 'string' } },
+            nextAction: { description: 'Next action object, or null to clear.' },
+          },
+        },
+        mutating: true,
+      },
+      handler: (args, ctx) => {
+        const s = svc();
+        const entity = typeof args.subjectId === 'string'
+          ? s.get(args.subjectId)
+          : typeof args.key === 'string' ? s.getByKey(ctx.workspaceId, 'subject', args.key) : null;
+        if (!entity || entity.workspaceId !== ctx.workspaceId || entity.kind !== 'subject') {
+          throw new AgentisError('RESOURCE_NOT_FOUND', 'relationship subject not found');
+        }
+        const state = normalizeRelationshipState(entity.key, entity.stateJson);
+        const now = new Date().toISOString();
+        if (Array.isArray(args.facts)) state.facts = args.facts.slice(0, 100) as typeof state.facts;
+        if (Array.isArray(args.engagements)) state.engagements = args.engagements.slice(0, 20) as typeof state.engagements;
+        if (Array.isArray(args.commitments)) state.commitments = args.commitments.slice(0, 50) as typeof state.commitments;
+        if (Array.isArray(args.openQuestions)) state.openQuestions = args.openQuestions.filter((v): v is string => typeof v === 'string').slice(0, 30);
+        if (Array.isArray(args.blockers)) state.blockers = args.blockers.filter((v): v is string => typeof v === 'string').slice(0, 30);
+        if ('nextAction' in args) state.nextAction = args.nextAction && typeof args.nextAction === 'object' ? args.nextAction as typeof state.nextAction : null;
+        state.updatedAt = now;
+        const dueAt = state.nextAction && ['planned', 'ready'].includes(state.nextAction.status)
+          ? state.nextAction.dueAt ?? now
+          : null;
+        s.upsert({ workspaceId: ctx.workspaceId, kind: 'subject', key: entity.key, appId: entity.appId, state: state as unknown as Record<string, unknown>, nextWakeAt: dueAt });
+        return { subjectId: entity.id, updatedAt: now, nextWakeAt: dueAt, state };
+      },
+    },
     {
       definition: {
         id: 'agentis.subject.enroll',
@@ -106,8 +153,8 @@ export function registerSubjectTools(registry: AgentisToolRegistry, deps: ToolHa
         const s = svc();
         const entity = s.getByKey(ctx.workspaceId, 'subject', key);
         if (!entity) throw new AgentisError('RESOURCE_NOT_FOUND', `no subject "${key}"`);
-        const state = entity.stateJson as { stage?: string; facts?: unknown };
-        return { subjectId: entity.id, key, status: entity.status, stage: state?.stage, facts: state?.facts ?? {}, pendingInbox: s.pendingInbox(entity.id).length };
+        const state = entity.stateJson as { version?: number; stage?: string; facts?: unknown; engagements?: Array<{ stage?: string }> };
+        return { subjectId: entity.id, key, status: entity.status, stage: state?.stage ?? state.engagements?.[0]?.stage, state, pendingInbox: s.pendingInbox(entity.id).length };
       },
     },
     {
@@ -121,8 +168,8 @@ export function registerSubjectTools(registry: AgentisToolRegistry, deps: ToolHa
       },
       handler: (_args, ctx) => ({
         subjects: svc().listByKind(ctx.workspaceId, 'subject').map((e) => {
-          const state = e.stateJson as { stage?: string };
-          return { subjectId: e.id, key: e.key, status: e.status, stage: state?.stage ?? null };
+          const state = e.stateJson as { version?: number; stage?: string; engagements?: Array<{ stage?: string; goal?: string; status?: string }>; nextAction?: unknown };
+          return { subjectId: e.id, key: e.key, status: e.status, stage: state?.stage ?? state.engagements?.[0]?.stage ?? null, goal: state.engagements?.[0]?.goal ?? null, engagementStatus: state.engagements?.[0]?.status ?? null, nextAction: state.nextAction ?? null };
         }),
       }),
     },

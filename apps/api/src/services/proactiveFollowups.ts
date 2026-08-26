@@ -63,15 +63,17 @@ export class ProactiveFollowupService {
     let cleared = 0;
     for (const contact of due) {
       try {
-        const dispatched = await this.#followUp(contact);
-        if (dispatched) fired += 1;
+        const outcome = await this.#followUp(contact);
+        if (outcome === 'fired') fired += 1;
+        if (outcome === 'fired' || outcome === 'held') {
+          this.deps.contacts.clearNextTouch(contact.id);
+          cleared += 1;
+        } else {
+          const delayMs = outcome === 'blocked' ? 60 * 60_000 : 15 * 60_000;
+          this.deps.contacts.deferNextTouch(contact.id, new Date(Date.parse(now) + delayMs).toISOString());
+        }
       } catch (err) {
         this.deps.logger.warn('proactive.followup.failed', { contactId: contact.id, err: (err as Error).message });
-      } finally {
-        // Always clear the clock — a fired follow-up sets a fresh lastTouch; an
-        // unresolvable one is dropped rather than retried forever.
-        this.deps.contacts.clearNextTouch(contact.id);
-        cleared += 1;
       }
     }
     return { fired, cleared };
@@ -79,9 +81,9 @@ export class ProactiveFollowupService {
 
   async #followUp(contact: {
     id: string; workspaceId: string; appId: string | null; channelKind: string | null; handle: string | null; displayName: string | null; goal: string | null;
-    stage?: string | null; dataJson?: unknown;
-  }): Promise<boolean> {
-    if (!contact.appId || !contact.channelKind || !contact.handle) return false;
+    stage?: string | null; dataJson?: unknown; subjectId?: string | null;
+  }): Promise<'fired' | 'held' | 'blocked' | 'unresolved'> {
+    if (!contact.appId || !contact.channelKind || !contact.handle) return 'unresolved';
     // Resolve the live thread for this contact (DM channels: handle == chat id).
     const conv = this.deps.db
       .select({ id: schema.conversations.id, agentId: schema.conversations.agentId, userId: schema.conversations.userId, connectionId: schema.conversations.channelConnectionId, handoffState: schema.conversations.handoffState })
@@ -91,9 +93,9 @@ export class ProactiveFollowupService {
         eq(schema.conversations.channelChatId, contact.handle),
       ))
       .get();
-    if (!conv || !conv.connectionId) return false;
+    if (!conv || !conv.connectionId) return 'unresolved';
     // A human in the thread? Don't barge in.
-    if (conv.handoffState === 'human') return false;
+    if (conv.handoffState === 'human') return 'blocked';
 
     const who = contact.displayName ?? 'this contact';
     const goal = contact.goal ?? 'continue the relationship and move it forward';
@@ -111,6 +113,14 @@ export class ProactiveFollowupService {
     // text is the proxy for what the agent will say (claim/approval guard); rate
     // limit + quiet hours apply because the App is reaching out unsupervised.
     if (this.deps.policy) {
+      const autonomy = this.deps.policy.evaluateAutonomy(contact.appId, 'proactive_followup', contact.id);
+      if (autonomy.decision !== 'allow') {
+        if (autonomy.decision === 'require_approval' && this.deps.requestApproval) {
+          const created = await this.deps.requestApproval({ workspaceId: contact.workspaceId, appId: contact.appId, conversationId: conv.id, contactName: who, reason: autonomy.reason });
+          return created ? 'held' : 'blocked';
+        }
+        return 'blocked';
+      }
       const decision = this.deps.policy.evaluate(contact.appId, { body: goal, source: 'agent' });
       if (!decision.allow) {
         if (decision.needsApproval && this.deps.requestApproval) {
@@ -125,7 +135,7 @@ export class ProactiveFollowupService {
         } else {
           this.deps.logger.info('proactive.followup.blocked', { contactId: contact.id, reason: decision.reason });
         }
-        return false; // not dispatched — held or blocked by policy
+        return decision.needsApproval ? 'held' : 'blocked';
       }
     }
 
@@ -139,11 +149,13 @@ export class ProactiveFollowupService {
       connectionId: conv.connectionId,
       kind: contact.channelKind,
       chatId: contact.handle,
+      initiatedBy: 'proactive',
+      ...(contact.subjectId ? { subjectId: contact.subjectId } : {}),
       text: `[Scheduled follow-up — you are reaching out first, this is not a reply to a new message] Follow up with ${who} as promised. Goal: ${goal}.${context ? ` ${context}` : ''} Send a brief, warm, on-topic message grounded in what you know about them; if there is nothing useful to say, stay quiet.`,
     });
     // Count this agent-initiated outbound against the App's rolling rate window (G7).
     this.deps.policy?.record(contact.appId, 'agent');
-    return true;
+    return 'fired';
   }
 }
 

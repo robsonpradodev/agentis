@@ -9,7 +9,7 @@
  * full ACP stream test belongs with an AcpClient fake if/when one exists.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { OpenClawAdapter } from '../../src/adapters/OpenClawAdapter.js';
+import { OpenClawAdapter, openClawCallerManagedDeltas } from '../../src/adapters/OpenClawAdapter.js';
 import type { Logger } from '../../src/logger.js';
 
 const logger: Logger = {
@@ -26,11 +26,24 @@ describe('OpenClawAdapter chat', () => {
     expect(adapter.capabilities().interactiveChat).toBe(true);
   });
 
-  it('owns its remote tool loop: session_event forwarding, no local tool calling', () => {
+  it('keeps native gateway tools while exposing Agentis tools through caller-managed markers', () => {
     const adapter = new OpenClawAdapter({ agentId: 'agent-1', gatewayUrl: 'wss://gw.test', logger });
     const caps = adapter.capabilities();
-    expect(caps.toolCalling).toBe(false);
-    expect(caps.toolForwarding).toBe('session_event');
+    expect(caps.toolCalling).toBe(true);
+    expect(caps.toolForwarding).toBe('marker_protocol');
+    expect(caps.limitations?.[0]).toMatch(/native tools.*ACP.*Agentis platform tools.*marker/i);
+  });
+
+  it('converts a buffered ACP marker into an executable Agentis tool call without exposing the marker', () => {
+    const deltas = openClawCallerManagedDeltas([
+      'Checking the workspace now.',
+      'AGENTIS_TOOL_CALL {"name":"agentis.data.query","arguments":{"table":"leads"}}',
+    ].join('\n'));
+    expect(deltas).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'text', delta: 'Checking the workspace now.' }),
+      expect.objectContaining({ type: 'tool_call', name: 'agentis.data.query', args: { table: 'leads' } }),
+    ]));
+    expect(JSON.stringify(deltas)).not.toContain('AGENTIS_TOOL_CALL');
   });
 
   it('connects lazily (no bridge process, no socket) and disposes cleanly', async () => {

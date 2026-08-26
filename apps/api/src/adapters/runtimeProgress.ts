@@ -1,4 +1,5 @@
 import { normalizeToolInvocation, type ChatDelta } from '@agentis/core';
+import { redactSecretString } from '../services/security/secretRedaction.js';
 
 type RuntimeActivity = Extract<ChatDelta, { type: 'activity' }>;
 
@@ -10,6 +11,10 @@ export interface RuntimeProgressOptions {
   safeLabel?: string;
   reasoning?: boolean;
   agentId?: string;
+  transport?: string;
+  attempt?: number;
+  /** Stable start time for replace-in-place heartbeat updates. */
+  startedAt?: string;
 }
 
 /** Build one stable activity row without exposing or paraphrasing model narration. */
@@ -22,9 +27,26 @@ export function runtimeProgressActivity(options: RuntimeProgressOptions): Runtim
     label: options.safeLabel?.trim() || (options.reasoning
       ? `${options.runtimeName} is reasoning`
       : `${options.runtimeName} is working`),
-    startedAt: new Date().toISOString(),
+    ...(options.reasoning && options.text?.trim()
+      ? { detail: clipPublicSummary(redactSecretString(options.text.trim())) }
+      : {}),
+    startedAt: options.startedAt ?? new Date().toISOString(),
     ...(options.agentId ? { agentId: options.agentId } : {}),
+    ...(options.transport ? { transport: options.transport } : {}),
+    ...(options.attempt !== undefined ? { attempt: options.attempt } : {}),
   };
+}
+
+/** Extract the workflow retry attempt from an isolated native session key. */
+export function runtimeAttemptFromSessionKey(sessionKey: string | null | undefined): number | undefined {
+  const match = sessionKey?.match(/:attempt:(\d+)$/);
+  if (!match) return undefined;
+  const attempt = Number(match[1]);
+  return Number.isSafeInteger(attempt) && attempt > 0 ? attempt : undefined;
+}
+
+function clipPublicSummary(text: string): string {
+  return text.length > 1_000 ? `${text.slice(0, 999)}…` : text;
 }
 
 /** Tool activity intentionally excludes prompts, commands, paths, and arguments. */

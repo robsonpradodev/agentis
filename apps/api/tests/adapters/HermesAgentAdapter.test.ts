@@ -154,7 +154,7 @@ describe('HermesAgentAdapter', () => {
     }
   });
 
-  it('caps first model event silence around 90 seconds instead of waiting for the hard ceiling', async () => {
+  it('fails a pinned background ACP turn after the 20 second first-meaningful-event watchdog', async () => {
     vi.useFakeTimers();
     const child = fakeAcpChild();
     spawnMock.mockReturnValue(child);
@@ -168,8 +168,9 @@ describe('HermesAgentAdapter', () => {
       [],
       { sessionKey: 'conversation-a' },
     ));
-    await vi.advanceTimersByTimeAsync(89_000);
-    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.advanceTimersByTimeAsync(19_500);
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(500);
     const deltas = await run;
 
     expect(deltas).toContainEqual(expect.objectContaining({
@@ -194,8 +195,8 @@ describe('HermesAgentAdapter', () => {
       { sessionKey: 'conversation-a', latencyClass: 'interactive' },
     ));
     // Still waiting just before the interactive stall budget...
-    await vi.advanceTimersByTimeAsync(29_500);
-    // ...fails just after 30s, long before the 90s non-interactive budget.
+    await vi.advanceTimersByTimeAsync(11_500);
+    // ...fails just after 12s, before a second provider-sized wait accumulates.
     await vi.advanceTimersByTimeAsync(1_000);
     const deltas = await run;
 
@@ -209,43 +210,122 @@ describe('HermesAgentAdapter', () => {
     expect(deltas.at(-1)).toEqual({ type: 'done', finishReason: 'error' });
   });
 
-  it('falls back from a stalled-before-first-event ACP turn to the CLI in auto mode (interactive)', async () => {
-    vi.useFakeTimers();
-    const acp = fakeAcpChild();
+  it('routes interactive auto turns directly to the reliable CLI transport', async () => {
     const cli = fakeChildProcess();
-    spawnMock
-      .mockReturnValueOnce(acp)
-      .mockImplementationOnce(() => {
-        queueMicrotask(() => {
-          cli.stdout.write('CLI_FALLBACK\n');
-          cli.emit('exit', 0);
-        });
-        return cli;
+    spawnMock.mockImplementationOnce(() => {
+      queueMicrotask(() => {
+        cli.stdout.write('CLI_FAST\n');
+        cli.emit('exit', 0);
       });
+      return cli;
+    });
     const adapter = new HermesAgentAdapter({ agentId: 'agent-1', logger, binaryPath: 'hermes-test', chatTransport: 'auto' });
 
-    acp.on('__prompt', () => {
-      // Session opens, but the ACP build never streams a first model event.
-    });
-    const run = collectDeltas(adapter.chat(
+    const deltas = await collectDeltas(adapter.chat(
       [{ role: 'user', content: 'hi' }],
       [],
       { sessionKey: 'conversation-a', latencyClass: 'interactive' },
     ));
-    // ACP first-event budget (~30s interactive) elapses, then the CLI answers.
-    await vi.advanceTimersByTimeAsync(31_000);
-    await vi.advanceTimersByTimeAsync(0);
-    const deltas = await run;
 
-    expect(spawnMock).toHaveBeenCalledTimes(2);
-    expect(spawnMock.mock.calls[0]![1]).toEqual(['acp']);
-    expect(spawnMock.mock.calls[1]![1]![0]).toBe('chat');
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    expect(spawnMock.mock.calls[0]![1]![0]).toBe('chat');
+    expect(deltas.some((d) => d.type === 'activity' && d.label === 'Switching Hermes transport')).toBe(false);
+    expect(deltas).toContainEqual({ type: 'text', delta: 'CLI_FAST' });
+    expect(deltas.at(-1)).toEqual({ type: 'done', finishReason: 'stop' });
+  });
+
+  it('runs caller-managed Agentis tasks through the model-only one-shot path and parses split markers', async () => {
+    const cli = fakeChildProcess();
+    spawnMock.mockImplementationOnce(() => {
+      queueMicrotask(() => {
+        // Hermes sometimes emits the marker keyword as prose and the JSON object
+        // as a separately parsed line. Preserve their original order.
+        cli.stdout.write('Warning: Unknown toolsets: stale-profile\n');
+        cli.stdout.write('AGENTIS_TOOL_CALL\n');
+        cli.stdout.write('{"name":"agentis.data.query","arguments":{}}\n');
+        cli.emit('exit', 0);
+      });
+      return cli;
+    });
+    const adapter = new HermesAgentAdapter({ agentId: 'agent-1', logger, binaryPath: 'hermes-test', chatTransport: 'cli' });
+
+    const deltas = await collectDeltas(adapter.chat(
+      [{ role: 'user', content: 'Select the next lead.' }],
+      [{ name: 'agentis.data.query', description: 'Query app data', parameters: { type: 'object' } }],
+      { sessionKey: 'agent-task:run-1:node-1:attempt:1', latencyClass: 'deliberate', toolMode: 'caller_loop' },
+    ));
+
+    const args = spawnMock.mock.calls[0]![1] as string[];
+    expect(args[0]).toBe('-z');
+    expect(args).not.toContain('chat');
+    expect(args).toContain('-t');
+    expect(args[args.indexOf('-t') + 1]).toBe('context_engine');
+    expect(args.join(' ')).toContain('intentionally model-only');
+    expect(deltas).toContainEqual(expect.objectContaining({ type: 'tool_call', name: 'agentis.data.query' }));
+    expect(deltas.some((delta) => delta.type === 'text' && /unknown toolsets/i.test(delta.delta))).toBe(false);
     expect(deltas).toContainEqual(expect.objectContaining({
       type: 'activity',
-      label: 'Switching Hermes transport',
+      label: 'Hermes CLI requested an Agentis tool',
+      status: 'success',
     }));
-    expect(deltas).toContainEqual({ type: 'text', delta: 'CLI_FALLBACK' });
+    expect(deltas.some((delta) => delta.type === 'activity' && delta.status === 'error')).toBe(false);
+  });
+
+  it('does not kill a healthy quiet background Hermes turn after three minutes', async () => {
+    vi.useFakeTimers();
+    const child = fakeChildProcess();
+    spawnMock.mockReturnValue(child);
+    const adapter = new HermesAgentAdapter({ agentId: 'agent-1', logger, binaryPath: 'hermes-test', chatTransport: 'cli' });
+
+    const run = collectDeltas(adapter.chat(
+      [{ role: 'user', content: 'Complete a multi-step workflow task.' }],
+      [],
+      { sessionKey: 'workflow-node', latencyClass: 'deliberate' },
+    ));
+    // Hermes quiet mode reports native tool work only in its own log. Three
+    // minutes without pipe output is therefore not evidence that it is stuck.
+    await vi.advanceTimersByTimeAsync(3 * 60_000 + 1);
+    child.stdout.write('BACKGROUND_OK\n');
+    child.emit('exit', 0);
+    const deltas = await run;
+
+    expect(deltas).toContainEqual(expect.objectContaining({
+      type: 'activity',
+      label: 'Waiting for Hermes CLI final response',
+    }));
+    expect(deltas).toContainEqual({ type: 'text', delta: 'BACKGROUND_OK' });
     expect(deltas.at(-1)).toEqual({ type: 'done', finishReason: 'stop' });
+  });
+
+  it('reports the silence ceiling as a timeout instead of an opaque exit code', async () => {
+    vi.useFakeTimers();
+    const prior = process.env.AGENTIS_HERMES_CLI_SILENCE_TIMEOUT_MS;
+    process.env.AGENTIS_HERMES_CLI_SILENCE_TIMEOUT_MS = '30000';
+    const child = fakeChildProcess();
+    spawnMock.mockReturnValue(child);
+    const adapter = new HermesAgentAdapter({ agentId: 'agent-1', logger, binaryPath: 'hermes-test', chatTransport: 'cli' });
+    try {
+      const run = collectDeltas(adapter.chat(
+        [{ role: 'user', content: 'Run.' }],
+        [],
+        { sessionKey: 'workflow-node', latencyClass: 'deliberate' },
+      ));
+      await vi.advanceTimersByTimeAsync(30_001);
+      // The real process exits non-zero after Agentis terminates its tree.
+      child.emit('exit', 1);
+      const deltas = await run;
+      const failure = deltas.find((delta) => delta.type === 'tool_result' && delta.error);
+
+      expect(failure).toEqual(expect.objectContaining({
+        type: 'tool_result',
+        error: expect.stringMatching(/no observable output.*appears stuck/i),
+      }));
+      expect((failure as { error?: string } | undefined)?.error).not.toMatch(/exited 1/i);
+      expect(deltas.at(-1)).toEqual({ type: 'done', finishReason: 'error' });
+    } finally {
+      if (prior === undefined) delete process.env.AGENTIS_HERMES_CLI_SILENCE_TIMEOUT_MS;
+      else process.env.AGENTIS_HERMES_CLI_SILENCE_TIMEOUT_MS = prior;
+    }
   });
 
   it('trips a breaker after an ACP stall so the next auto turn goes straight to the CLI (no re-probe)', async () => {
@@ -266,15 +346,16 @@ describe('HermesAgentAdapter', () => {
     const adapter = new HermesAgentAdapter({ agentId: 'agent-1', logger, binaryPath: 'hermes-test', chatTransport: 'auto' });
     acp.on('__prompt', () => { /* never streams a first event */ });
 
-    // Turn 1: ACP stalls (~30s) then CLI answers — trips the breaker.
-    const run1 = collectDeltas(adapter.chat([{ role: 'user', content: 'one' }], [], { sessionKey: 'c', latencyClass: 'interactive' }));
-    await vi.advanceTimersByTimeAsync(31_000);
+    // Turn 1: a deliberate/background ACP turn stalls (~90s), then CLI answers
+    // and trips the shared adapter breaker.
+    const run1 = collectDeltas(adapter.chat([{ role: 'user', content: 'one' }], [], { sessionKey: 'c', latencyClass: 'deliberate' }));
+    await vi.advanceTimersByTimeAsync(91_000);
     await vi.advanceTimersByTimeAsync(0);
     const deltas1 = await run1;
     expect(deltas1).toContainEqual({ type: 'text', delta: 'FIRST' });
 
     // Turn 2: no ACP spawn, no first-event probe — CLI answers immediately.
-    const run2 = collectDeltas(adapter.chat([{ role: 'user', content: 'two' }], [], { sessionKey: 'c', latencyClass: 'interactive' }));
+    const run2 = collectDeltas(adapter.chat([{ role: 'user', content: 'two' }], [], { sessionKey: 'c', latencyClass: 'deliberate' }));
     await vi.advanceTimersByTimeAsync(0);
     const deltas2 = await run2;
 
@@ -339,6 +420,7 @@ describe('HermesAgentAdapter', () => {
       phase: 'runtime',
       status: 'running',
       label: 'Hermes is reasoning',
+      detail: 'considering',
     }));
     expect(deltas.some((delta) => delta.type === 'thinking')).toBe(false);
     expect(deltas).toContainEqual({ type: 'text', delta: 'Hello operator' });
@@ -531,7 +613,7 @@ describe('HermesAgentAdapter', () => {
     expect(prompted).toBe(true);
 
     child.update({ sessionUpdate: 'available_commands_update', availableCommands: [] });
-    await vi.advanceTimersByTimeAsync(31_000);
+    await vi.advanceTimersByTimeAsync(13_000);
 
     const deltas = await run;
     expect(deltas).toContainEqual(expect.objectContaining({
@@ -670,12 +752,149 @@ describe('HermesAgentAdapter', () => {
     await vi.waitFor(() => expect(events.some((event) => event.eventType === 'task.completed')).toBe(true));
 
     expect(spawnMock.mock.calls[0]![1]).toEqual(['acp']);
-    expect(events).toContainEqual(expect.objectContaining({ eventType: 'task.progress', message: 'Hermes is reasoning' }));
+    expect(events).toContainEqual(expect.objectContaining({
+      eventType: 'task.progress',
+      activityId: 'hermes-thought-task:task-1',
+      kind: 'reasoning',
+      message: 'Planning the task',
+    }));
     expect(events).toContainEqual(expect.objectContaining({ eventType: 'task.progress', message: 'Using Build interface' }));
     expect(events).toContainEqual(expect.objectContaining({
       eventType: 'task.completed',
       output: { text: 'Interface created.' },
     }));
+  });
+
+  it('does not mistake Hermes ANSI review diffs for the quiet-mode final answer', async () => {
+    const child = fakeChildProcess();
+    spawnMock.mockImplementation(() => {
+      queueMicrotask(() => {
+        child.stdout.write('┊ review diff\n');
+        child.stdout.write('\u001b[38;2;218;165;32ma/C:\\tmp\\send.ps1 → b/C:\\tmp\\send.ps1\u001b[0m\n');
+        child.stdout.write('\u001b[38;2;255;255;255m+Invoke-RestMethod /send\u001b[0m\n');
+        child.stdout.write('{"sent_count":1,"status":"delivered"}\n');
+        child.emit('exit', 0);
+      });
+      return child;
+    });
+    const adapter = new HermesAgentAdapter({ agentId: 'agent-1', logger, binaryPath: 'hermes-test', chatTransport: 'cli' });
+
+    const deltas = await collectDeltas(adapter.chat([{ role: 'user', content: 'send' }], []));
+
+    expect(deltas).toContainEqual({ type: 'text', delta: '{"sent_count":1,"status":"delivered"}' });
+    expect(deltas.some((delta) => delta.type === 'text' && /review diff|Invoke-RestMethod/.test(delta.delta))).toBe(false);
+  });
+
+  it('never degrades an MCP-mounted workflow turn to the tool-blind CLI fallback', async () => {
+    vi.useFakeTimers();
+    const child = fakeAcpChild();
+    spawnMock.mockReturnValue(child);
+    const adapter = new HermesAgentAdapter({
+      agentId: 'agent-1',
+      logger,
+      binaryPath: 'hermes-test',
+      chatTransport: 'auto',
+      mcpServers: [{ name: 'agentis', url: 'http://127.0.0.1:3737/mcp', headers: {} }],
+    });
+    child.on('__prompt', () => { /* no model event */ });
+
+    const run = collectDeltas(adapter.chat(
+      [{ role: 'user', content: 'use the native channel tool' }],
+      [],
+      { sessionKey: 'workflow-node', latencyClass: 'deliberate' },
+    ));
+    await vi.advanceTimersByTimeAsync(20_000);
+    const deltas = await run;
+
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    expect(spawnMock.mock.calls[0]![1]).toEqual(['acp']);
+    expect(deltas.some((delta) => delta.type === 'activity' && delta.label === 'Switching Hermes transport')).toBe(false);
+    expect(deltas).toContainEqual(expect.objectContaining({
+      type: 'tool_result',
+      error: expect.stringContaining('first_event_timeout'),
+    }));
+  });
+
+  it('routes auto caller-loop workflow turns directly to the capability-preserving CLI path', async () => {
+    const firstCli = fakeChildProcess();
+    const secondCli = fakeChildProcess();
+    spawnMock
+      .mockImplementationOnce(() => {
+        queueMicrotask(() => {
+          firstCli.stdout.write('{"answer":"direct-first"}\n');
+          firstCli.emit('exit', 0);
+        });
+        return firstCli;
+      })
+      .mockImplementationOnce(() => {
+        queueMicrotask(() => {
+          secondCli.stdout.write('{"answer":"direct-second"}\n');
+          secondCli.emit('exit', 0);
+        });
+        return secondCli;
+      });
+    const adapter = new HermesAgentAdapter({
+      agentId: 'agent-1',
+      logger,
+      binaryPath: 'hermes-test',
+      chatTransport: 'auto',
+      mcpServers: [{ name: 'agentis', url: 'http://127.0.0.1:3737/mcp', headers: {} }],
+    });
+    const tools = [{
+      name: 'agentis.lead_search',
+      description: 'Search leads',
+      parameters: { type: 'object', properties: { query: { type: 'string' } } },
+    }];
+
+    const first = await collectDeltas(adapter.chat(
+      [{ role: 'user', content: 'find the next lead' }],
+      tools,
+      {
+        sessionKey: 'agent-task:run-a:node-a:attempt:1',
+        latencyClass: 'deliberate',
+        toolMode: 'caller_loop',
+        transportRecovery: 'capability_preserving',
+      },
+    ));
+
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    expect(spawnMock.mock.calls[0]![1]![0]).toBe('-z');
+    expect(spawnMock.mock.calls[0]![1]!.join(' ')).toContain('agentis.lead_search');
+    expect(first.some((delta) => delta.type === 'activity' && delta.label === 'Switching Hermes transport')).toBe(false);
+    expect(first).toContainEqual({ type: 'text', delta: '{"answer":"direct-first"}' });
+
+    const second = await collectDeltas(adapter.chat(
+      [{ role: 'user', content: 'summarize without calling a tool' }],
+      [],
+      {
+        sessionKey: 'agent-task:run-b:node-a:attempt:1',
+        latencyClass: 'deliberate',
+        toolMode: 'caller_loop',
+        transportRecovery: 'capability_preserving',
+      },
+    ));
+    expect(spawnMock).toHaveBeenCalledTimes(2);
+    expect(spawnMock.mock.calls[1]![1]![0]).toBe('-z');
+    expect(second).toContainEqual({ type: 'text', delta: '{"answer":"direct-second"}' });
+  });
+
+  it('does not emit a false completed or failed task event after operator cancellation', async () => {
+    const child = fakeAcpChild();
+    spawnMock.mockReturnValue(child);
+    const adapter = new HermesAgentAdapter({ agentId: 'agent-1', logger, binaryPath: 'hermes-test' });
+    const events: NormalizedAgentEvent[] = [];
+    adapter.onEvent((event) => events.push(event));
+    child.on('__prompt', () => {
+      // A provider that remains silent until the operator stops the run.
+    });
+
+    await adapter.dispatchTask(task);
+    await vi.waitFor(() => expect(events.some((event) => event.eventType === 'task.started')).toBe(true));
+    await adapter.cancelTask(task.taskId);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(events.some((event) => event.eventType === 'task.completed')).toBe(false);
+    expect(events.some((event) => event.eventType === 'task.failed')).toBe(false);
   });
 
   it('dispatches workflow tasks through the real `hermes chat -q … -Q --ignore-rules` contract', async () => {

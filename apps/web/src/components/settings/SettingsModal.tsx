@@ -36,6 +36,7 @@ import {
   RefreshCcw,
   BrainCircuit,
   ShieldCheck,
+  PackageOpen,
 } from 'lucide-react';
 import { formatDistanceToNow } from 'date-fns';
 import clsx from 'clsx';
@@ -59,6 +60,7 @@ import { AutonomyPanel } from './AutonomyPanel';
 import { IntegrationsPanel } from './IntegrationsPanel';
 import { DataOwnershipPanel } from './DataOwnershipPanel';
 import { StartupPanel } from './StartupPanel';
+import { WorkspaceBundleModal } from '../packages/WorkspaceBundleModal';
 import {
   useAgentisStore,
   type SettingsDestination,
@@ -539,6 +541,7 @@ function WorkspaceTab() {
   const [imageDataUrl, setImageDataUrl] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [bundleOpen, setBundleOpen] = useState(false);
   const [loading, setLoading] = useState(true);
   const fileRef = useRef<HTMLInputElement>(null);
 
@@ -697,6 +700,27 @@ function WorkspaceTab() {
       </div>
 
       <div>
+        <h2 className="mb-3 text-[11px] font-semibold uppercase tracking-wider text-text-muted">Complete transfer</h2>
+        <div className="rounded-card border border-line bg-surface p-5">
+          <div className="flex items-start gap-3">
+            <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-card border border-accent/25 bg-accent-soft text-accent">
+              <PackageOpen size={17} />
+            </span>
+            <div className="min-w-0 flex-1">
+              <div className="text-[13px] font-medium text-text-primary">Move this workspace to another machine</div>
+              <p className="mt-1 text-[12px] leading-5 text-text-muted">
+                Export apps, current workflow drafts, agents, extensions, knowledge, Brain memory, collection rows, and workspace structure as one <span className="font-mono text-text-secondary">.agentis</span> file.
+              </p>
+              <p className="mt-1 text-[11px] text-text-muted">Secret values never enter the file; credential and channel slots are listed for safe reconnection.</p>
+              <Button variant="primary" size="md" iconLeft={<PackageOpen size={13} />} className="mt-3" onClick={() => setBundleOpen(true)}>
+                Export complete workspace
+              </Button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div>
         <h2 className="mb-3 text-[11px] font-semibold uppercase tracking-wider text-danger">
           {t('settings.workspace.dangerZone')}
         </h2>
@@ -715,6 +739,10 @@ function WorkspaceTab() {
           </Button>
         </div>
       </div>
+      {bundleOpen && createPortal(
+        <WorkspaceBundleModal onClose={() => setBundleOpen(false)} onImported={() => {}} />,
+        document.body,
+      )}
     </div>
   );
 }

@@ -112,6 +112,12 @@ export interface ChatInvocationOptions {
    */
   toolMode?: 'adapter_native' | 'caller_loop';
   /**
+   * Whether an `auto` transport may recover from a stalled native session by
+   * switching to a capability-equivalent compatibility transport. Recovery is
+   * only legal when the caller owns the tool loop and supplied the tool catalog.
+   */
+  transportRecovery?: 'none' | 'capability_preserving';
+  /**
    * Per-call output-token ceiling. Overrides the adapter's configured default for
    * this one invocation — used by the turn loop to retry a starved/truncated turn
    * with more room. Adapters that don't support it simply ignore it.
@@ -254,6 +260,8 @@ export interface RuntimeDescriptor {
 export interface AgentAdapter {
   readonly adapterType: AdapterType;
   connect(config: AgentAdapterConfig): Promise<void>;
+  /** Best-effort non-blocking warm-up before queued workflow work reaches the adapter. */
+  prepare?(): Promise<void>;
   disconnect(): Promise<void>;
   healthCheck(): Promise<AdapterHealthStatus>;
   capabilities?(): AdapterCapabilities;
@@ -617,6 +625,16 @@ export type NormalizedAgentEvent =
       workflowId: string;
       message: string;
       timestamp: string;
+      /** Stable identity used to replace cumulative runtime/reasoning updates. */
+      activityId?: string;
+      kind?: 'runtime' | 'reasoning' | 'commentary' | 'tool' | 'fallback' | 'waiting';
+      phase?: string;
+      status?: 'running' | 'success' | 'error';
+      transport?: string;
+      attempt?: number;
+      startedAt?: string;
+      completedAt?: string;
+      durationMs?: number;
     }
   | {
       eventType: 'task.completed';

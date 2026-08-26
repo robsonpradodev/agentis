@@ -33,7 +33,7 @@ import { CONSTANTS } from '@agentis/core';
 import type { Logger } from '../logger.js';
 import { resolveClaudeBinary, resolveSpawnCwd, resolveSpawnTarget, withExpandedPath } from '../services/pathExpander.js';
 import { buildMarkerToolPrompt, formatToolManifestAwareness } from './markerToolProtocol.js';
-import { toolActivityLabel } from './runtimeProgress.js';
+import { runtimeAttemptFromSessionKey, toolActivityLabel } from './runtimeProgress.js';
 import { harnessMcpArgs, type McpHarnessServer } from '../services/mcp/mcpHarnessSession.js';
 import { linkAbortSignal } from './abort.js';
 import {
@@ -428,6 +428,7 @@ export class ClaudeCodeAdapter implements AgentAdapter {
       ?? (this.opts.sessionStore && this.opts.workspaceId
         ? this.opts.sessionStore.get(this.opts.workspaceId, this.opts.agentId, sessionKey)?.runtimeSessionId
         : undefined);
+    const callerOwnsToolLoop = options?.toolMode === 'caller_loop';
     // NO default `--max-turns`. Codex passes no turn cap and never fails on one;
     // Claude Code's `--max-turns` turns into `error_max_turns` → exit 1 → a hard
     // FAILED that throws the work away, and raising the number only moves the wall.
@@ -455,11 +456,11 @@ export class ClaudeCodeAdapter implements AgentAdapter {
       // Mount Agentis tools over MCP so Claude Code calls them natively in its loop.
       // `executionMode` tags the descriptor so Plan mode is registry-enforced, not
       // just prompt-level, for Claude's own tool loop.
-      ...harnessMcpArgs('claude_code', this.opts.mcpServers ?? [], options?.executionMode ?? 'chat', {
+      ...(!callerOwnsToolLoop ? harnessMcpArgs('claude_code', this.opts.mcpServers ?? [], options?.executionMode ?? 'chat', {
         conversationId: options?.conversationId,
         turnLease: options?.turnLease,
         approvalSensitivity: options?.approvalSensitivity,
-      }),
+      }) : []),
       ...(this.opts.extraArgs ?? []),
     ];
     const configuredTimeoutMs = this.opts.timeoutSec && this.opts.timeoutSec > 0
@@ -499,7 +500,11 @@ export class ClaudeCodeAdapter implements AgentAdapter {
       cwd: this.opts.cwd,
       env: this.opts.env,
       stdin: appendRuntimeInputAttachments(
-        buildClaudeCodeChatPrompt(messagesForRuntimeSession(messages, Boolean(storedSession)), tools, this.#mcpNative()),
+        buildClaudeCodeChatPrompt(
+          messagesForRuntimeSession(messages, Boolean(storedSession)),
+          tools,
+          this.#mcpNative() && !callerOwnsToolLoop,
+        ),
         options?.inputAttachments,
       ),
       displayName: 'Claude Code',
@@ -508,6 +513,9 @@ export class ClaudeCodeAdapter implements AgentAdapter {
       signal: options?.signal,
       idleTimeoutMs,
       hardCeilingMs: chatHardCeilingMs(idleTimeoutMs, 'AGENTIS_CLAUDE_CHAT_HARD_CEILING_MS'),
+      activityId: `claude-code-cli-${sessionKey}`,
+      transport: 'claude_code_cli',
+      attempt: runtimeAttemptFromSessionKey(sessionKey),
       interpret,
       formatExitError: (code, stderr, stdoutError) => {
         const streamed = stdoutError.trim();

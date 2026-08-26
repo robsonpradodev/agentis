@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { and, eq, isNull, or, sql } from 'drizzle-orm';
+import { and, eq, inArray, isNull, or, sql } from 'drizzle-orm';
 import { AgentisError } from '@agentis/core';
 import { schema } from '@agentis/db/sqlite';
 import type { AgentisSqliteDb } from '@agentis/db/sqlite';
@@ -183,8 +183,13 @@ export class KnowledgeBaseService {
 
   deleteKnowledgeBase(workspaceId: string, knowledgeBaseId: string) {
     this.getKnowledgeBase(workspaceId, knowledgeBaseId);
-    this.db.delete(schema.kbChunks).where(eq(schema.kbChunks.knowledgeBaseId, knowledgeBaseId)).run();
-    this.db.delete(schema.kbDocuments).where(eq(schema.kbDocuments.knowledgeBaseId, knowledgeBaseId)).run();
+    const documents = this.listDocuments(workspaceId, knowledgeBaseId);
+    const archivedDocuments = this.db.select({ id: schema.kbDocuments.id }).from(schema.kbDocuments).where(and(
+      eq(schema.kbDocuments.workspaceId, workspaceId),
+      eq(schema.kbDocuments.knowledgeBaseId, knowledgeBaseId),
+    )).all();
+    const documentIds = [...new Set([...documents.map((document) => document.id), ...archivedDocuments.map((document) => document.id)])];
+    for (const documentId of documentIds) this.deleteDocument(workspaceId, knowledgeBaseId, documentId);
     this.db.delete(schema.knowledgeBases).where(eq(schema.knowledgeBases.id, knowledgeBaseId)).run();
     return { id: knowledgeBaseId, deleted: true };
   }
@@ -558,6 +563,49 @@ export class KnowledgeBaseService {
       .where(eq(schema.kbDocuments.id, documentId))
       .run();
     return { id: documentId, archived: true };
+  }
+
+  deleteDocument(workspaceId: string, knowledgeBaseId: string, documentId: string) {
+    this.getKnowledgeBase(workspaceId, knowledgeBaseId);
+    const document = this.db
+      .select({ id: schema.kbDocuments.id })
+      .from(schema.kbDocuments)
+      .where(
+        and(
+          eq(schema.kbDocuments.workspaceId, workspaceId),
+          eq(schema.kbDocuments.knowledgeBaseId, knowledgeBaseId),
+          eq(schema.kbDocuments.id, documentId),
+        ),
+      )
+      .get();
+    if (!document) throw new AgentisError('RESOURCE_NOT_FOUND', 'Document not found');
+
+    const chunkIds = this.db.select({ id: schema.kbChunks.id }).from(schema.kbChunks).where(and(
+      eq(schema.kbChunks.workspaceId, workspaceId),
+      eq(schema.kbChunks.knowledgeBaseId, knowledgeBaseId),
+      eq(schema.kbChunks.documentId, documentId),
+    )).all().map((chunk) => chunk.id);
+    if (chunkIds.length > 0) {
+      this.db.delete(schema.knowledgeLinks).where(and(
+        eq(schema.knowledgeLinks.workspaceId, workspaceId),
+        or(inArray(schema.knowledgeLinks.sourceId, chunkIds), inArray(schema.knowledgeLinks.targetId, chunkIds)),
+      )).run();
+    }
+
+    // Do not rely solely on FK cascades: existing SQLite installations may have
+    // foreign_keys disabled, and a permanent agent operation must not leave
+    // retrievable chunks behind.
+    this.db.delete(schema.kbChunks).where(and(
+      eq(schema.kbChunks.workspaceId, workspaceId),
+      eq(schema.kbChunks.knowledgeBaseId, knowledgeBaseId),
+      eq(schema.kbChunks.documentId, documentId),
+    )).run();
+    this.db.delete(schema.kbDocuments).where(and(
+      eq(schema.kbDocuments.workspaceId, workspaceId),
+      eq(schema.kbDocuments.knowledgeBaseId, knowledgeBaseId),
+      eq(schema.kbDocuments.id, documentId),
+    )).run();
+    return { id: documentId, deleted: true };
   }
 
   async search(args: SearchKnowledgeArgs) {

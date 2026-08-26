@@ -26,6 +26,9 @@ export * from './retrieval.js';
 export * from './baseline.js';
 export * from './plan.js';
 export * from './buildSession.js';
+export * from './hub.js';
+export * from './relationship.js';
+export * from './channel.js';
 
 
 

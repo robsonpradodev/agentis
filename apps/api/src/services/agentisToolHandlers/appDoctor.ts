@@ -161,9 +161,9 @@ export function registerAppDoctorTools(registry: AgentisToolRegistry, deps: Tool
         id: 'agentis.app.deliver',
         family: 'build',
         description:
-          '[AUTHORITATIVE APP DELIVERY] Resume or create one persisted App build session, run the batched zero-cost preflight, '
+          '[APP-WIDE DELIVERY] Resume or create one persisted App build session, run the batched zero-cost preflight, '
           + 'deliver every enabled workflow through real debug/world verification with bounded repair, compile production readiness, '
-          + 'and complete the session only when every layer agrees. Returns structured blockers instead of a false-ready result.',
+          + 'and complete the session only when every layer agrees. This reports whole-App readiness; it does not block an independently proven workflow from being published.',
         inputSchema: {
           type: 'object',
           properties: {

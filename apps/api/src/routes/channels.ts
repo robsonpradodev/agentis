@@ -21,6 +21,8 @@ import { resolveAndSend } from '../services/conversation/channelSend.js';
 import type { ChannelConnectionSupervisor } from '../services/conversation/channelConnectionSupervisor.js';
 import type { ChannelIdentityService } from '../services/conversation/channelIdentityService.js';
 import type { ConnectionGrantService } from '../services/connectionGrants.js';
+import type { ChannelInboxService } from '../services/conversation/channelInboxService.js';
+import type { ChannelActionIntentService } from '../services/conversation/channelActionIntentService.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireWorkspace, getWorkspace } from '../middleware/workspace.js';
 
@@ -57,6 +59,7 @@ const createSchema = z
   });
 
 const linkSchema = z.object({
+  connectionId: z.string().min(1).nullish(),
   channelKind: z.enum(['telegram', 'discord', 'slack', 'whatsapp']),
   handle: z.string().min(1).max(256),
   /** Null unlinks the handle from any workspace user. */
@@ -64,6 +67,7 @@ const linkSchema = z.object({
 });
 
 const blockSchema = z.object({
+  connectionId: z.string().min(1).nullish(),
   channelKind: z.enum(['telegram', 'discord', 'slack', 'whatsapp']),
   handle: z.string().min(1).max(256),
   blocked: z.boolean(),
@@ -83,6 +87,14 @@ const behaviorSchema = z.object({
   manualOutboundTakeover: z.enum(['until_handback', 'off']).optional(),
   ownerManualOutboundTakeover: z.enum(['until_handback', 'off']).optional(),
   historyReconciliation: z.enum(['recent', 'off']).optional(),
+});
+
+const authoritySchema = z.object({
+  connectionId: z.string().min(1),
+  channelKind: z.enum(['telegram', 'discord', 'slack', 'whatsapp']),
+  handle: z.string().min(1).max(256),
+  role: z.enum(['owner', 'delegate']),
+  expiresAt: z.string().datetime().nullish(),
 });
 
 const sendAttachmentSchema = z.object({
@@ -138,6 +150,20 @@ const targetSchema = z.object({
   access: accessSchema,
 });
 
+const actionCreateSchema = z.object({
+  agentId: z.string().min(1),
+  connectionId: z.string().min(1),
+  recipientRef: z.string().min(1),
+  appId: z.string().nullish(),
+  subjectId: z.string().nullish(),
+  goalRef: z.string().nullish(),
+  goal: z.string().min(1).max(4000),
+  body: z.string().max(20_000).optional(),
+  messages: z.array(z.object({ body: z.string().max(20_000).optional() })).optional(),
+  scheduledFor: z.string().datetime().nullish(),
+  requireApproval: z.boolean().optional(),
+});
+
 export function buildChannelRoutes(deps: {
   db: AgentisSqliteDb;
   auth: AuthService;
@@ -146,6 +172,8 @@ export function buildChannelRoutes(deps: {
   supervisor?: ChannelConnectionSupervisor;
   /** Cross-surface peer identity. Optional — absent in some tests. */
   identity?: ChannelIdentityService;
+  inbox?: ChannelInboxService;
+  actions?: ChannelActionIntentService;
   /** §3.3 per-agent connection authority. Optional — absent in some tests. */
   connectionGrants?: ConnectionGrantService;
 }) {
@@ -171,11 +199,38 @@ export function buildChannelRoutes(deps: {
     const linked = deps.identity.link({
       workspaceId: ws.workspaceId,
       channelKind: body.channelKind,
+      connectionId: body.connectionId ?? null,
       handle: body.handle,
       userId: body.userId ?? null,
     });
     if (!linked) throw new AgentisError('RESOURCE_NOT_FOUND', 'peer identity not found');
     return c.json({ identity: linked });
+  });
+
+  app.post('/identities/authority', async (c) => {
+    const ws = getWorkspace(c);
+    if (!deps.identity) throw new AgentisError('RESOURCE_NOT_FOUND', 'identity service not available');
+    const body = authoritySchema.parse(await c.req.json());
+    deps.bridge.get(ws.workspaceId, body.connectionId);
+    const identity = deps.identity.grantAuthority({
+      workspaceId: ws.workspaceId,
+      connectionId: body.connectionId,
+      channelKind: body.channelKind,
+      handle: body.handle,
+      role: body.role,
+      userId: body.role === 'owner' ? ws.user.id : null,
+      method: 'operator_grant',
+      expiresAt: body.expiresAt ?? null,
+    });
+    return c.json({ identity });
+  });
+
+  app.delete('/identities/:identityId/authority', (c) => {
+    const ws = getWorkspace(c);
+    if (!deps.identity) throw new AgentisError('RESOURCE_NOT_FOUND', 'identity service not available');
+    const identity = deps.identity.revokeAuthority({ workspaceId: ws.workspaceId, identityId: c.req.param('identityId') });
+    if (!identity) throw new AgentisError('RESOURCE_NOT_FOUND', 'peer identity not found');
+    return c.json({ identity });
   });
 
   app.post('/identities/block', async (c) => {
@@ -185,10 +240,92 @@ export function buildChannelRoutes(deps: {
     const identity = deps.identity.setBlocked({
       workspaceId: ws.workspaceId,
       channelKind: body.channelKind,
+      connectionId: body.connectionId ?? null,
       handle: body.handle,
       blocked: body.blocked,
     });
     return c.json({ identity });
+  });
+
+  app.get('/inbox', (c) => {
+    const ws = getWorkspace(c);
+    if (!deps.inbox) throw new AgentisError('RESOURCE_NOT_FOUND', 'channel inbox is not available');
+    const limit = Number(c.req.query('limit') ?? 20);
+    return c.json(deps.inbox.list({
+      workspaceId: ws.workspaceId,
+      connectionId: c.req.query('connectionId') ?? null,
+      query: c.req.query('query') ?? null,
+      excludeOwner: c.req.query('includeOwner') !== 'true',
+      limit: Number.isFinite(limit) ? limit : 20,
+      cursor: c.req.query('cursor') ?? null,
+    }));
+  });
+
+  app.get('/inbox/resolve', (c) => {
+    const ws = getWorkspace(c);
+    if (!deps.inbox) throw new AgentisError('RESOURCE_NOT_FOUND', 'channel inbox is not available');
+    const selector = c.req.query('selector');
+    const result = deps.inbox.resolve({
+      workspaceId: ws.workspaceId,
+      connectionId: c.req.query('connectionId') ?? null,
+      recipientRef: c.req.query('recipientRef') ?? null,
+      conversationId: c.req.query('conversationId') ?? null,
+      ...(selector === 'last_inbound' || selector === 'last_contact' ? { selector } : {}),
+      query: c.req.query('query') ?? null,
+    });
+    return c.json(result, result.resolved ? 200 : 404);
+  });
+
+  app.get('/inbox/:recipientRef', (c) => {
+    const ws = getWorkspace(c);
+    if (!deps.inbox) throw new AgentisError('RESOURCE_NOT_FOUND', 'channel inbox is not available');
+    const ref = decodeURIComponent(c.req.param('recipientRef'));
+    const peer = deps.inbox.get(ws.workspaceId, ref);
+    if (!peer) throw new AgentisError('RESOURCE_NOT_FOUND', 'channel recipient not found');
+    const limit = Number(c.req.query('limit') ?? 30);
+    return c.json({ peer, messages: deps.inbox.history(ws.workspaceId, ref, Number.isFinite(limit) ? limit : 30) });
+  });
+
+  app.get('/actions', (c) => {
+    const ws = getWorkspace(c);
+    if (!deps.actions) throw new AgentisError('RESOURCE_NOT_FOUND', 'channel action engine is not available');
+    return c.json({ actions: deps.actions.list(ws.workspaceId, {
+      ...(c.req.query('connectionId') ? { connectionId: c.req.query('connectionId') } : {}),
+      ...(c.req.query('status') ? { status: c.req.query('status') as never } : {}),
+      limit: Number(c.req.query('limit') ?? 30),
+    }) });
+  });
+
+  app.post('/actions', async (c) => {
+    const ws = getWorkspace(c);
+    if (!deps.actions) throw new AgentisError('RESOURCE_NOT_FOUND', 'channel action engine is not available');
+    const body = actionCreateSchema.parse(await c.req.json());
+    const result = await deps.actions.createAndExecute({
+      workspaceId: ws.workspaceId,
+      appId: body.appId ?? null,
+      agentId: body.agentId,
+      connectionId: body.connectionId,
+      recipientRef: body.recipientRef,
+      subjectId: body.subjectId ?? null,
+      goalRef: body.goalRef ?? null,
+      goal: body.goal,
+      body: body.body ?? '',
+      messages: body.messages,
+      // This endpoint is authenticated operator control, not an unsupervised
+      // model action. The durable intent still records who/what/where was sent.
+      authorizationBasis: 'verified_owner_command',
+      scheduledFor: body.scheduledFor ?? null,
+      requireApproval: body.requireApproval,
+      userId: ws.user.id,
+    });
+    return c.json(result, result.action.status === 'delivered' ? 200 : 202);
+  });
+
+  app.post('/actions/:actionId/cancel', async (c) => {
+    const ws = getWorkspace(c);
+    if (!deps.actions) throw new AgentisError('RESOURCE_NOT_FOUND', 'channel action engine is not available');
+    const payload = await c.req.json().catch(() => ({})) as { reason?: unknown };
+    return c.json({ action: deps.actions.cancel(ws.workspaceId, c.req.param('actionId'), typeof payload.reason === 'string' ? payload.reason : 'cancelled by operator') });
   });
 
   app.post('/', async (c) => {

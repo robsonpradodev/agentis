@@ -34,6 +34,8 @@
   authHint?: string;
 }
 
+import { parseCron } from '../../lib/cronPreview';
+
 export interface NodeReadiness {
   ready: boolean;
   message: string | null;
@@ -127,12 +129,31 @@ export function evaluateNodeReadiness(config: unknown, context: NodeConfigContex
     case 'trigger': {
       const triggerType = stringOf(c.triggerType) || 'manual';
       if (triggerType === 'cron') {
-        return stringOf(c.schedule).trim() ? ready() : missing('Enter a cron schedule.');
+        const rules = Array.isArray(c.scheduleRules)
+          ? c.scheduleRules.map(objectRecord).map((rule) => stringOf(rule.expression).trim()).filter(Boolean)
+          : [];
+        const schedules = rules.length ? rules : [stringOf(c.schedule).trim()].filter(Boolean);
+        if (!schedules.length) return missing('Enter a cron schedule.');
+        return schedules.every((schedule) => parseCron(schedule))
+          ? ready()
+          : missing('Enter a valid five-field cron expression, for example: */5 * * * *');
       }
       if (triggerType === 'persistent_listener') {
         const parsed = schemas.listenerConfigSchema.safeParse(c.listenerConfig);
         if (!parsed.success) {
           return missing(listenerIssueMessage(parsed.error.issues[0]?.message));
+        }
+      }
+      if (triggerType === 'rss_feed' && !stringOf(objectRecord(c.rssFeed).feedUrl).trim()) {
+        return missing('Enter an RSS feed URL.');
+      }
+      if (triggerType === 'email_imap' && !stringOf(objectRecord(c.emailImap).host).trim()) {
+        return missing('Enter the IMAP host.');
+      }
+      if (triggerType === 'error_trigger') {
+        const errorConfig = objectRecord(c.errorTrigger);
+        if (!Array.isArray(errorConfig.onStatus) || errorConfig.onStatus.length === 0) {
+          return missing('Choose at least one failure status to watch.');
         }
       }
       return ready();

@@ -18,6 +18,8 @@
  */
 
 import type { EntityWakeContext, EntityWakeResult, Correlation } from './durableEntities.js';
+import type { RelationshipState } from '@agentis/core';
+import { normalizeRelationshipState } from './relationshipStateService.js';
 
 export type SubjectStage =
   | { action: 'send'; text: string; next: string }
@@ -31,9 +33,9 @@ export interface SubjectScript {
 }
 
 export interface SubjectState {
-  script: SubjectScript;
-  stage: string;
-  facts: Record<string, unknown>;
+  script?: SubjectScript;
+  stage?: string;
+  facts?: Record<string, unknown>;
 }
 
 export interface SubjectActionArgs {
@@ -47,7 +49,7 @@ export interface SubjectActions {
   /** Deterministic, token-free send. Resolves the destination from the subject's facts. */
   send(args: SubjectActionArgs & { stage: string; text: string }): Promise<void> | void;
   /** Hand the step to a model (compose a message, classify a reply, trigger a build). */
-  runAgent(args: SubjectActionArgs & { instruction: string }): Promise<void> | void;
+  runAgent(args: SubjectActionArgs & { instruction: string }): Promise<{ outcome: 'performed' | 'held' | 'blocked' } | void> | void;
 }
 
 const MAX_STEPS_PER_WAKE = 50;
@@ -58,7 +60,10 @@ export class SubjectRuntime {
   /** The dispatcher handler for kind `subject`. Advances until it parks (wait) or terminates (done). */
   async handle(ctx: EntityWakeContext): Promise<EntityWakeResult> {
     const state = ctx.entity.stateJson as SubjectState;
-    if (!state?.script?.stages) return { done: true }; // malformed → stop cleanly
+    if (!state?.script?.stages) {
+      if ((state as { version?: unknown })?.version === 2) return this.#handleRelationship(ctx);
+      return { done: true }; // malformed legacy subject → stop cleanly
+    }
     const facts = { ...(state.facts ?? {}) };
     const consumeInboxIds = ctx.inbox.map((e) => e.id);
     let stageName = state.stage || state.script.start;
@@ -105,6 +110,70 @@ export class SubjectRuntime {
     }
     // guard tripped (script likely loops) — persist and stop being woken.
     return { state: { ...state, stage: stageName, facts }, consumeInboxIds, done: true };
+  }
+
+  /** Goal-directed Subject without a fixed script: update its compact state and wake its planned action. */
+  async #handleRelationship(ctx: EntityWakeContext): Promise<EntityWakeResult> {
+    const now = new Date().toISOString();
+    const state = normalizeRelationshipState(ctx.entity.key, ctx.entity.stateJson);
+    // Managed relationship facts follow the same principle as the Brain:
+    // expire low-value working knowledge, keep an archive window, and never
+    // turn the compact state into an immortal transcript.
+    const archiveCutoff = Date.parse(now) - 365 * 24 * 60 * 60_000;
+    state.facts = state.facts
+      .map((fact) => fact.expiresAt && !fact.archivedAt && Date.parse(fact.expiresAt) <= Date.parse(now)
+        ? { ...fact, archivedAt: now }
+        : fact)
+      .filter((fact) => !fact.archivedAt || Date.parse(fact.archivedAt) > archiveCutoff)
+      .slice(-100);
+    const inbound = ctx.inbox.filter((event) => event.eventType === 'channel.inbound' || event.eventType === 'reply');
+    if (inbound.length > 0) {
+      state.lastInboundAt = inbound[inbound.length - 1]!.receivedAt;
+      // A person replied before a scheduled nudge: that nudge has served its
+      // purpose and must not fire later as an embarrassing duplicate.
+      if (state.nextAction?.kind === 'follow_up' && ['planned', 'ready'].includes(state.nextAction.status)) {
+        state.nextAction = { ...state.nextAction, status: 'cancelled' };
+      }
+    }
+    const next = state.nextAction;
+    const due = next && ['planned', 'ready'].includes(next.status)
+      && (!next.dueAt || Date.parse(next.dueAt) <= Date.parse(now));
+    if (due && next) {
+      const handle = state.identity.handles[0];
+      const result = await this.actions.runAgent({
+        entityId: ctx.entity.id,
+        workspaceId: ctx.entity.workspaceId,
+        appId: ctx.entity.appId,
+        facts: {
+          relationship: state,
+          ...(handle ? { connectionId: handle.connectionId, to: handle.handle, channelKind: handle.channelKind } : {}),
+        },
+        instruction: [
+          'Advance the durable relationship next action below. Check its preconditions and stop conditions first.',
+          'Use the known channel destination only if a useful action is still warranted. Never send a generic nudge.',
+          JSON.stringify(next),
+          `Relationship state: ${JSON.stringify(state)}`,
+        ].join('\n'),
+      });
+      const outcome = result?.outcome ?? 'performed';
+      state.nextAction = {
+        ...next,
+        status: outcome === 'blocked' ? 'blocked' : 'done',
+        attempts: (next.attempts ?? 0) + 1,
+        lastAttemptAt: now,
+      };
+      if (outcome === 'performed') state.lastOutboundAt = now;
+    }
+    state.updatedAt = now;
+    const wake = state.nextAction && ['planned', 'ready'].includes(state.nextAction.status)
+      ? state.nextAction.dueAt ?? null
+      : null;
+    return {
+      state: state as unknown as Record<string, unknown>,
+      consumeInboxIds: ctx.inbox.map((event) => event.id),
+      nextWakeAt: wake,
+      awaitingCorrelation: null,
+    };
   }
 }
 

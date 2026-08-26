@@ -1,7 +1,7 @@
 import { Routes, Route, Navigate, useNavigate, useParams, useLocation } from 'react-router-dom';
 import { lazy, Suspense, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Search, Check, Plus, ChevronDown } from 'lucide-react';
+import { Search, Check, Plus, ChevronDown, PackageOpen } from 'lucide-react';
 import clsx from 'clsx';
 import { LoginPage } from './pages/LoginPage';
 import { LiveStrip } from './components/LiveStrip';
@@ -622,6 +622,7 @@ function WorkspaceSwitcher({
   workspaceId: string | null;
 }) {
   const { setSettingsOpen } = useAgentisStore();
+  const navigate = useNavigate();
   const [open, setOpen] = useState(false);
   const [items, setItems] = useState<Workspace[]>([]);
   const [creating, setCreating] = useState(false);
@@ -707,7 +708,7 @@ function WorkspaceSwitcher({
         <ChevronDown size={12} className="text-text-muted" />
       </button>
       {open && (
-        <div className="absolute left-0 top-full z-50 mt-1 w-64 overflow-hidden rounded-card border border-line bg-surface shadow-dropdown">
+        <div className="absolute left-0 top-full z-50 mt-1 w-72 overflow-hidden rounded-card border border-line bg-surface shadow-dropdown">
           <div className="max-h-72 overflow-y-auto py-1">
             {items.length === 0 ? (
               <div className="px-3 py-3 text-[12px] text-text-muted">Loading…</div>
@@ -766,13 +767,33 @@ function WorkspaceSwitcher({
                 </button>
               </form>
             ) : (
-              <button
-                type="button"
-                onClick={() => setCreating(true)}
-                className="flex w-full items-center gap-2 px-3 py-2 text-left text-[12px] text-text-secondary hover:bg-surface-2 hover:text-text-primary"
-              >
-                <Plus size={12} /> New workspace
-              </button>
+              <div className="grid grid-cols-2 gap-1.5 border-t border-line p-2">
+                <button
+                  type="button"
+                  onClick={() => setCreating(true)}
+                  className="group flex min-h-[62px] min-w-0 flex-col items-start gap-1 rounded-lg border border-transparent px-2.5 py-2 text-left transition-colors hover:border-line hover:bg-surface-2"
+                >
+                  <span className="flex h-6 w-6 items-center justify-center rounded-md bg-surface-2 text-text-muted transition-colors group-hover:bg-surface-3 group-hover:text-text-primary">
+                    <Plus size={13} />
+                  </span>
+                  <span className="text-[11px] font-medium leading-tight text-text-secondary group-hover:text-text-primary">New workspace</span>
+                  <span className="text-[10px] leading-tight text-text-muted">Start fresh</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setOpen(false);
+                    navigate('/workspaces');
+                  }}
+                  className="group flex min-h-[62px] min-w-0 flex-col items-start gap-1 rounded-lg border border-transparent px-2.5 py-2 text-left transition-colors hover:border-accent/30 hover:bg-accent-soft/30"
+                >
+                  <span className="flex h-6 w-6 items-center justify-center rounded-md bg-accent-soft text-accent transition-colors group-hover:bg-accent group-hover:text-canvas">
+                    <PackageOpen size={13} />
+                  </span>
+                  <span className="text-[11px] font-medium leading-tight text-text-secondary group-hover:text-text-primary">Import workspace</span>
+                  <span className="text-[10px] leading-tight text-text-muted">.agentis bundle</span>
+                </button>
+              </div>
             )}
             <button
               type="button"

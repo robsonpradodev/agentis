@@ -199,6 +199,22 @@ sentence and 220 characters, so progress cannot become a second answer or a toke
 affected resource, duration, and result. Stable event ids update an existing row in place, internal
 discovery calls are suppressed, and recovered retries remain attached to the same turn.
 
+Workflow `agent_task` uses this same executor and safe activity vocabulary. A Hermes task in
+automatic caller-managed mode goes directly through the script-oriented, model-only one-shot CLI
+path with the valid zero-tool `context_engine` profile. Agentis remains the only owner of platform
+tools and supplies the complete catalog through marker calls, avoiding ACP startup and a hidden
+Hermes-native loop. Explicit ACP remains pinned and retains its 20-second first-meaningful-event
+watchdog; it never changes transport silently. Inspect the run activity for `transport`, `attempt`,
+`phase`, `durationMs`, and any fallback reason when troubleshooting.
+
+This is not a Hermes-only execution path. Codex, Claude Code, Cursor, Antigravity, OpenClaw, native
+function-calling HTTP adapters, and text-only HTTP-compatible models all enter the shared executor
+when they advertise chat. The executor is the sole owner of Agentis platform calls: a runtime either
+forwards a structured call or emits a marker for that executor, but never executes the same platform
+catalog in a second hidden loop. Node turn limits are enforced, and only a clean `stop` with a
+contract-valid result completes an `agent_task`; all other terminal states remain recoverable,
+operator-visible pauses.
+
 Antigravity's headless runtime writes its model turn to the current conversation transcript while
 it runs. Agentis tails only that new turn and streams the model's operator-facing `content` as
 commentary after stripping tool markers; the transcript's private `thinking` field is never read

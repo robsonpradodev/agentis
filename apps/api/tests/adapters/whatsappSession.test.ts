@@ -238,7 +238,7 @@ describe('WhatsAppSession bounded history events', () => {
     listeners.get('messages.upsert')?.({
       type: 'append',
       messages: [{
-        key: { id: 'manual-image', remoteJid: '5511@s.whatsapp.net', fromMe: true },
+        key: { id: 'manual-image', remoteJid: '187654321098765@lid', remoteJidAlt: '5511:7@s.whatsapp.net', fromMe: true },
         messageTimestamp: Math.floor(Date.now() / 1_000),
         message: { imageMessage: { caption: 'manual photo', mimetype: 'image/jpeg' } },
       }],
@@ -247,6 +247,7 @@ describe('WhatsAppSession bounded history events', () => {
     expect(outbound).toHaveBeenCalledWith(expect.objectContaining({
       externalId: 'manual-image',
       chatId: '5511@s.whatsapp.net',
+      alternateChatIds: ['187654321098765@lid'],
       attachmentIds: ['manual-media'],
     }));
     expect(outbound.mock.calls[0]?.[0]?.body).toContain('manual photo');

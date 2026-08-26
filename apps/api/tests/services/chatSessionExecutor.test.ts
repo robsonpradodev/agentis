@@ -171,6 +171,31 @@ describe('ChatSessionExecutor', () => {
     });
   });
 
+  it('honors the caller model-round budget even when every tool call is novel', async () => {
+    const adapter = new FakeChatAdapter(async function* (_messages, _tools, callIndex) {
+      yield {
+        type: 'tool_call', id: `plan-${callIndex}`, name: 'agentis.plan',
+        args: { goal: `novel-goal-${callIndex}` },
+      };
+      yield { type: 'done', finishReason: 'tool_calls' };
+    });
+
+    const deltas = await collect(ChatSessionExecutor.turn(
+      adapter,
+      [],
+      'Keep planning forever.',
+      { workspaceId: 'ws_budget', agentId: 'agent_budget', userId: 'user_budget', conversationId: 'conv_budget' },
+      {
+        tools: [{ name: 'agentis.plan', description: 'Plan', parameters: { type: 'object' } }],
+        maxTurns: 2,
+        maxToolCalls: 100,
+      },
+    ));
+
+    expect(adapter.calls).toHaveLength(2);
+    expect(deltas.at(-1)).toEqual({ type: 'done', finishReason: 'max_turns' });
+  });
+
   it('uses low-latency inference only when the turn is explicitly Quick', async () => {
     const adapter = new FakeChatAdapter(async function* () {
       yield { type: 'text', delta: 'quick answer' };

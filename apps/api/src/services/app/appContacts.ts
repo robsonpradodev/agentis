@@ -22,7 +22,8 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { and, asc, eq, isNotNull, lte } from 'drizzle-orm';
+import { and, asc, eq, isNotNull, isNull, lte } from 'drizzle-orm';
+import { normalizeRelationshipState } from '../relationshipStateService.js';
 import { schema } from '@agentis/db/sqlite';
 import type { AgentisSqliteDb } from '@agentis/db/sqlite';
 
@@ -107,6 +108,7 @@ export class AppContactService {
       ...(data ? { dataJson: data } : {}),
       updatedAt: new Date().toISOString(),
     }).where(eq(schema.appContacts.id, contactId)).run();
+    if (existing.subjectId) this.#syncSubject(existing.subjectId, { ...patch, data }, existing.appId);
     return this.get(workspaceId, contactId);
   }
 
@@ -115,7 +117,9 @@ export class AppContactService {
     return this.db
       .select()
       .from(schema.appContacts)
-      .where(and(isNotNull(schema.appContacts.nextTouchAt), lte(schema.appContacts.nextTouchAt, now)))
+      // Canonical Subjects own their own wake clock. Only not-yet-migrated
+      // contacts remain on this compatibility sweep, preventing duplicate sends.
+      .where(and(isNull(schema.appContacts.subjectId), isNotNull(schema.appContacts.nextTouchAt), lte(schema.appContacts.nextTouchAt, now)))
       .orderBy(asc(schema.appContacts.nextTouchAt))
       .limit(limit)
       .all();
@@ -125,6 +129,12 @@ export class AppContactService {
   clearNextTouch(contactId: string): void {
     this.db.update(schema.appContacts)
       .set({ nextTouchAt: null, lastTouchAt: new Date().toISOString(), updatedAt: new Date().toISOString() })
+      .where(eq(schema.appContacts.id, contactId)).run();
+  }
+
+  deferNextTouch(contactId: string, nextTouchAt: string): void {
+    this.db.update(schema.appContacts)
+      .set({ nextTouchAt, updatedAt: new Date().toISOString() })
       .where(eq(schema.appContacts.id, contactId)).run();
   }
 
@@ -138,5 +148,38 @@ export class AppContactService {
         eq(schema.appContacts.handle, handle),
       ))
       .get() ?? null;
+  }
+
+  #syncSubject(subjectId: string, patch: ContactPatch & { data?: Record<string, unknown> }, appId: string): void {
+    const entity = this.db.select().from(schema.durableEntities).where(eq(schema.durableEntities.id, subjectId)).get();
+    if (!entity) return;
+    const state = normalizeRelationshipState(entity.key, entity.stateJson);
+    const now = new Date().toISOString();
+    const engagementId = `app:${appId}`;
+    state.engagements = state.engagements.map((engagement) => engagement.id === engagementId ? {
+      ...engagement,
+      ...(patch.stage !== undefined && patch.stage !== null ? { stage: patch.stage } : {}),
+      ...(patch.goal !== undefined && patch.goal !== null ? { goal: patch.goal } : {}),
+      updatedAt: now,
+    } : engagement);
+    if (patch.nextTouchAt !== undefined) {
+      state.nextAction = patch.nextTouchAt
+        ? {
+            kind: 'follow_up',
+            goal: patch.goal ?? state.engagements.find((item) => item.id === engagementId)?.goal ?? 'advance this relationship usefully',
+            dueAt: patch.nextTouchAt,
+            preconditions: ['the relationship is still active', 'the contact has not replied since this action was planned'],
+            stopConditions: ['the contact replied', 'a human took over', 'the goal is already achieved', 'there is no useful non-generic message'],
+            status: 'planned',
+            attempts: 0,
+          }
+        : state.nextAction?.kind === 'follow_up' ? { ...state.nextAction, status: 'cancelled' } : state.nextAction;
+    }
+    state.updatedAt = now;
+    this.db.update(schema.durableEntities).set({
+      stateJson: state as unknown as Record<string, unknown>,
+      nextWakeAt: state.nextAction && ['planned', 'ready'].includes(state.nextAction.status) ? state.nextAction.dueAt ?? now : null,
+      updatedAt: now,
+    }).where(eq(schema.durableEntities.id, subjectId)).run();
   }
 }

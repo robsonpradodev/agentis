@@ -199,12 +199,15 @@ export class AppPackager {
     }));
     const collections = this.data.listCollections(workspaceId, appId).map((col) => {
       let seed: Record<string, unknown>[] = [];
+      let records: ReturnType<AppDatastore['exportRecords']>['records'] | undefined;
       if (withData) {
         const dump = this.data.exportRows(workspaceId, appId, col.name, cap);
         seed = dump.rows;
+        const fullDump = this.data.exportRecords(workspaceId, appId, col.name, cap);
+        records = fullDump.records;
         if (dump.truncated) opts.warnings?.push(`Collection "${col.name}" exceeded ${cap} rows; only the first ${cap} were exported.`);
       }
-      return { name: col.name, schema: col.schema, seed };
+      return { name: col.name, schema: col.schema, seed, ...(records ? { records } : {}) };
     });
     // The App's full dependency CLOSURE — what it needs to run, not merely what
     // it owns. An `agent_task` agent seated elsewhere, a bare sub-workflow, a
@@ -628,7 +631,15 @@ export class AppPackager {
     }
     for (const col of parsed.collections) {
       data.defineCollection(workspaceId, app.id, { name: col.name, schema: collectionSchemaSchema.parse(col.schema) });
-      if (withData && col.seed && col.seed.length > 0) {
+      if (withData && col.records && col.records.length > 0) {
+        const records = col.name === CONVERSATION_SCRIPT_COLLECTION
+          ? col.records.map((record) => ({ ...record, data: rewriteConversationScriptRow(record.data, refIdMap) }))
+          : col.records;
+        const res = data.importRecords(workspaceId, app.id, col.name, records);
+        if (res.failed.length > 0) {
+          opts.warnings?.push(`Collection "${col.name}": ${res.failed.length} of ${records.length} full-fidelity row(s) failed to import.`);
+        }
+      } else if (withData && col.seed && col.seed.length > 0) {
         // The conversation-script collection carries workflow/agent ids INSIDE its
         // rows (a script is a datastore row, not a graph), so it needs the same
         // rebind as workflow node configs — otherwise a stage keeps pointing at

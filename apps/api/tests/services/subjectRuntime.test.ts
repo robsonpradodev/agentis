@@ -27,6 +27,27 @@ const SCRIPT: SubjectScript = {
 };
 
 describe('SubjectRuntime on the spine', () => {
+  it('keeps a relationship Subject alive, cancels a stale follow-up on reply, and preserves compact state', async () => {
+    const svc = new DurableEntityService(ctx.db);
+    const runtime = new SubjectRuntime({ send: () => {}, runAgent: () => {} });
+    const disp = new DurableEntityDispatcher(svc, { logger: ctx.logger });
+    disp.registerHandler('subject', (c) => runtime.handle(c));
+    const subject = svc.upsert({
+      workspaceId: ctx.workspace.id, kind: 'subject', key: 'person:wa:42',
+      state: {
+        version: 2, subjectKey: 'person:wa:42', identity: { handles: [] }, facts: [], engagements: [], commitments: [],
+        openQuestions: [], blockers: [], memoryRefs: [], updatedAt: past,
+        nextAction: { kind: 'follow_up', goal: 'ask for documents', dueAt: '2099-01-01T00:00:00.000Z', status: 'planned' },
+      },
+    });
+    svc.post(subject.id, 'channel.inbound', { text: 'Here are the documents' });
+    await disp.tick();
+    const state = svc.get(subject.id)!.stateJson as { nextAction: { status: string }; lastInboundAt: string };
+    expect(svc.get(subject.id)!.status).toBe('active');
+    expect(state.nextAction.status).toBe('cancelled');
+    expect(state.lastInboundAt).toBeTruthy();
+  });
+
   it('drives greeting → wait → pitch → wait → done, out of order, on one durable model', async () => {
     const svc = new DurableEntityService(ctx.db);
     const sends: Array<{ text: string; to: unknown }> = [];

@@ -18,6 +18,41 @@ const graphOf = (nodes: N[], edges: Array<{ id: string; source: string; target: 
 const codes = (r: { warnings: Array<{ code: string }> }) => r.warnings.map((w) => w.code);
 
 describe('auditWorkflowRobustness', () => {
+  it('rejects an agent-owned external send with a self-reported receipt and no native delivery sink', () => {
+    const g = graphOf(
+      [
+        node('t', 'trigger'),
+        node('compose-and-send', 'agent_task', {
+          prompt: 'Choose the recipient and send the WhatsApp message. Require a real provider acknowledgement.',
+          outputKeys: ['sent_count', 'provider_ack', 'status'],
+        }),
+        node('o', 'return_output'),
+      ],
+      [edge('t', 'compose-and-send'), edge('compose-and-send', 'o')],
+    );
+
+    const result = auditWorkflowRobustness(g, { triggerType: 'manual', archetype: 'pipeline' });
+
+    expect(codes(result)).toContain('MISSING_DELIVERY_SINK');
+    expect(result.warnings.find((warning) => warning.code === 'MISSING_DELIVERY_SINK')?.message).toMatch(/channel or integration node/i);
+  });
+
+  it('accepts agent judgment followed by a native channel delivery node', () => {
+    const g = graphOf(
+      [
+        node('t', 'trigger'),
+        node('compose', 'agent_task', { prompt: 'Compose a short WhatsApp message.', outputKeys: ['body'] }),
+        node('send', 'channel', { channelKind: 'whatsapp', to: '{{input.to}}', body: '{{nodes.compose.body}}' }),
+        node('o', 'return_output'),
+      ],
+      [edge('t', 'compose'), edge('compose', 'send'), edge('send', 'o')],
+    );
+
+    const result = auditWorkflowRobustness(g, { triggerType: 'manual', archetype: 'pipeline' });
+
+    expect(codes(result)).not.toContain('MISSING_DELIVERY_SINK');
+  });
+
   it('flags a recurring workflow with no workflow_store (D4 missing dedup state)', () => {
     const g = graphOf(
       [node('t', 'trigger', { triggerType: 'cron' }), node('f', 'http_request'), node('o', 'return_output')],

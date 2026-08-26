@@ -271,6 +271,62 @@ export class AppDatastore {
     return { rows: out, truncated };
   }
 
+  /** Full-fidelity export used by machine-to-machine packages. */
+  exportRecords(workspaceId: string, appId: string, collection: string, cap = 5000) {
+    const col = this.requireCollection(workspaceId, appId, collection);
+    const rows = this.db.select().from(schema.appRecords)
+      .where(and(eq(schema.appRecords.workspaceId, workspaceId), eq(schema.appRecords.collectionId, col.id)))
+      .orderBy(asc(schema.appRecords.createdAt), asc(schema.appRecords.id))
+      .limit(cap + 1).all();
+    return {
+      records: rows.slice(0, cap).map((row) => ({
+        id: row.id,
+        data: (row.dataJson ?? {}) as Record<string, unknown>,
+        version: row.version,
+        createdBy: row.createdBy,
+        createdAt: row.createdAt,
+        updatedAt: row.updatedAt,
+      })),
+      truncated: rows.length > cap,
+    };
+  }
+
+  /** Restore full-fidelity row envelopes while rebuilding target-side indexes. */
+  importRecords(
+    workspaceId: string,
+    appId: string,
+    collection: string,
+    records: Array<{ id: string; data: Record<string, unknown>; version: number; createdBy: string | null; createdAt: string; updatedAt: string }>,
+  ): { inserted: number; failed: Array<{ index: number; error: string }> } {
+    const col = this.requireCollection(workspaceId, appId, collection);
+    const validate = this.recordValidator(col.schema);
+    let inserted = 0;
+    const failed: Array<{ index: number; error: string }> = [];
+    for (let index = 0; index < records.length; index += 1) {
+      try {
+        const record = records[index]!;
+        const data = validate.parse(record.data);
+        this.db.insert(schema.appRecords).values({
+          id: record.id,
+          collectionId: col.id,
+          appId,
+          workspaceId,
+          dataJson: data,
+          version: record.version,
+          createdBy: record.createdBy,
+          createdAt: record.createdAt,
+          updatedAt: record.updatedAt,
+        }).run();
+        this.writeIndexEntries(workspaceId, appId, col.id, record.id, col.schema, data);
+        inserted += 1;
+      } catch (err) {
+        failed.push({ index, error: err instanceof Error ? err.message : String(err) });
+      }
+    }
+    if (inserted > 0) this.onChange?.({ workspaceId, appId, collection, op: 'insert', id: 'bulk' });
+    return { inserted, failed };
+  }
+
   /**
    * Bulk-insert records (import / seed). Validates each row against the schema,
    * writes its index entries, and skips (collecting) rows that fail rather than

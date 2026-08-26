@@ -148,6 +148,15 @@ function runEmbeddedMigrations(sqlite: Database.Database): void {
   addColumn('issues', 'scheduled_for', 'TEXT');
   addColumn('issues', 'recurrence_cron', 'TEXT');
   addColumn('channel_peer_identities', 'blocked', 'INTEGER NOT NULL DEFAULT 0');
+  // Relationship principals (v135/v136). These must be present before the
+  // embedded index block below runs, because an older database already has the
+  // table and CREATE TABLE IF NOT EXISTS cannot add the new columns for it.
+  addColumn('channel_peer_identities', 'connection_id', 'TEXT REFERENCES channel_connections(id) ON DELETE CASCADE');
+  addColumn('channel_peer_identities', 'grounding_entity_id', 'TEXT REFERENCES durable_entities(id) ON DELETE SET NULL');
+  addColumn('channel_peer_identities', 'authority_role', "TEXT NOT NULL DEFAULT 'external'");
+  addColumn('channel_peer_identities', 'authority_method', 'TEXT');
+  addColumn('channel_peer_identities', 'verified_at', 'TEXT');
+  addColumn('channel_peer_identities', 'grant_expires_at', 'TEXT');
 
   // Company OS layer (migration v2): conversation messages can be linked to an
   // issue. embedded-sql.ts predates this column — patch the drift here.
@@ -357,26 +366,37 @@ CREATE INDEX IF NOT EXISTS idx_schedule_due ON schedule_runs(status, scheduled_a
 
   migrateChannelDeliveriesUniqueness(sqlite);
 
-  // Cross-surface peer identity (OMNICHANNEL §5.2): one row per (workspace,
-  // channel kind, handle); opt-in `user_id` + `peer_key` unify the same human
-  // across channels so the orchestrator recognizes them everywhere.
+  // Cross-surface peer identity (OMNICHANNEL §5.2): one principal per exact
+  // connection + channel kind + handle. A phone number can legitimately reach
+  // two WhatsApp connections in the same workspace; routing identity and
+  // authority must therefore never collapse at workspace/channel scope.
   sqlite.exec(`
 CREATE TABLE IF NOT EXISTS channel_peer_identities (
   id TEXT PRIMARY KEY,
   workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  connection_id TEXT REFERENCES channel_connections(id) ON DELETE CASCADE,
   channel_kind TEXT NOT NULL,
   handle TEXT NOT NULL,
   display_name TEXT,
   user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
   peer_key TEXT,
+  grounding_entity_id TEXT REFERENCES durable_entities(id) ON DELETE SET NULL,
+  authority_role TEXT NOT NULL DEFAULT 'external',
+  authority_method TEXT,
+  verified_at TEXT,
+  grant_expires_at TEXT,
   blocked INTEGER NOT NULL DEFAULT 0,
   message_count INTEGER NOT NULL DEFAULT 0,
   first_seen_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   last_seen_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
-CREATE UNIQUE INDEX IF NOT EXISTS uq_channel_peer ON channel_peer_identities(workspace_id, channel_kind, handle);
+DROP INDEX IF EXISTS uq_channel_peer;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_channel_peer_principal
+  ON channel_peer_identities(workspace_id, connection_id, channel_kind, handle);
 CREATE INDEX IF NOT EXISTS idx_channel_peer_user ON channel_peer_identities(workspace_id, user_id);
 CREATE INDEX IF NOT EXISTS idx_channel_peer_key ON channel_peer_identities(workspace_id, peer_key);
+CREATE INDEX IF NOT EXISTS idx_channel_peer_authority
+  ON channel_peer_identities(workspace_id, connection_id, authority_role);
 `);
 
   // Per-App outbound safety envelope counter (LIVING-APPS §7 · G7, v101). Append-only

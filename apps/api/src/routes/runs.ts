@@ -171,7 +171,13 @@ export function buildRunRoutes(deps: {
     const ws = getWorkspace(c);
     const id = c.req.param('id');
     loadRunRow(deps.db, ws.workspaceId, id);
-    return c.json({ activity: deps.engine.getRunActivity(id) });
+    const requested = Number(c.req.query('limit'));
+    const limit = Number.isFinite(requested) ? Math.max(1, Math.min(Math.floor(requested), 400)) : 400;
+    const activity = deps.engine.getRunActivity(id, { limit, cursor: c.req.query('cursor') });
+    return c.json({
+      activity,
+      nextCursor: activity.length === limit ? activity.at(-1)?.emittedAt ?? null : null,
+    });
   });
 
   // TRANSPORT: a run-scoped SSE stream — every run-room event (node/run status,

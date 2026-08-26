@@ -71,14 +71,16 @@ the responsible agent/subject.
   the only optional external status is the generic, identity-verified owner reasoning indicator.
 - A newly observed, uncorrelated WhatsApp `fromMe` event from the primary phone or another
   companion normally claims that conversation for the human until an explicit **Hand back**. The
-  exception is an explicitly saved owner/operator chat: it always keeps automation available so
-  the owner can talk to their agent naturally. Manual-message takeover remains configurable for
+  exception is the connection-scoped owner/operator peer, established either by the saved
+  `ownerChatId` or a verified Owner identity: it always keeps automation available so the owner can
+  talk to their agent naturally. WhatsApp PN, LID, formatting, and device-qualified aliases are
+  compared as the same provider peer. Manual-message takeover remains configurable for
   customer conversations. `defaultChatId` never creates the operator exception;
   it can be auto-populated and is routing only. The claim is durable and conversation-local:
   Agentis aborts the active turn and companion lane, revokes the tool lease, clears typing, cancels
   pending durable turn jobs, and fences every automated provider send with a monotonic
   `automationEpoch`. Agentis-originated provider echoes never claim ownership.
-  Any stale handoff on the configured operator conversation is released on its next inbound message;
+  Any stale handoff on an owner/operator conversation is released on its next inbound message;
   customer conversations remain human-owned until explicit **Hand back**.
 - Operator messages are business-side conversation context and compile as model role `assistant`;
   customer messages compile as `user`. Platform-chat actor semantics are unchanged. This prevents
@@ -94,12 +96,78 @@ the responsible agent/subject.
   advanced by message watermark. History import invalidates and rebuilds that local summary in the
   background without delaying the first live reply.
 
+### Principals, utterances, and continuing relationships
+
+Channel identity is a verified principal, not a reply address. `channel_peer_identities` is scoped
+by `(workspaceId, connectionId, channelKind, handle)` and records a durable authority role:
+`external`, `owner`, or `delegate`. A workspace has one primary owner person (who may have several
+verified handles) and explicit delegates can be revoked or expired. Saving `ownerChatId` from an
+authenticated configuration creates this durable owner binding; `defaultChatId` remains routing
+only and can never grant control. Settings → Channel identities exposes the binding and authority.
+The manual-outbound exception reads this canonical verified Owner binding as well as `ownerChatId`;
+delegates and external peers retain normal last-human-responder takeover semantics.
+The legacy workspace/channel/handle index must not coexist with the connection-scoped principal
+index; migration v136 removes it from databases that briefly recreated it after v135.
+
+Principal authority does not promote the resident agent's organizational role. A worker or
+specialist channel receives only its own Brain, relationship, current-channel/media, and App data
+tools. It cannot list or reconfigure agents, inspect other connections, or write another agent's
+Brain. Orchestrators and managers remain the explicit control-plane roles. On a verified-owner
+turn, a worker may persist a durable correction only into its own Brain; omitting the target is
+safely narrowed to that agent. Raw SQL/provider/runtime errors stay in operator telemetry and are
+replaced by a generic retry message at the external channel boundary.
+
+WhatsApp provider addresses are aliases, not people. `channel_peer_aliases` folds phone-number
+JIDs (`@s.whatsapp.net`), LIDs (`@lid`), formatted phone numbers, and later provider mappings into
+one connection-scoped canonical peer. `conversations.channel_peer_identity_id` keeps every alias on
+the same transcript and relationship. Alias observation uses conflict-safe upserts, so concurrent
+history reconciliation and live ingress cannot expose a uniqueness constraint to the customer.
+Groups, status broadcasts, and newsletters are excluded from the direct-contact inbox.
+
+`agentis.channel.inbox` gives an authorized agent a bounded, canonical view of recent contacts,
+last inbound/outbound activity, message preview, handoff state, relationship stage/goal, aliases,
+and an opaque `peer:<id>` `recipientRef`. The selectors `last_inbound` and `last_contact` resolve
+requests such as “message the last person who wrote” without asking the operator for a JID. REST
+projections are `GET /v1/channels/inbox`, `GET /v1/channels/inbox/resolve`, and
+`GET /v1/channels/inbox/:recipientRef`. Workspace and connection authority still apply.
+
+Cross-recipient work is an action, not an improvised send. `channel_action_intents` persists the
+recipient, operating agent, requester, goal/relationship reference, exact message, authorization
+basis, approval, idempotency key, schedule, attempts, provider receipt, and terminal state before
+delivery. `agentis.channel.action.{create,list,cancel}` and `/v1/channels/actions` expose that ledger.
+Verified-owner commands can execute immediately; autonomous outreach must point to durable goal or
+relationship state and pass the App autonomy/outbound envelope. Quiet hours and rolling rate limits
+are re-evaluated at delivery time, approval resolves the exact held action, provider uncertainty is
+never blindly resent, and a new inbound reply cancels obsolete planned work for that peer. A
+customer-originated turn can never use a `recipientRef` to contact another person.
+
+Provider messages are not model turns. Rapid bubbles are assembled in
+`channel_utterance_batches` with a quiet deadline and an eight-second hard deadline; the batch
+survives restart and enters the normal durable channel queue once. While cognition is active,
+ordinary bubbles join its live mailbox without producing another answer. Only an explicit status
+request uses the companion lane.
+
+Every external principal is grounded to one `durable_entities(kind='subject')` relationship actor.
+Its bounded state contains identity handles, provenance-bearing facts, engagements/goals/stages,
+commitments, open questions, blockers, and one next action. Contacts are a query/UI projection that
+links back through `subject_id`. A scheduled next action arms the Subject wake clock, reuses the
+normal channel turn/delivery/approval engine, and is cancelled when the person replies first.
+Expired low-value facts are archived and eventually pruned; full transcripts and Brain episodes
+remain outside the compact Subject state.
+
+App `policy.autonomy` chooses `reply_only`, `policy`, or `broad`, with per-action and per-Subject
+overrides. Inbound replies, proactive follow-ups, reads, mutations, contractual/financial,
+destructive, cross-recipient, and escalation actions can each be allowed, approval-gated, or denied.
+`GET /v1/apps/:appId/contacts` returns each contact with its compact relationship state and effective
+case override; `PATCH /v1/apps/:appId/contacts/:contactId/autonomy` changes that case alone.
+The existing Brain PACER lifecycle remains authoritative for durable learning.
+
 The allow-listed WhatsApp behavior profile is version 4. Existing settings resolve lazily with safe
 defaults: `manualOutboundTakeover:"until_handback"`,
 `ownerManualOutboundTakeover:"off"`, and `historyReconciliation:"recent"`. The explicit
 `ownerChatId` and optional `ownerName` let the agent recognize its configured owner/operator in
-that conversation. They are a handoff and conversation-context setting only; owner privileges
-still require a linked peer identity.
+that conversation. Authenticated configuration materializes an explicit owner principal binding;
+editing a default recipient does not.
 Channel transcript identity is `(workspaceId, connectionId, chatId)`, independent of whichever
 agent currently owns the connection. Rebinding an agent or receiving activity in an archived thread
 reactivates the same durable transcript instead of creating a context-free parallel conversation.
@@ -163,6 +231,12 @@ Four providers: **Gmail** (OAuth), **SMTP** (custom), **Outlook** (OAuth), and *
   can grant a RAL affordance when tagged (`mcpToolBridge.ts`).
 - **Provider** — publish any workflow as an MCP tool over JSON-RPC 2.0 Streamable HTTP; the
   published surface is the same one the engine and chat use.
+
+Unleased external clients receive the compact progressive-disclosure gateway. A native chat
+harness carrying a revocable conversation lease instead receives the exact server-selected tool
+schemas for that turn; `tools/list`, direct calls, and calls through `agentis.tools.call` enforce the
+same allow-list. This preserves model capabilities without creating a second tool owner or a way
+to escape channel authority.
 
 - Tools: `agentis.mcp.{list,call}`, `agentis.capability.{search,load,invoke}`.
 

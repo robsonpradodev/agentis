@@ -6,6 +6,7 @@ import { REALTIME_EVENTS } from '@agentis/core';
 import { ChannelConnectionSupervisor, reconcileTransportHealth } from '../../src/services/conversation/channelConnectionSupervisor.js';
 import { ConversationStore } from '../../src/services/conversation/conversationStore.js';
 import { ConversationHandoffService } from '../../src/services/conversation/conversationHandoffService.js';
+import { ChannelIdentityService } from '../../src/services/conversation/channelIdentityService.js';
 import { createTestContext, type TestContext } from '../_helpers/createTestContext.js';
 
 let ctx: TestContext;
@@ -159,6 +160,50 @@ describe('ChannelConnectionSupervisor observed outbound synchronization', () => 
 
     const message = ctx.db.select().from(schema.conversationMessages).get()!;
     expect(message.authorType).toBe('operator');
+    expect(handoffs.current(ctx.workspace.id, message.conversationId)).toMatchObject({
+      state: 'agent', automationEpoch: 0, claimedAt: null,
+    });
+  });
+
+  it('keeps automation available for a verified connection-scoped Owner even without ownerChatId', () => {
+    const { connectionId, supervisor, handoffs } = fixture();
+    const identity = new ChannelIdentityService({ db: ctx.db, logger: ctx.logger });
+    identity.grantAuthority({
+      workspaceId: ctx.workspace.id,
+      connectionId,
+      channelKind: 'whatsapp',
+      handle: '+55 21 97039-8568',
+      role: 'owner',
+      userId: ctx.user.id,
+      method: 'test_owner_setting',
+    });
+
+    supervisor.observeOutbound(connectionId, {
+      externalId: 'VERIFIED-OWNER-MESSAGE-1',
+      chatId: '5521970398568:12@s.whatsapp.net',
+      body: 'Testing my assistant from another device',
+    });
+
+    const message = ctx.db.select().from(schema.conversationMessages).get()!;
+    expect(handoffs.current(ctx.workspace.id, message.conversationId)).toMatchObject({
+      state: 'agent', automationEpoch: 0, claimedAt: null,
+    });
+  });
+
+  it('uses the alternate PN identity when WhatsApp observes the owner chat under a LID', () => {
+    const { connectionId, supervisor, handoffs } = fixture();
+    ctx.db.update(schema.channelConnections).set({
+      settings: { mode: 'qr_local', ownerChatId: '5521970398568@s.whatsapp.net' },
+    }).where(eq(schema.channelConnections.id, connectionId)).run();
+
+    supervisor.observeOutbound(connectionId, {
+      externalId: 'OWNER-LID-MESSAGE-1',
+      chatId: '187654321098765@lid',
+      alternateChatIds: ['5521970398568@s.whatsapp.net'],
+      body: 'Self-chat through the LID alias',
+    });
+
+    const message = ctx.db.select().from(schema.conversationMessages).get()!;
     expect(handoffs.current(ctx.workspace.id, message.conversationId)).toMatchObject({
       state: 'agent', automationEpoch: 0, claimedAt: null,
     });

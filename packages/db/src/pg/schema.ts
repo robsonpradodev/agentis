@@ -418,6 +418,31 @@ export const workflowRuns = pgTable('workflow_runs', {
   ...baseTimestamps(),
 });
 
+export const runActivityEvents = pgTable('run_activity_events', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  workspaceId: uuid('workspace_id').notNull().references(() => workspaces.id, { onDelete: 'cascade' }),
+  runId: uuid('run_id').notNull().references(() => workflowRuns.id, { onDelete: 'cascade' }),
+  nodeId: text('node_id'),
+  agentId: uuid('agent_id'),
+  activityId: text('activity_id').notNull(),
+  event: text('event').notNull(),
+  kind: text('kind'),
+  phase: text('phase'),
+  status: text('status'),
+  title: text('title'),
+  detail: text('detail'),
+  transport: text('transport'),
+  attempt: integer('attempt'),
+  startedAt: timestamp('started_at', { withTimezone: true }),
+  completedAt: timestamp('completed_at', { withTimezone: true }),
+  durationMs: integer('duration_ms'),
+  payload: jsonb('payload_json').notNull().default(sql`'{}'::jsonb`),
+  ...baseTimestamps(),
+}, (table) => ({
+  owner: uniqueIndex('uq_run_activity_owner').on(table.runId, table.activityId),
+  timeline: index('idx_run_activity_timeline').on(table.workspaceId, table.runId, table.createdAt),
+}));
+
 export const agentExecutionEnvelopes = pgTable('agent_execution_envelopes', {
   id: uuid('id').primaryKey().defaultRandom(),
   workspaceId: uuid('workspace_id').notNull().references(() => workspaces.id, { onDelete: 'cascade' }),

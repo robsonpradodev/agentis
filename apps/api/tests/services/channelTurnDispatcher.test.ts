@@ -388,7 +388,7 @@ describe('ChannelTurnDispatcher', () => {
     ctx.db.insert(schema.channelConnections).values({
       id: connectionId, workspaceId: ctx.workspace.id, ambientId: ctx.ambient.id, userId: ctx.user.id,
       agentId, kind: 'whatsapp', name: 'Owner boundary', tokenEncrypted: 'x',
-      settings: { defaultChatId: handle, ownerChatId: handle, ownerName: 'Robson' },
+      settings: { defaultChatId: handle },
     }).run();
     const conv = conversations.getOrCreateByChannel({
       workspaceId: ctx.workspace.id, ambientId: ctx.ambient.id, userId: ctx.user.id,
@@ -413,17 +413,69 @@ describe('ChannelTurnDispatcher', () => {
     });
     expect(ownerVerified).toBe(false);
     expect(addendum).toContain('Address that person, never an imagined operator');
-    expect(addendum).toContain('configured as the channel owner/operator (Robson)');
-    expect(addendum).toContain('protected owner-only capabilities remain gated');
     expect(addendum).toContain('Keep runtime state');
 
-    identity.record({ workspaceId: ctx.workspace.id, channelKind: 'whatsapp', handle });
-    identity.link({ workspaceId: ctx.workspace.id, channelKind: 'whatsapp', handle, userId: ctx.user.id });
+    identity.grantAuthority({
+      workspaceId: ctx.workspace.id, connectionId, channelKind: 'whatsapp', handle,
+      role: 'owner', userId: ctx.user.id, method: 'test',
+    });
     await dispatcher.dispatch({
       workspaceId: ctx.workspace.id, ambientId: ctx.ambient.id, userId: ctx.user.id,
       agentId, conversationId: conv.id, connectionId, kind: 'whatsapp', chatId: handle, text: 'after link',
     });
     expect(ownerVerified).toBe(true);
+  });
+
+  it('keeps a worker channel in its own operational scope while exposing its Brain', async () => {
+    const conversations = new ConversationStore({ db: ctx.db, bus: ctx.bus });
+    const identity = new ChannelIdentityService({ db: ctx.db, logger: ctx.logger });
+    const agentId = seedAgent(ctx);
+    ctx.db.update(schema.agents).set({ role: 'worker' }).where(eq(schema.agents.id, agentId)).run();
+    const handle = '5511777777777@s.whatsapp.net';
+    const connectionId = randomUUID();
+    ctx.db.insert(schema.channelConnections).values({
+      id: connectionId, workspaceId: ctx.workspace.id, ambientId: ctx.ambient.id, userId: ctx.user.id,
+      agentId, kind: 'whatsapp', name: 'Bounded worker', tokenEncrypted: 'x',
+      settings: { ownerChatId: handle, ownerName: 'Owner' },
+    }).run();
+    identity.grantAuthority({
+      workspaceId: ctx.workspace.id,
+      connectionId,
+      channelKind: 'whatsapp',
+      handle,
+      role: 'owner',
+      userId: ctx.user.id,
+      method: 'test',
+    });
+    const conv = conversations.getOrCreateByChannel({
+      workspaceId: ctx.workspace.id, ambientId: ctx.ambient.id, userId: ctx.user.id,
+      agentId, channelConnectionId: connectionId, channelChatId: handle,
+    });
+    let allowed: string[] | undefined;
+    let addendum = '';
+    const dispatcher = new ChannelTurnDispatcher({
+      db: ctx.db, adapters: new AdapterManager(ctx.logger), conversations, identity, logger: ctx.logger,
+      deliver: async (args) => ackReceipt(args.chatId), fallbackAdapter: () => chatStub('unused'),
+      runTurn: async function* (_adapter, _history, _text, turnContext, options) {
+        allowed = turnContext.allowedToolIds;
+        addendum = options?.systemAddendum ?? '';
+        yield { type: 'text', delta: 'ok' } as ChatDelta;
+        yield { type: 'done', finishReason: 'stop' } as ChatDelta;
+      } as unknown as typeof ChatSessionExecutor.turn,
+    });
+
+    await dispatcher.dispatch({
+      workspaceId: ctx.workspace.id, ambientId: ctx.ambient.id, userId: ctx.user.id,
+      agentId, conversationId: conv.id, connectionId, kind: 'whatsapp', chatId: handle,
+      text: 'remember this correction',
+    });
+
+    expect(allowed).toEqual(expect.arrayContaining(['agentis.brain.search', 'agentis.memory.write']));
+    expect(allowed).not.toContain('agentis.agents.list');
+    expect(allowed).not.toContain('agentis.agent.brain.configure');
+    expect(allowed).not.toContain('agentis.channel.list');
+    expect(addendum).toContain('DURABLE BRAIN AVAILABILITY');
+    expect(addendum).toContain('Never claim that platform memory is unavailable');
   });
 
   it('releases a legacy phone-observed handoff when its chat is configured as the owner/operator', async () => {
@@ -459,6 +511,47 @@ describe('ChannelTurnDispatcher', () => {
     });
     expect(result).toMatchObject({ replied: true });
     expect(delivered).toEqual(['I am back.']);
+    expect(handoffs.current(ctx.workspace.id, conv.id)).toMatchObject({ state: 'agent', automationEpoch: 2 });
+  });
+
+  it('releases a stale handoff for a verified Owner identity even without ownerChatId', async () => {
+    const conversations = new ConversationStore({ db: ctx.db, bus: ctx.bus });
+    const handoffs = new ConversationHandoffService({ db: ctx.db, bus: ctx.bus });
+    const identity = new ChannelIdentityService({ db: ctx.db, logger: ctx.logger });
+    const agentId = seedAgent(ctx);
+    const configuredHandle = '+55 11 99123-4567';
+    const inboundHandle = '5511991234567:4@s.whatsapp.net';
+    const connectionId = randomUUID();
+    ctx.db.insert(schema.channelConnections).values({
+      id: connectionId, workspaceId: ctx.workspace.id, ambientId: ctx.ambient.id, userId: ctx.user.id,
+      agentId, kind: 'whatsapp', name: 'Verified owner recovery', tokenEncrypted: 'x', settings: {},
+    }).run();
+    identity.grantAuthority({
+      workspaceId: ctx.workspace.id, connectionId, channelKind: 'whatsapp', handle: configuredHandle,
+      role: 'owner', userId: ctx.user.id, method: 'test_owner_setting',
+    });
+    const conv = conversations.getOrCreateByChannel({
+      workspaceId: ctx.workspace.id, ambientId: ctx.ambient.id, userId: ctx.user.id,
+      agentId, channelConnectionId: connectionId, channelChatId: inboundHandle,
+    });
+    handoffs.claimHuman({ workspaceId: ctx.workspace.id, conversationId: conv.id, source: 'provider_observed' });
+    const delivered: string[] = [];
+    const dispatcher = new ChannelTurnDispatcher({
+      db: ctx.db, adapters: new AdapterManager(ctx.logger), conversations, identity, logger: ctx.logger, handoffs,
+      deliver: async ({ body, chatId }) => { delivered.push(body); return ackReceipt(chatId); },
+      fallbackAdapter: () => chatStub('unused'),
+      runTurn: async function* () {
+        yield { type: 'text', delta: 'Owner chat remains automated.' } as ChatDelta;
+        yield { type: 'done', finishReason: 'stop' } as ChatDelta;
+      } as unknown as typeof ChatSessionExecutor.turn,
+    });
+
+    const result = await dispatcher.dispatch({
+      workspaceId: ctx.workspace.id, ambientId: ctx.ambient.id, userId: ctx.user.id,
+      agentId, conversationId: conv.id, connectionId, kind: 'whatsapp', chatId: inboundHandle, text: 'Continue replying.',
+    });
+    expect(result).toMatchObject({ replied: true });
+    expect(delivered).toEqual(['Owner chat remains automated.']);
     expect(handoffs.current(ctx.workspace.id, conv.id)).toMatchObject({ state: 'agent', automationEpoch: 2 });
   });
 
@@ -604,8 +697,10 @@ describe('ChannelTurnDispatcher', () => {
         whatsappProfile: { ...DEFAULT_WHATSAPP_CONNECTION_PROFILE, ownerReasoningVisibility: 'indicator' },
       },
     }).run();
-    identity.record({ workspaceId: ctx.workspace.id, channelKind: 'whatsapp', handle });
-    identity.link({ workspaceId: ctx.workspace.id, channelKind: 'whatsapp', handle, userId: ctx.user.id });
+    identity.grantAuthority({
+      workspaceId: ctx.workspace.id, connectionId, channelKind: 'whatsapp', handle,
+      role: 'owner', userId: ctx.user.id, method: 'test',
+    });
     const conv = conversations.getOrCreateByChannel({
       workspaceId: ctx.workspace.id, ambientId: ctx.ambient.id, userId: ctx.user.id,
       agentId, channelConnectionId: connectionId, channelChatId: handle,
@@ -794,6 +889,34 @@ describe('ChannelTurnDispatcher', () => {
     // This is a successfully transported failure notice. Delivery status reflects
     // provider evidence, not whether the model turn itself succeeded.
     expect(failure?.deliveryStatus).toBe('sent');
+  });
+
+  it('never sends raw database errors to a channel recipient', async () => {
+    const conversations = new ConversationStore({ db: ctx.db, bus: ctx.bus });
+    const agentId = seedAgent(ctx);
+    const conv = conversations.getOrCreateByAgent({
+      workspaceId: ctx.workspace.id, ambientId: ctx.ambient.id, userId: ctx.user.id, agentId,
+    });
+    const delivered: string[] = [];
+    const dispatcher = new ChannelTurnDispatcher({
+      db: ctx.db,
+      adapters: new AdapterManager(ctx.logger),
+      conversations,
+      logger: ctx.logger,
+      deliver: async (args) => { delivered.push(args.body); return ackReceipt(args.chatId); },
+      fallbackAdapter: () => chatStub('unused'),
+      runTurn: async function* () {
+        throw new Error('UNIQUE constraint failed: channel_peer_identities.workspace_id, channel_peer_identities.channel_kind, channel_peer_identities.handle');
+      } as unknown as typeof ChatSessionExecutor.turn,
+    });
+
+    await dispatcher.dispatch({
+      workspaceId: ctx.workspace.id, ambientId: ctx.ambient.id, userId: ctx.user.id,
+      agentId, conversationId: conv.id, connectionId: 'conn-1', kind: 'telegram', chatId: '999', text: 'hello',
+    });
+
+    expect(delivered).toEqual(['I’m having trouble answering right now. Please try again in a moment.']);
+    expect(delivered[0]).not.toMatch(/UNIQUE|constraint|channel_peer_identities/i);
   });
 
   it('maps prior channel-inbound system messages to user role in history', async () => {
@@ -1284,7 +1407,7 @@ describe('ChannelTurnDispatcher', () => {
     expect(typing).toContain(false);
   });
 
-  it('keeps the work lane alive and answers a new message through the companion lane', async () => {
+  it('keeps the work lane alive and answers only an explicit status request through the companion lane', async () => {
     const conversations = new ConversationStore({ db: ctx.db, bus: ctx.bus });
     const agentId = seedAgent(ctx);
     const conv = conversations.getOrCreateByAgent({
@@ -1316,7 +1439,7 @@ describe('ChannelTurnDispatcher', () => {
       } as unknown as typeof import('../../src/services/chat/chatSessionExecutor.js').ChatSessionExecutor.turn,
       runConcurrentTurn: async function* (_adapter, _history, userMessage, _turnContext, options) {
         companionState = options?.systemAddendum ?? '';
-        expect(userMessage).toBe('second question');
+        expect(userMessage).toBe('status?');
         expect(options?.sessionKey).toBe(`${conv.id}:companion`);
         yield { type: 'text', delta: 'The original task is still running.' } as ChatDelta;
         yield { type: 'done', finishReason: 'stop' } as ChatDelta;
@@ -1330,13 +1453,13 @@ describe('ChannelTurnDispatcher', () => {
     const first = dispatcher.dispatch({ ...base, text: 'first detail', inboundMessageId: firstInbound.id });
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(releaseWork).toBeTypeOf('function');
-    const companion = await dispatcher.dispatch({ ...base, text: 'second question', inboundMessageId: secondInbound.id });
+    const companion = await dispatcher.dispatch({ ...base, text: 'status?', inboundMessageId: secondInbound.id });
     expect(companion).toEqual({ replied: true, reason: 'active_turn_companion' });
     expect(mainSignal?.aborted).toBe(false);
     releaseWork!();
     await first;
 
-    expect(joinedInput).toEqual([{ role: 'user', content: 'second question' }]);
+    expect(joinedInput).toEqual([{ role: 'user', content: 'status?' }]);
     expect(companionState).toContain('ACTIVE_TASK_STATE');
     expect(companionState).toContain('"objective":"first detail"');
     expect(delivered).toEqual([

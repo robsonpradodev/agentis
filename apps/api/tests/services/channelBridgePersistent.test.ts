@@ -15,6 +15,7 @@ import { ChannelBridge, DEFAULT_WHATSAPP_CONNECTION_PROFILE, type PersistentChan
 import { ConversationStore } from '../../src/services/conversation/conversationStore.js';
 import { SlackChannelAdapter } from '../../src/adapters/channels/slack.js';
 import { ConversationHandoffService } from '../../src/services/conversation/conversationHandoffService.js';
+import { ChannelIdentityService } from '../../src/services/conversation/channelIdentityService.js';
 
 function seedAgent(ctx: TestContext) {
   const id = randomUUID();
@@ -245,6 +246,33 @@ describe('ChannelBridge persistent transport (WhatsApp)', () => {
     expect(snapshot).toMatchObject({ state: 'agent', automationEpoch: 0 });
     await bridge.deliverToConnection({ connectionId: connection.id, chatId: target, body: 'agent reply', conversationId: snapshot.conversationId });
     expect(sent.map((item) => item.body)).toEqual(['operator note', 'agent reply']);
+  });
+
+  it('does not claim a verified Owner chat when an operator sends through Agentis', async () => {
+    const { bridge, handoffs } = buildBridge(ctx);
+    const { transport, sent } = fakeTransport();
+    bridge.setPersistentTransport(transport);
+    const agentId = seedAgent(ctx);
+    const target = '5511999999999@s.whatsapp.net';
+    const { connection } = bridge.create({
+      workspaceId: ctx.workspace.id, ambientId: null, userId: ctx.user.id,
+      agentId, kind: 'whatsapp', name: 'WA verified owner',
+    });
+    new ChannelIdentityService({ db: ctx.db, logger: ctx.logger }).grantAuthority({
+      workspaceId: ctx.workspace.id,
+      connectionId: connection.id,
+      channelKind: 'whatsapp',
+      handle: '+55 11 99999-9999',
+      role: 'owner',
+      userId: ctx.user.id,
+      method: 'test_owner_setting',
+    });
+
+    await bridge.deliverToConnection({ connectionId: connection.id, chatId: target, body: 'owner note', actor: 'human' });
+    const snapshot = handoffs.findByChannel(ctx.workspace.id, connection.id, target)!;
+    expect(snapshot).toMatchObject({ state: 'agent', automationEpoch: 0 });
+    await bridge.deliverToConnection({ connectionId: connection.id, chatId: target, body: 'agent reply', conversationId: snapshot.conversationId });
+    expect(sent.map((item) => item.body)).toEqual(['owner note', 'agent reply']);
   });
 
   it('persists a client-only WhatsApp submission as queued, never as sent', async () => {

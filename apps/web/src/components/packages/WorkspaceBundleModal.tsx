@@ -51,7 +51,9 @@ export function WorkspaceBundleModal({
   const toast = useToast();
   const [mode] = useState<'export' | 'import'>(importEnvelope ? 'import' : 'export');
   const [profile, setProfile] = useState<Profile>('share');
-  const [fidelity, setFidelity] = useState<BundleFidelity>('shareable');
+  // Workspace Settings opens this as a machine-to-machine transfer. Default to
+  // the complete portable shape; operators may still deliberately opt down.
+  const [fidelity, setFidelity] = useState<BundleFidelity>('full');
   const [facets, setFacets] = useState<Facets>(ALL_FACETS);
   const [name, setName] = useState('');
   const [license, setLicense] = useState('');

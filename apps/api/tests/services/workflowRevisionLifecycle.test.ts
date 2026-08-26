@@ -138,9 +138,43 @@ describe('immutable workflow revision lifecycle', () => {
     })).toThrowError(AgentisError);
   });
 
-  it('requires App delivery authority and exact clean-run proof for semantic publication', () => {
+  it('bounds unreferenced autosave checkpoints without removing the active working change', () => {
+    const active = revisions.ensureWorkflow(ctx.workspace.id, workflowId).active;
+    let baseRevisionId = active.id;
+    for (let index = 0; index < 25; index += 1) {
+      const next = graph(index % 2 === 0 ? 'text' : 'json');
+      next.nodes[1] = { ...next.nodes[1]!, title: `Result ${index}` };
+      baseRevisionId = revisions.createCandidate({
+        workspaceId: ctx.workspace.id,
+        workflowId,
+        graph: next,
+        baseRevisionId,
+        source: 'user_edit',
+        actor: { type: 'user', id: ctx.user.id },
+        reason: `Autosave ${index}`,
+      }).revision.id;
+    }
+    const rows = revisions.revisions(ctx.workspace.id, workflowId);
+    expect(rows.filter((revision) => revision.source === 'user_edit' && revision.status === 'superseded')).toHaveLength(20);
+    expect(revisions.candidate(ctx.workspace.id, workflowId)?.revision.id).toBe(baseRevisionId);
+    expect(revisions.active(ctx.workspace.id, workflowId).revision.id).toBe(active.id);
+  });
+
+  it('publishes an independently proven App-owned workflow without sibling App gates', () => {
     const appId = new AppStore(ctx.db).create(ctx.workspace.id, ctx.user.id, { name: 'Delivery-only app' }).id;
     ctx.db.update(schema.workflows).set({ appId }).where(eq(schema.workflows.id, workflowId)).run();
+    // Deliberately broken sibling: no executable graph, no proof, no trigger.
+    // Its health belongs in App readiness, never in this workflow's promotion.
+    ctx.db.insert(schema.workflows).values({
+      id: randomUUID(),
+      workspaceId: ctx.workspace.id,
+      ambientId: ctx.ambient.id,
+      userId: ctx.user.id,
+      appId,
+      title: 'Unrelated broken sibling',
+      graph: { version: 1, nodes: [], edges: [], viewport: { x: 0, y: 0, zoom: 1 } },
+      settings: {},
+    }).run();
     const active = revisions.ensureWorkflow(ctx.workspace.id, workflowId).active;
     const candidate = revisions.createCandidate({
       workspaceId: ctx.workspace.id,
@@ -178,21 +212,12 @@ describe('immutable workflow revision lifecycle', () => {
       });
     }
 
-    expect(() => revisions.promote({
+    const promoted = revisions.promote({
       workspaceId: ctx.workspace.id,
       workflowId,
       revisionId: candidate.id,
       expectedActiveRevisionId: active.id,
       actor: { type: 'user', id: ctx.user.id },
-    })).toThrowError(/agentis\.app\.deliver/);
-
-    const promoted = revisions.promoteFromAppDelivery({
-      workspaceId: ctx.workspace.id,
-      workflowId,
-      revisionId: candidate.id,
-      expectedActiveRevisionId: active.id,
-      actor: { type: 'system', id: 'delivery-test' },
-      deliveryRunId: runId,
     });
     expect(promoted.activeRevisionId).toBe(candidate.id);
   });
@@ -349,7 +374,10 @@ describe('immutable workflow revision lifecycle', () => {
   it.each([
     ['BLOCKED_APPROVAL_REQUIRED: wait for operator', 'human_policy', false],
     ['credential API key missing', 'configuration_capability', false],
+    ['agent_task node select_draft: pinned agent e34b5a36-85fc-4384-b8b9-a71392a198c6 has no connected runtime', 'configuration_capability', false],
+    ['Bia Outreacher seleciona um novo lead: agent "Bia Outreacher" is offline. Reconnect its runtime or choose an online agent before running.', 'configuration_capability', false],
     ['provider returned 429 rate limit', 'transient_resource', false],
+    ['Hermes produced no observable output for 3m 0s and appears stuck; the runtime was stopped', 'transient_resource', false],
     ['CONTRACT_OUTPUT_INVALID: missing result', 'data_contract', true],
     ['WORKFLOW_GRAPH_INVALID: dangling edge target', 'graph_design', true],
     ['internal invariant failed in sqlite transaction', 'platform', false],

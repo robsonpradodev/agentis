@@ -68,6 +68,29 @@ const semanticProvider: EmbeddingProvider = {
 };
 
 describe('/v1/knowledge-bases document uploads', () => {
+  it('permanently deletes a document, its chunks, and graph links', async () => {
+    wireAutoLinker();
+    const kb = knowledge.createKnowledgeBase({ workspaceId: ctx.workspace.id, name: 'disposable docs' });
+    const document = await knowledge.addDocument({
+      workspaceId: ctx.workspace.id,
+      knowledgeBaseId: kb.id,
+      name: 'obsolete.md',
+      content: Array.from({ length: 520 }, (_, index) => `obsolete-policy-${index % 15}`).join(' '),
+    });
+    await knowledge.flushPendingIndexing();
+    const chunkIds = ctx.db.select({ id: schema.kbChunks.id }).from(schema.kbChunks)
+      .where(eq(schema.kbChunks.documentId, document.id)).all().map((chunk) => chunk.id);
+    expect(chunkIds.length).toBeGreaterThan(1);
+    expect(ctx.db.select().from(schema.knowledgeLinks).all()
+      .some((link) => chunkIds.includes(link.sourceId) || chunkIds.includes(link.targetId))).toBe(true);
+
+    expect(knowledge.deleteDocument(ctx.workspace.id, kb.id, document.id)).toEqual({ id: document.id, deleted: true });
+    expect(ctx.db.select().from(schema.kbDocuments).where(eq(schema.kbDocuments.id, document.id)).get()).toBeUndefined();
+    expect(ctx.db.select().from(schema.kbChunks).where(eq(schema.kbChunks.documentId, document.id)).all()).toHaveLength(0);
+    expect(ctx.db.select().from(schema.knowledgeLinks).all()
+      .filter((link) => chunkIds.includes(link.sourceId) || chunkIds.includes(link.targetId))).toHaveLength(0);
+  });
+
   it('presents workflow-scoped knowledge with owner provenance and document counts', async () => {
     const workflowId = randomUUID();
     ctx.db.insert(schema.workflows)

@@ -39,6 +39,9 @@ describe('agentOperatingManual (W2)', () => {
     const m = composeOperatingManual({ role: 'worker', workspaceManual: 'House rules: ship small.' });
     expect(m).toContain('House rules: ship small.');
     expect(m).toContain(ROLE_TIER_MANUAL.worker);
+    expect(m).toContain('Workflow delivery is atomic');
+    expect(m).toContain('agentis.workflow.deliver');
+    expect(m).toContain('A medium-state workflow is not a deliverable');
   });
 });
 

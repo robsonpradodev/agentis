@@ -17,7 +17,7 @@ import { graphContentHash, readBuildLoop } from '../../services/workflow/workflo
 import { decideRecoveryPolicy, recoveryFailureFingerprint, recoveryTierForPlan, repairPlanFingerprint } from '../../services/workflow/workflowRecoveryPolicy.js';
 import { type DeepPlanArgs, type DeepPlanResult, type IntentAnchor, type RepairResourceContext } from '../../services/workflow/workflowSelfHeal.js';
 import { classifyWorkflowFailure, workflowFailureFingerprint } from '../../services/workflow/workflowFailureClassification.js';
-import { REALTIME_EVENTS, REALTIME_ROOMS, type AgentRequirements, type AgentRole, type AgentTaskNodeConfig, type AgentTool, type ChatDelta, type ReadyQueueItem, type ToolDefinition, type WorkflowGraph, type WorkflowGraphPatch, type WorkflowNode, type WorkflowRecoveryMode, type WorkflowSelfHealIncident } from '@agentis/core';
+import { agentSatisfiesRequirements, REALTIME_EVENTS, REALTIME_ROOMS, type AgentRequirements, type AgentRole, type AgentTaskNodeConfig, type AgentTool, type ChatDelta, type ReadyQueueItem, type ToolDefinition, type WorkflowGraph, type WorkflowGraphPatch, type WorkflowNode, type WorkflowRecoveryMode, type WorkflowSelfHealIncident } from '@agentis/core';
 import { schema } from '@agentis/db/sqlite';
 import { and, eq } from 'drizzle-orm';
 import { randomUUID } from 'node:crypto';
@@ -171,6 +171,15 @@ export interface SelfHealHost {
     tool?: string;
     toolInput?: unknown;
     toolResult?: unknown;
+    activityId?: string;
+    activityPhase?: string;
+    activityStatus?: 'running' | 'success' | 'error';
+    activityTitle?: string;
+    transport?: string;
+    attempt?: number;
+    startedAt?: string;
+    completedAt?: string;
+    durationMs?: number;
   }): void;
 }
 
@@ -648,7 +657,7 @@ export class SelfHealController {
     }
 
     // 2) Reroute the step to the healer (configured agent, else orchestrator).
-    const healerId = this.#resolveHealerExecutor(ctx, cfg, config.prompt);
+    const healerId = this.#resolveHealerExecutor(ctx, cfg, config.prompt, config.requires);
     if (healerId && healerId !== pinnedId) {
       const attempt = recordSelfHealAttempt(ctx, node.id);
       await this.host.persistRun(ctx).catch(() => {});
@@ -724,12 +733,19 @@ export class SelfHealController {
   }
 
   /** The agent that backs self-healing: configured healer → orchestrator → any connected agent. Ensures a runtime. */
-  #resolveHealerExecutor(ctx: RunningContext, cfg: SelfHealConfig, task?: string | null): string | null {
-    const ready = (id: string | null | undefined): string | null =>
-      id && this.#tryBindAgentRuntime(ctx, id, task, this.host.agentConfiguredModel(id)) ? id : null;
+  #resolveHealerExecutor(
+    ctx: RunningContext,
+    cfg: SelfHealConfig,
+    task?: string | null,
+    requires?: AgentRequirements,
+  ): string | null {
+    const ready = (id: string | null | undefined): string | null => {
+      if (!id || !this.#tryBindAgentRuntime(ctx, id, task, this.host.agentConfiguredModel(id))) return null;
+      return agentSatisfiesRequirements(this.host.deps.adapters.capabilities(id), requires) ? id : null;
+    };
     return ready(cfg.healerAgentId)
       ?? ready(this.host.findAgentByRole(ctx.workspaceId, 'orchestrator'))
-      ?? this.host.resolveConnectedFallbackAgent(ctx.workspaceId, []);
+      ?? this.host.resolveConnectedFallbackAgent(ctx.workspaceId, [], requires);
   }
 
   /** Human-readable name for an agent id (falls back to role, then id). */
@@ -978,24 +994,31 @@ export class SelfHealController {
       // failure (e.g. no chat adapter). Checking `phase` alone let a REAL
       // failed tool call (phase:'tool', status:'error') during the repair
       // loop fall through to 'thinking' — never surfaced as a failure.
-      const failed = delta.status === 'error' || delta.phase === 'error';
       const detail = [delta.label, delta.detail].filter(Boolean).join(' - ');
-      this.host.emitWorkStep(ctx, node, failed ? 'fail' : delta.phase === 'complete' ? 'complete' : 'thinking', detail);
-      // `emitWorkStep` publishes to the WORKSPACE room only, but the run SSE /
-      // socket stream filters strictly on the RUN room — so on its own it never
-      // reaches the workflow live modal or `useRunActivity`, and the operator saw
-      // only the handful of thoughts that happened to survive the /activity
-      // back-fill. Activity deltas ARE the harness thought stream (chat renders
-      // exactly these), so mirror them run-scoped too. Runtime-phase activities
-      // carry reasoning; the rest are tool/step narration — both belong in the
-      // terminal, so relay every one and let the surfaces filter.
+      // One typed projection is enough. The former `emitWorkStep` call created a
+      // second, lossy activity without delta.id/transport/attempt/start time, so
+      // every 15-second heartbeat became a permanent duplicate row. The
+      // run-scoped notification below is durable and retains the stable identity.
       if (detail) {
+        const activityKind = delta.phase === 'tool'
+          ? 'tool_call'
+          : 'thinking';
         this.host.notifyAgentActivity({
           runId: ctx.runId,
           agentId: healerId,
           taskId: node.id,
-          kind: 'thinking',
+          kind: activityKind,
           text: clip(detail, 4000),
+          ...(delta.phase === 'tool' ? { tool: delta.tool ?? delta.label } : {}),
+          activityId: delta.id,
+          activityPhase: delta.phase,
+          activityStatus: delta.status,
+          activityTitle: delta.label,
+          transport: delta.transport,
+          attempt: delta.attempt,
+          startedAt: delta.startedAt,
+          completedAt: delta.completedAt,
+          durationMs: delta.durationMs,
         });
       }
       return;

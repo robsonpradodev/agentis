@@ -22,7 +22,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { and, eq, gte, lt } from 'drizzle-orm';
-import { appPolicySchema, type AppOutboundPolicy } from '@agentis/core';
+import { appPolicySchema, type AppOutboundPolicy, type AutonomyActionCategory, type AutonomyDecision, type AutonomyMode, type RelationshipAutonomyPolicy } from '@agentis/core';
 import { schema } from '@agentis/db/sqlite';
 import type { AgentisSqliteDb } from '@agentis/db/sqlite';
 import type { Logger } from '../logger.js';
@@ -42,6 +42,12 @@ export interface OutboundDecision {
   allow: boolean;
   needsApproval: boolean;
   reason?: string;
+}
+
+export interface AutonomyPolicyDecision {
+  decision: AutonomyDecision;
+  mode: AutonomyMode;
+  reason: string;
 }
 
 const HOUR_MS = 60 * 60 * 1000;
@@ -104,6 +110,18 @@ export class OutboundPolicyService {
     return { allow: true, needsApproval: false };
   }
 
+  /** Category gate shared by relationship replies, follow-ups and external side effects. */
+  evaluateAutonomy(appId: string | null | undefined, category: AutonomyActionCategory, subjectId?: string | null): AutonomyPolicyDecision {
+    if (!appId) return { decision: 'allow', mode: 'broad', reason: 'workspace agent without App policy' };
+    const policy = this.#fullPolicy(appId)?.autonomy;
+    if (!policy) return { decision: 'allow', mode: 'broad', reason: 'no autonomy policy configured' };
+    const override = subjectId ? policy.subjectOverrides[subjectId] : undefined;
+    const mode = override?.mode ?? policy.mode;
+    const explicit = override?.actions?.[category] ?? policy.actions[category];
+    const decision = explicit ?? defaultAutonomyDecision(mode, category);
+    return { decision, mode, reason: explicit ? `explicit ${category} policy` : `${mode} default for ${category}` };
+  }
+
   /**
    * Record one outbound send against the App's rolling counter. Call AFTER a send
    * actually goes out (agent reply, proactive follow-up, or operator manual send).
@@ -145,6 +163,10 @@ export class OutboundPolicyService {
 
   /** Resolve the App's outbound policy block, or undefined when none is set. */
   #policy(appId: string): AppOutboundPolicy | undefined {
+    return this.#fullPolicy(appId)?.outbound;
+  }
+
+  #fullPolicy(appId: string): { outbound?: AppOutboundPolicy; autonomy?: RelationshipAutonomyPolicy } | undefined {
     const row = this.deps.db
       .select({ policyJson: schema.apps.policyJson })
       .from(schema.apps)
@@ -153,8 +175,16 @@ export class OutboundPolicyService {
     if (!row) return undefined;
     const parsed = appPolicySchema.safeParse(row.policyJson ?? {});
     if (!parsed.success) return undefined;
-    return parsed.data.outbound;
+    return parsed.data;
   }
+}
+
+function defaultAutonomyDecision(mode: AutonomyMode, category: AutonomyActionCategory): AutonomyDecision {
+  if (category === 'inbound_reply' || category === 'escalation') return 'allow';
+  if (mode === 'reply_only') return 'deny';
+  if (mode === 'policy') return category === 'external_read' ? 'allow' : 'require_approval';
+  if (category === 'financial_contractual' || category === 'destructive' || category === 'cross_recipient') return 'require_approval';
+  return 'allow';
 }
 
 const ALLOW: OutboundDecision = { allow: true, needsApproval: false };

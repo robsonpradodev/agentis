@@ -9,7 +9,7 @@ import { eq } from 'drizzle-orm';
 import type { AppWorkflowBinding, WorkflowGraph } from '@agentis/core';
 import { schema } from '@agentis/db/sqlite';
 import { AppOrchestratorService } from '../../src/services/app/appOrchestrator.js';
-import { nextCronFire, describeCron } from '../../src/services/cronNextFire.js';
+import { nextCronFire, nextCronFireInTimezone, describeCron } from '../../src/services/cronNextFire.js';
 import type { WorkflowEngine } from '../../src/engine/WorkflowEngine.js';
 import { createTestContext, type TestContext } from '../_helpers/createTestContext.js';
 
@@ -446,6 +446,9 @@ describe('nextCronFire', () => {
     expect(nextCronFire('30 6 1 * *', from)?.toISOString()).toBe('2026-08-01T06:30:00.000Z');
     expect(nextCronFire('garbage', from)).toBeNull();
     expect(nextCronFire('0 9 31 2 *', from)).toBeNull(); // Feb 31 never exists
+    expect(nextCronFireInTimezone('0 9 * * *', 'America/Sao_Paulo', from)?.toISOString())
+      .toBe('2026-07-02T12:00:00.000Z');
+    expect(nextCronFireInTimezone('0 9 * * *', 'Not/A_Timezone', from)).toBeNull();
   });
 
   it('describes common expressions', () => {

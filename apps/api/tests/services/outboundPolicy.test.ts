@@ -111,4 +111,21 @@ describe('OutboundPolicyService.evaluate', () => {
     expect(d).toMatchObject({ allow: false, needsApproval: false });
     expect(d.reason).toMatch(/blocked claim/i);
   });
+
+  it('applies autonomy modes and a per-Subject override', () => {
+    const appId = makeApp();
+    ctx.db.update(schema.apps).set({
+      policyJson: {
+        customCode: 'disabled', grants: [],
+        autonomy: {
+          mode: 'reply_only', actions: {},
+          subjectOverrides: { 'subject-vip': { mode: 'broad', actions: { cross_recipient: 'deny' } } },
+        },
+      },
+    }).where(eq(schema.apps.id, appId)).run();
+    const svc = new OutboundPolicyService({ db: ctx.db });
+    expect(svc.evaluateAutonomy(appId, 'proactive_followup', 'ordinary').decision).toBe('deny');
+    expect(svc.evaluateAutonomy(appId, 'proactive_followup', 'subject-vip').decision).toBe('allow');
+    expect(svc.evaluateAutonomy(appId, 'cross_recipient', 'subject-vip').decision).toBe('deny');
+  });
 });

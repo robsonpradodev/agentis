@@ -305,6 +305,33 @@ describe('/v1/mcp/rpc', () => {
     expect(body.error?.data?.code).toBe('TURN_CANCELLED');
   });
 
+  it('exposes and enforces the exact server-selected tool catalog for a native harness turn', async () => {
+    const conversationId = randomUUID();
+    const token = turnLeases.issue(ctx.workspace.id, conversationId, {
+      allowedToolIds: ['agentis.echo'],
+    });
+    const headers = {
+      'x-agentis-conversation': conversationId,
+      'x-agentis-turn-lease': token,
+    };
+    const listed = await rpc(app(), 'tools/list', undefined, 1, headers);
+    const names = ((await listed.json()) as { result: { tools: Array<{ name: string }> } }).result.tools.map((tool) => tool.name);
+    expect(names).toEqual(['agentis.echo']);
+
+    const allowed = await rpc(app(), 'tools/call', { name: 'agentis.echo', arguments: { safe: true } }, 2, headers);
+    expect((await allowed.json() as { result?: unknown }).result).toBeDefined();
+
+    const denied = await rpc(app(), 'tools/call', { name: 'agentis.mutate', arguments: {} }, 3, headers);
+    const deniedBody = await denied.json() as { error?: { data?: { code?: string } } };
+    expect(deniedBody.error?.data?.code).toBe('AUTH_FORBIDDEN');
+
+    const gatewayBypass = await rpc(app(), 'tools/call', {
+      name: 'agentis.tools.call', arguments: { name: 'agentis.mutate', arguments: {} },
+    }, 4, headers);
+    const bypassBody = await gatewayBypass.json() as { error?: { data?: { code?: string } } };
+    expect(bypassBody.error?.data?.code).toBe('AUTH_FORBIDDEN');
+  });
+
   it('propagates server-authored channel authority through an MCP-native tool call', async () => {
     const conversationId = randomUUID();
     const channelOrigin = {

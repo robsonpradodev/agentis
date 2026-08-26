@@ -225,6 +225,17 @@ export function ApprovalReviewModal({ approval, open, onClose, onResolved }: App
       await onResolved?.(approval, decision);
       onClose();
     } catch (err) {
+      // A candidate can be discarded between opening this dialog and clicking
+      // a decision. The API retires that approval as expired; refresh and
+      // close rather than leaving the operator with a misleading error.
+      if (isExpiredApprovalConflict(err)) {
+        await Promise.all([
+          refreshWorkspaceSnapshot(),
+          refreshWorkspaceChromeSnapshot(),
+        ]);
+        onClose();
+        return;
+      }
       setError(err instanceof Error ? err.message : 'Could not resolve approval.');
     } finally {
       setBusy(false);
@@ -613,6 +624,14 @@ function scalarText(value: unknown): string {
 
 function shortId(value: string): string {
   return value.length > 13 ? `${value.slice(0, 8)}…` : value;
+}
+
+function isExpiredApprovalConflict(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const value = error as { code?: unknown; message?: unknown };
+  return value.code === 'RESOURCE_CONFLICT'
+    && typeof value.message === 'string'
+    && value.message === 'Approval already expired';
 }
 
 

@@ -25,6 +25,7 @@ import { loadBaileys, silentBaileysLogger, type BaileysModule } from './whatsapp
 import {
   artifactIdFromRef,
   observedWhatsAppChatJid,
+  observedWhatsAppChatJids,
   resolveWhatsAppInboundBody,
   whatsappMediaContent,
   whatsappNativeContent,
@@ -78,13 +79,25 @@ export interface WhatsAppInbound {
   chatId: string; // the JID to reply to (key.remoteJid)
   body: string;
   from?: string;
+  /** Provider aliases for the same peer (for example PN + LID). */
+  alternateChatIds?: string[];
   /** Durable artifacts created from provider media. Kept typed through the turn. */
   attachmentIds?: string[];
+}
+
+export interface WhatsAppPeerObservation {
+  primaryChatId: string;
+  aliases: string[];
+  displayName?: string;
+  source: 'message' | 'contact' | 'lid_mapping';
+  verified: boolean;
 }
 
 export interface WhatsAppObservedOutbound {
   externalId: string;
   chatId: string;
+  /** Provider aliases for the same peer (for example PN + LID). */
+  alternateChatIds?: string[];
   body: string;
   attachmentIds?: string[];
 }
@@ -111,6 +124,8 @@ export interface WhatsAppSessionOptions {
   onInbound: (msg: WhatsAppInbound) => void;
   /** Mirror messages sent from the primary phone or another companion. */
   onOutboundObserved?: (msg: WhatsAppObservedOutbound) => void;
+  /** Provider directory updates used to canonicalize PN/LID/contact identities. */
+  onPeerObserved?: (peer: WhatsAppPeerObservation) => void;
   /** Silent, bounded bootstrap history. It never enters the live inbound callback. */
   onHistoryReconciled?: (messages: WhatsAppHistoryEntry[]) => void | Promise<void>;
   /** Notified whenever status/QR changes (for the login UI + DB status). */
@@ -202,6 +217,7 @@ export class WhatsAppSession {
   get qr(): string | undefined { return this.#qr; }
   get qrDataUrl(): string | undefined { return this.#qrDataUrl; }
   get selfId(): string | undefined { return this.#selfId; }
+  get recovery(): WhatsAppRecoveryState | undefined { return this.#recovery; }
 
   /**
    * Boot the socket. Idempotent while a start is in flight or the session is
@@ -668,6 +684,23 @@ export class WhatsAppSession {
       const status = String(event?.status ?? event ?? '').toLowerCase();
       if (status.includes('complete') || status.includes('pause')) void this.#flushHistory();
     });
+    historyEvents.on('contacts.upsert', (contacts) => {
+      for (const contact of Array.isArray(contacts) ? contacts : []) this.#observeContact(contact);
+    });
+    historyEvents.on('contacts.update', (contacts) => {
+      for (const contact of Array.isArray(contacts) ? contacts : []) this.#observeContact(contact);
+    });
+    historyEvents.on('lid-mapping.update', (mapping) => {
+      const rows = Array.isArray(mapping) ? mapping : [mapping];
+      for (const row of rows) {
+        const lid = firstProviderId(row, ['lid', 'lidJid', 'id']);
+        const pn = firstProviderId(row, ['pn', 'pnJid', 'phoneNumber']);
+        if (!lid || !pn) continue;
+        const aliases = observedWhatsAppChatJids({ remoteJid: lid, remoteJidAlt: pn });
+        if (aliases.length < 2) continue;
+        this.opts.onPeerObserved?.({ primaryChatId: aliases[0]!, aliases, source: 'lid_mapping', verified: true });
+      }
+    });
 
     // `sendMessage()` returning an id proves only local submission. These
     // provider events are the actual server/delivery/read acknowledgement.
@@ -812,9 +845,12 @@ export class WhatsAppSession {
         }
       }
       if (!this.#locallySubmittedMessageIds.has(externalId)) {
+        const alternateChatIds = observedWhatsAppChatJids(key).filter((candidate) => candidate !== chatId);
+        this.opts.onPeerObserved?.({ primaryChatId: chatId, aliases: [chatId, ...alternateChatIds], source: 'message', verified: alternateChatIds.length > 0 });
         this.opts.onOutboundObserved?.({
           externalId,
           chatId,
+          ...(alternateChatIds.length ? { alternateChatIds } : {}),
           body,
           ...(attachmentIds.length ? { attachmentIds: [...new Set(attachmentIds)] } : {}),
         });
@@ -846,6 +882,14 @@ export class WhatsAppSession {
     }
     const externalId = String(key.id ?? `${chatJid}:${msg.messageTimestamp ?? Date.now()}`);
     const from = msg.pushName ? String(msg.pushName) : undefined;
+    const aliases = observedWhatsAppChatJids(key);
+    this.opts.onPeerObserved?.({
+      primaryChatId: chatJid,
+      aliases,
+      ...(from ? { displayName: from } : {}),
+      source: 'message',
+      verified: aliases.length > 1,
+    });
 
     const attachmentIds: string[] = [];
     const body = await resolveWhatsAppInboundBody(msg, {
@@ -870,7 +914,26 @@ export class WhatsAppSession {
       chatId: chatJid,
       body,
       ...(from ? { from } : {}),
+      ...(aliases.length > 1 ? { alternateChatIds: aliases.filter((value) => value !== chatJid) } : {}),
       ...(attachmentIds.length ? { attachmentIds: [...new Set(attachmentIds)] } : {}),
+    });
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  #observeContact(contact: any): void {
+    const id = typeof contact?.id === 'string' ? contact.id : '';
+    if (!id || id === 'status@broadcast') return;
+    const pn = firstProviderId(contact, ['phoneNumber', 'pnJid', 'pn']);
+    const aliases = observedWhatsAppChatJids({ remoteJid: id, remoteJidAlt: pn });
+    if (aliases.length === 0) return;
+    const displayName = [contact?.verifiedName, contact?.name, contact?.notify]
+      .find((value) => typeof value === 'string' && value.trim());
+    this.opts.onPeerObserved?.({
+      primaryChatId: aliases[0]!,
+      aliases,
+      ...(displayName ? { displayName: String(displayName).trim() } : {}),
+      source: 'contact',
+      verified: Boolean(contact?.verifiedName || aliases.length > 1),
     });
   }
 
@@ -993,4 +1056,18 @@ export class WhatsAppSession {
       ...(this.#recovery ? { recovery: this.#recovery } : {}),
     });
   }
+}
+
+function firstProviderId(value: unknown, keys: string[]): string {
+  if (!value || typeof value !== 'object') return '';
+  const record = value as Record<string, unknown>;
+  for (const key of keys) {
+    const candidate = record[key];
+    if (typeof candidate !== 'string' || !candidate.trim()) continue;
+    const clean = candidate.trim().replace(/:\d+@/u, '@');
+    if (clean.includes('@')) return clean;
+    const digits = clean.replace(/\D/g, '');
+    if (digits) return `${digits}@s.whatsapp.net`;
+  }
+  return '';
 }

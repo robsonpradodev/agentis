@@ -53,6 +53,16 @@ function isDeliveryNode(node: WorkflowNode): boolean {
   return false;
 }
 
+function looksLikeAgentOwnedDelivery(node: WorkflowNode): boolean {
+  if (kindOf(node) !== 'agent_task' && kindOf(node) !== 'agent_session') return false;
+  const cfg = node.config as unknown as Record<string, unknown>;
+  const outputKeys = Array.isArray(cfg.outputKeys) ? cfg.outputKeys.map((key) => String(key).toLowerCase()) : [];
+  const hasReceiptContract = outputKeys.some((key) => /provider.?ack|delivery|message.?id|sent.?count/.test(key));
+  const instruction = `${node.title}\n${String(cfg.prompt ?? '')}`;
+  const namesDelivery = /\b(?:send|deliver|dispatch|publish|post|outreach|whatsapp|telegram|slack|discord|email|enviar|envie|mensagem|mensaje|correo)\b/i.test(instruction);
+  return hasReceiptContract && namesDelivery;
+}
+
 /** Backward reachability: the set of node ids that can reach `targetId` (its ancestors). */
 function ancestorsOf(targetId: string, edges: WorkflowGraph['edges']): Set<string> {
   const incoming = new Map<string, string[]>();
@@ -87,6 +97,24 @@ export function auditWorkflowRobustness(
 
   const has = (kind: string) => kinds.includes(kind);
   const recurring = classification.triggerType === 'cron' || classification.triggerType === 'persistent_listener';
+
+  // ── D0: real-world delivery must be represented by a native executable node.
+  // An agent may choose/compose WHAT to send, but an agent_task claiming its own
+  // provider acknowledgement is neither deterministic nor independently
+  // observable. This exact shape caused a successful WhatsApp delivery to spend
+  // 30 minutes in a coding harness and then be reported as unaccomplished.
+  if (!nodes.some(isDeliveryNode)) {
+    const disguisedDelivery = nodes.find(looksLikeAgentOwnedDelivery);
+    if (disguisedDelivery) {
+      warnings.push({
+        code: 'MISSING_DELIVERY_SINK',
+        nodeId: disguisedDelivery.id,
+        message:
+          `${disguisedDelivery.title}: this agent step is responsible for an external delivery and its receipt, but the graph has no native channel/integration delivery node. `
+          + 'Keep agent judgment in an upstream agent_task, then execute the send with a channel or integration node and verify that node\'s durable receipt.',
+      });
+    }
+  }
 
   // ── D4: recurring workflow that accumulates work but keeps no state → no dedup,
   //        re-processes everything every run. Iron Rule 13, now enforced. ──

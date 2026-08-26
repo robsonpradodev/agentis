@@ -101,6 +101,28 @@ describe('ClaudeCodeAdapter chat', () => {
     expect(deltas.at(-1)).toEqual({ type: 'done', finishReason: 'tool_calls' });
   });
 
+  it('does not mount Agentis MCP when the workflow caller owns the tool loop', async () => {
+    const child = fakeChildProcess();
+    spawnMock.mockReturnValue(child);
+    const adapter = new ClaudeCodeAdapter({
+      agentId: 'agent-1', logger, binaryPath: 'claude-test',
+      mcpServers: [{ name: 'agentis', url: 'http://127.0.0.1:3737/mcp', headers: {} }],
+    });
+    const consume = collectDeltas(adapter.chat(
+      [{ role: 'user', content: 'Query leads.' }],
+      [{ name: 'agentis.data.query', description: 'Query data', parameters: { type: 'object' } }],
+      { toolMode: 'caller_loop', transportRecovery: 'capability_preserving' },
+    ));
+    child.stdout.write('{"type":"result","result":"ok"}\n');
+    child.emit('exit', 0);
+    await consume;
+
+    const args = spawnMock.mock.calls[0]![1] as string[];
+    expect(args.some((arg) => /mcp-config/i.test(arg))).toBe(false);
+    expect(child.stdinChunks.join('')).toContain('agentis.data.query');
+    expect(child.stdinChunks.join('')).toContain('AGENTIS_TOOL_CALL');
+  });
+
   it('marks the Agentis system identity block as authoritative over Claude defaults', async () => {
     const child = fakeChildProcess();
     spawnMock.mockReturnValue(child);

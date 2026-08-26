@@ -151,7 +151,7 @@ export class ApprovalInboxService {
   }
 
   list(workspaceId: string, status: 'pending' | 'all' = 'pending'): PresentedApproval[] {
-    this.#expireTerminalRunApprovals(workspaceId);
+    this.#expireNonActionableApprovals(workspaceId);
     const rows = this.db
       .select()
       .from(schema.approvalRequests)
@@ -164,7 +164,7 @@ export class ApprovalInboxService {
   }
 
   get(workspaceId: string, approvalId: string): PresentedApproval | null {
-    this.#expireTerminalRunApprovals(workspaceId);
+    this.#expireNonActionableApprovals(workspaceId);
     const row = this.db
       .select()
       .from(schema.approvalRequests)
@@ -175,6 +175,18 @@ export class ApprovalInboxService {
 
   countActionable(workspaceId: string): number {
     return this.list(workspaceId, 'pending').length;
+  }
+
+  /**
+   * An approval is only useful while the resource it authorizes is still the
+   * current decision point. Most approvals are attached to a run, but revision
+   * promotion approvals deliberately are not: their delivery run may finish
+   * while the operator decides. Reconcile both kinds before every inbox read
+   * so an abandoned/superseded candidate can never remain actionable.
+   */
+  #expireNonActionableApprovals(workspaceId: string): void {
+    this.#expireTerminalRunApprovals(workspaceId);
+    this.#expireStaleWorkflowRevisionApprovals(workspaceId);
   }
 
   #expireTerminalRunApprovals(workspaceId: string): void {
@@ -204,6 +216,71 @@ export class ApprovalInboxService {
     }
   }
 
+  #expireStaleWorkflowRevisionApprovals(workspaceId: string): void {
+    const pending = this.db.select().from(schema.approvalRequests).where(and(
+      eq(schema.approvalRequests.workspaceId, workspaceId),
+      eq(schema.approvalRequests.status, 'pending'),
+      eq(schema.approvalRequests.source, 'workflow_revision'),
+    )).all();
+
+    for (const approval of pending) {
+      const payload = asRecord(approval.payload);
+      const payloadWorkspaceId = stringValue(payload.workspaceId);
+      const workflowId = stringValue(payload.workflowId);
+      const revisionId = stringValue(payload.revisionId);
+      const semanticHash = stringValue(payload.semanticHash);
+      const expectedActiveRevisionId = stringValue(payload.expectedActiveRevisionId);
+      const workflow = workflowId
+        ? this.db.select({
+          activeRevisionId: schema.workflows.activeRevisionId,
+          candidateRevisionId: schema.workflows.candidateRevisionId,
+        }).from(schema.workflows).where(and(
+          eq(schema.workflows.id, workflowId),
+          eq(schema.workflows.workspaceId, workspaceId),
+        )).get()
+        : null;
+      const revision = workflow && workflowId && revisionId
+        ? this.db.select({ status: schema.workflowGraphRevisions.status, semanticHash: schema.workflowGraphRevisions.semanticHash })
+          .from(schema.workflowGraphRevisions).where(and(
+            eq(schema.workflowGraphRevisions.id, revisionId),
+            eq(schema.workflowGraphRevisions.workflowId, workflowId),
+            eq(schema.workflowGraphRevisions.workspaceId, workspaceId),
+          )).get()
+        : null;
+
+      const reason = !payloadWorkspaceId || payloadWorkspaceId !== workspaceId || !workflowId || !revisionId || !semanticHash || !expectedActiveRevisionId
+        ? 'Workflow revision approval payload is incomplete.'
+        : !workflow
+          ? 'Workflow no longer exists.'
+          : !revision
+            ? 'Workflow revision no longer exists.'
+            : workflow.candidateRevisionId !== revisionId
+              ? 'Workflow revision is no longer the current candidate.'
+              : workflow.activeRevisionId !== expectedActiveRevisionId
+                ? 'The workflow active revision changed before approval.'
+                : revision.status !== 'candidate'
+                  ? `Workflow revision is no longer a candidate (status ${revision.status}).`
+                  : revision.semanticHash !== semanticHash
+                    ? 'Workflow revision no longer matches the reviewed hash.'
+                    : null;
+      if (reason) this.#expireApproval(approval, reason);
+    }
+  }
+
+  #expireApproval(approval: ApprovalRow, resolutionReason: string): void {
+    const resolvedAt = new Date().toISOString();
+    this.db.update(schema.approvalRequests).set({
+      status: 'expired',
+      resolvedAt,
+      resolutionReason,
+    }).where(eq(schema.approvalRequests.id, approval.id)).run();
+    this.bus.publish(REALTIME_ROOMS.workspace(approval.workspaceId), REALTIME_EVENTS.APPROVAL_RESOLVED, {
+      id: approval.id,
+      status: 'expired',
+      resolvedAt,
+    });
+  }
+
   async resolve(args: {
     workspaceId: string;
     approvalId: string;
@@ -215,6 +292,10 @@ export class ApprovalInboxService {
     feedback?: string;
     resolvedByUserId?: string | null;
   }) {
+    // The operator may have opened a review just before a workflow candidate
+    // was discarded. Reconcile again at the write boundary, not only on list,
+    // so that click turns into a clean expired state instead of a handler error.
+    this.#expireNonActionableApprovals(args.workspaceId);
     const row = this.db
       .select()
       .from(schema.approvalRequests)
@@ -414,6 +495,10 @@ function isRunResumingApproval(source: string): boolean {
 
 function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+function stringValue(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() ? value : null;
 }
 
 function findWorkflowGraphNode(graph: unknown, nodeId: string): Record<string, unknown> | null {

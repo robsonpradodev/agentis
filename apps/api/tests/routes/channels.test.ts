@@ -18,6 +18,8 @@ import { createTestContext, type TestContext } from '../_helpers/createTestConte
 import type { ChannelAdapter, ParsedInboundMessage } from '../../src/adapters/channels/types.js';
 import type { TriggerRuntime } from '../../src/engine/TriggerRuntime.js';
 import { SlackChannelAdapter } from '../../src/adapters/channels/slack.js';
+import { ChannelIdentityService } from '../../src/services/conversation/channelIdentityService.js';
+import { ChannelInboxService } from '../../src/services/conversation/channelInboxService.js';
 
 class StubAdapter implements ChannelAdapter {
   readonly kind = 'telegram' as const;
@@ -43,6 +45,8 @@ let ctx: TestContext;
 let bridge: ChannelBridge;
 let adapter: StubAdapter;
 let connectionGrants: ConnectionGrantService;
+let identity: ChannelIdentityService;
+let inbox: ChannelInboxService;
 
 function seedAgent() {
   const id = randomUUID();
@@ -62,7 +66,7 @@ function seedAgent() {
 
 function app() {
   return ctx.buildApp([
-    { path: '/v1/channels', app: buildChannelRoutes({ db: ctx.db, auth: ctx.auth, bridge, connectionGrants }) },
+    { path: '/v1/channels', app: buildChannelRoutes({ db: ctx.db, auth: ctx.auth, bridge, connectionGrants, identity, inbox }) },
     {
       path: '/v1/webhooks',
       app: buildWebhookRoutes({
@@ -88,6 +92,7 @@ beforeEach(async () => {
   ctx = await createTestContext();
   adapter = new StubAdapter();
   const conversations = new ConversationStore({ db: ctx.db, bus: ctx.bus });
+  identity = new ChannelIdentityService({ db: ctx.db, logger: ctx.logger });
   bridge = new ChannelBridge({
     db: ctx.db,
     vault: ctx.vault,
@@ -95,8 +100,10 @@ beforeEach(async () => {
     bus: ctx.bus,
     logger: ctx.logger,
     adapters: { telegram: adapter, slack: new SlackChannelAdapter() },
+    identity,
   });
   connectionGrants = new ConnectionGrantService(ctx.db);
+  inbox = new ChannelInboxService({ db: ctx.db, identities: identity });
 });
 
 afterEach(() => ctx.close());
@@ -370,6 +377,67 @@ describe('PATCH /v1/channels/:id/targets', () => {
     expect(body.connection.defaultChatId).toBe('777');
     expect(body.connection.targetAliases.work).toBe('888');
     expect(JSON.stringify(body)).not.toContain('tok');
+  });
+
+  it('materializes owner authority at the authenticated configuration boundary', async () => {
+    bridge.setPersistentTransport(fakePersistentTransport());
+    const agentId = seedAgent();
+    const { connection } = bridge.create({
+      workspaceId: ctx.workspace.id, ambientId: null, userId: ctx.user.id,
+      agentId, kind: 'whatsapp', name: 'wa owner',
+    });
+    const res = await app().request(`/v1/channels/${connection.id}/targets`, {
+      method: 'PATCH',
+      headers: ctx.authHeaders,
+      body: JSON.stringify({ ownerChatId: '+55 31 7144-3148', ownerName: 'Robson' }),
+    });
+    expect(res.status).toBe(200);
+    expect(identity.principal({
+      workspaceId: ctx.workspace.id,
+      connectionId: connection.id,
+      channelKind: 'whatsapp',
+      handle: '553171443148@s.whatsapp.net',
+    })).toMatchObject({ role: 'owner', verified: true, displayName: 'Robson' });
+  });
+});
+
+describe('GET /v1/channels/inbox/resolve', () => {
+  it('resolves the latest direct inbound contact to an opaque recipient reference', async () => {
+    const agentId = seedAgent();
+    const { connection } = bridge.create({
+      workspaceId: ctx.workspace.id, ambientId: null, userId: ctx.user.id,
+      agentId, kind: 'telegram', name: 'tg inbox', token: 'tok',
+    });
+    const peer = identity.observeAliases({
+      workspaceId: ctx.workspace.id,
+      connectionId: connection.id,
+      channelKind: 'telegram',
+      primaryHandle: '777',
+      displayName: 'Latest lead',
+      source: 'test',
+      countMessage: true,
+    });
+    const conversation = new ConversationStore({ db: ctx.db, bus: ctx.bus }).getOrCreateByChannel({
+      workspaceId: ctx.workspace.id, ambientId: null, userId: ctx.user.id, agentId,
+      channelConnectionId: connection.id, channelChatId: '777', channelPeerIdentityId: peer.id,
+    });
+    new ConversationStore({ db: ctx.db, bus: ctx.bus }).appendReconciledChannelMessage({
+      workspaceId: ctx.workspace.id,
+      conversationId: conversation.id,
+      sessionMessageId: 'last-inbound-route',
+      body: 'hello',
+      participantSide: 'customer',
+      occurredAt: new Date().toISOString(),
+    });
+    const res = await app().request(`/v1/channels/inbox/resolve?connectionId=${connection.id}&selector=last_inbound`, {
+      headers: ctx.authHeaders,
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({
+      resolved: true,
+      peer: { recipientRef: `peer:${peer.id}`, displayName: 'Latest lead' },
+      to: '777',
+    });
   });
 });
 

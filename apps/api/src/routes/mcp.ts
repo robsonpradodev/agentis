@@ -165,6 +165,15 @@ export function buildMcpRoutes(deps: McpRoutesDeps) {
     const id = body.id ?? null;
 
     try {
+      const conversationId = c.req.header(CONVERSATION_ID_HEADER)?.trim();
+      const turnLease = c.req.header(TURN_LEASE_HEADER)?.trim();
+      if (Boolean(conversationId) !== Boolean(turnLease)) {
+        throw new AgentisError('TURN_CANCELLED', 'Incomplete conversation turn capability. The tool was not executed.');
+      }
+      const leaseContext = conversationId && turnLease && deps.turnLeases
+        ? deps.turnLeases.context(ws.workspaceId, conversationId, turnLease)
+        : undefined;
+      const allowedToolIds = leaseContext?.allowedToolIds ? new Set(leaseContext.allowedToolIds) : null;
       switch (body.method) {
         case 'initialize':
           return c.json(rpcResult(id, {
@@ -191,22 +200,30 @@ export function buildMcpRoutes(deps: McpRoutesDeps) {
           if (!contents) return c.json(rpcError(id, -32602, `Unknown resource '${params.uri}'`));
           return c.json(rpcResult(id, contents));
         }
-        case 'tools/list':
-          return c.json(rpcResult(id, { tools: collectMcpTools(deps, ws.workspaceId).map(toMcpDescriptor) }));
+        case 'tools/list': {
+          // A conversation lease already carries the exact catalog selected by
+          // ChatSessionExecutor. Native harnesses need those real schemas (not
+          // the generic progressive-disclosure gateway), and must see nothing
+          // outside that set. Unleased integrations retain the compact gateway.
+          const visible = allowedToolIds
+            ? allMcpOperations(deps, ws.workspaceId).filter((tool) => allowedToolIds.has(tool.name))
+            : collectMcpTools(deps, ws.workspaceId);
+          return c.json(rpcResult(id, { tools: visible.map(toMcpDescriptor) }));
+        }
         case 'tools/call': {
           const params = (body.params ?? {}) as { name?: string; arguments?: Record<string, unknown> };
           if (!params.name) return c.json(rpcError(id, -32602, 'tools/call requires params.name'));
-          const conversationId = c.req.header(CONVERSATION_ID_HEADER)?.trim();
-          const turnLease = c.req.header(TURN_LEASE_HEADER)?.trim();
-          if (Boolean(conversationId) !== Boolean(turnLease)) {
-            throw new AgentisError('TURN_CANCELLED', 'Incomplete conversation turn capability. The tool was not executed.');
+          const effectiveToolName = params.name === 'agentis.tools.call' && typeof params.arguments?.name === 'string'
+            ? params.arguments.name : params.name;
+          if (allowedToolIds && !allowedToolIds.has(effectiveToolName)) {
+            throw new AgentisError('AUTH_FORBIDDEN', `Tool '${effectiveToolName}' is outside this turn's bounded capability set.`);
           }
           let turnSignal: AbortSignal | undefined;
           let channelOrigin: ChannelToolOrigin | undefined;
           if (conversationId && turnLease) {
             if (!deps.turnLeases) throw new AgentisError('TURN_CANCELLED', 'Conversation turn capability enforcement is unavailable. The tool was not executed.');
             turnSignal = deps.turnLeases.assertActive(ws.workspaceId, conversationId, turnLease);
-            channelOrigin = deps.turnLeases.context(ws.workspaceId, conversationId, turnLease)?.channelOrigin;
+            channelOrigin = leaseContext?.channelOrigin;
           }
           const startedAt = Date.now();
           const result = await callMcpTool(

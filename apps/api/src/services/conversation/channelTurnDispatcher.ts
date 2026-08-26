@@ -43,6 +43,10 @@ import { isAcknowledgedChannelDelivery, type ChannelDeliveryReceipt, type Outbou
 import { resolveWhatsAppConnectionProfile } from './channelBridge.js';
 import { channelModelRole } from './channelConversationRole.js';
 import type { ConversationHandoffService, ConversationHandoffSnapshot } from './conversationHandoffService.js';
+import type { RelationshipStateService } from '../relationshipStateService.js';
+import type { ChannelUtteranceBatchStore } from './channelUtteranceBatchStore.js';
+import type { ChannelInboxService } from './channelInboxService.js';
+import type { ChannelActionIntentService } from './channelActionIntentService.js';
 
 /** Channel activity is never a chat message unless it is this verified-owner indicator. */
 export type ChannelDeliveryClass = 'internal' | 'owner_reasoning_indicator' | 'reply';
@@ -78,8 +82,16 @@ export interface ChannelTurnDispatcherDeps {
   fallbackAdapter?: () => AgentAdapter | undefined;
   /** Cross-surface peer identity — records senders and recalls them (§5.2). */
   identity?: ChannelIdentityService;
+  /** Canonical, read-only inbox view for owner control turns. */
+  inbox?: ChannelInboxService;
+  /** Durable goal-scoped outbound actions. */
+  channelActions?: ChannelActionIntentService;
   /** App relationship entity — upserts/touches a contact for App-bound turns (Phase 3). */
   contacts?: AppContactService;
+  /** Canonical per-principal Subject state; contacts remain a UI/query projection. */
+  relationships?: RelationshipStateService;
+  /** Restart-durable provider-bubble assembler. */
+  utterances?: ChannelUtteranceBatchStore;
   /**
    * Long-horizon per-conversation memory (G4). When wired, the dispatcher folds
    * turns that scroll out of the live window into a rolling "state of this
@@ -172,6 +184,8 @@ interface PendingBatch {
   ids: Set<string>;
   attachmentIds: Set<string>;
   timer: ReturnType<typeof setTimeout>;
+  firstReceivedAt: number;
+  durableBatchId?: string;
 }
 
 interface ActiveChannelTurn {
@@ -192,6 +206,42 @@ interface ActiveChannelTurn {
 
 const CONFIRM_TTL_MS = 5 * 60 * 1000;
 const OWNER_REASONING_INDICATOR_DELAY_MS = 7_000;
+
+/**
+ * A resident worker answers its own relationship; it does not become a second
+ * workspace control plane merely because an operator is speaking to it. The
+ * registry enforces this allow-list as well as hiding the other tools from the
+ * model, so progressive-disclosure gateways cannot bypass the boundary.
+ */
+const BOUNDED_CHANNEL_AGENT_TOOLS = [
+  'agentis.brain.search',
+  'agentis.skill.load',
+  'agentis.skills.list',
+  'agentis.knowledge.search',
+  'agentis.channel.send',
+  'agentis.channel.inbox',
+  'agentis.channel.action.create',
+  'agentis.channel.action.list',
+  'agentis.channel.action.cancel',
+  'agentis.channel.capabilities',
+  'agentis.channel.react',
+  'agentis.channel.typing',
+  'agentis.media.capabilities',
+  'agentis.media.generate',
+  'agentis.subject.get',
+  'agentis.subject.post',
+  'agentis.subject.update_relationship',
+  'agentis.conversation.flag_needs_attention',
+] as const;
+
+const APP_RELATIONSHIP_TOOLS = [
+  'agentis.data.query',
+  'agentis.data.insert',
+  'agentis.data.upsert',
+  'agentis.data.update',
+  'agentis.data.batch',
+  'agentis.data.promote_memory',
+] as const;
 
 interface OwnerReasoningIndicatorState {
   cancelled: boolean;
@@ -235,6 +285,10 @@ export interface ChannelTurnInput {
   turnGeneration?: number;
   /** Ownership version captured before this automated turn began. */
   automationEpoch?: number;
+  /** Distinguishes a human inbound from a Subject wake reaching out first. */
+  initiatedBy?: 'inbound' | 'proactive';
+  /** Canonical relationship Subject for proactive wakes and continuity. */
+  subjectId?: string;
 }
 
 const HISTORY_LIMIT = 20;
@@ -313,18 +367,19 @@ export class ChannelTurnDispatcher {
    * fire-and-forget exactly as before. Fire-and-forget safe — never throws.
    */
   async dispatch(input: ChannelTurnInput): Promise<{ replied: boolean; reason?: string }> {
+    const proactive = input.initiatedBy === 'proactive';
     // Operator block gate: a blocked sender is fully silent — no subject routing,
     // no agent turn, no reply. Cheap single-row lookup on the same handle the
     // identity table shows. (Same handle rule as #recordIdentity below.)
-    if (this.deps.identity && !this.#configuredOwnerOperator(input)) {
+    if (!proactive && this.deps.identity && !this.#isOwnerControlPeer(input)) {
       const handle = (input.kind === 'slack' || input.kind === 'discord') ? (input.from ?? input.chatId) : input.chatId;
-      if (this.deps.identity.isBlocked(input.workspaceId, input.kind, handle)) {
+      if (this.deps.identity.isBlocked(input.workspaceId, input.kind, handle, input.connectionId)) {
         return { replied: false, reason: 'blocked' };
       }
     }
     // §3.2 — hand the inbound to any Subject awaiting this channel correlation (best-effort).
     try {
-      this.deps.onInbound?.({ workspaceId: input.workspaceId, connectionId: input.connectionId, chatId: input.chatId, ...(input.from ? { from: input.from } : {}), ...(input.text ? { text: input.text } : {}) });
+      if (!proactive) this.deps.onInbound?.({ workspaceId: input.workspaceId, connectionId: input.connectionId, chatId: input.chatId, ...(input.from ? { from: input.from } : {}), ...(input.text ? { text: input.text } : {}) });
     } catch { /* never let subject routing break a channel turn */ }
     this.#publishWorkStep(input, null, {
       phase: 'received',
@@ -342,14 +397,38 @@ export class ChannelTurnDispatcher {
         ...(input.attachmentIds?.length ? { attachments: input.attachmentIds } : {}),
       });
       active.mailbox.push({ input, queueId: queued.id });
-      return this.#replyAlongsideActiveTurn(input, active, queued.id);
+      // Ordinary bubbles are continuation fragments for the active cognition
+      // lane. Only an unmistakable status request opens a companion response;
+      // this prevents one bot-like answer per provider bubble.
+      if (isExplicitActiveStatusRequest(input.text)) {
+        return this.#replyAlongsideActiveTurn(input, active, queued.id);
+      }
+      return { replied: false, reason: 'joined_active_turn' };
     }
     input = this.#acceptInbound(input);
-    const windowMs = this.deps.debounceMs ?? 0;
+    const windowMs = proactive ? 0 : (this.deps.debounceMs ?? 0);
     if (windowMs <= 0) {
       return this.#commitTurn(input, input.inboundMessageId ? [input.inboundMessageId] : []);
     }
     const key = `${input.connectionId}:${input.chatId}`;
+    if (this.deps.utterances) {
+      const priorCount = this.#batches.get(key)?.texts.length ?? 0;
+      const quietMs = priorCount > 0 && windowMs >= 1_000 ? Math.max(windowMs, 1_800) : windowMs;
+      const durable = this.deps.utterances.append(input, quietMs);
+      const existingTimer = this.#batches.get(key);
+      if (existingTimer) clearTimeout(existingTimer.timer);
+      const delay = Math.max(0, Date.parse(durable.softDeadlineAt) - Date.now());
+      this.#batches.set(key, {
+        latest: durable.input,
+        texts: durable.input.text.split('\n'),
+        ids: new Set(durable.messageIds),
+        attachmentIds: new Set(durable.attachmentIds),
+        timer: setTimeout(() => { void this.#flushBatch(key); }, delay),
+        firstReceivedAt: Date.parse(durable.hardDeadlineAt) - 8_000,
+        durableBatchId: durable.id,
+      });
+      return { replied: false, reason: 'batched' };
+    }
     const existing = this.#batches.get(key);
     if (existing) {
       existing.texts.push(input.text);
@@ -357,7 +436,9 @@ export class ChannelTurnDispatcher {
       for (const artifactId of input.attachmentIds ?? []) existing.attachmentIds.add(artifactId);
       existing.latest = input;
       clearTimeout(existing.timer);
-      existing.timer = setTimeout(() => this.#flushBatch(key), windowMs);
+      const hardRemaining = Math.max(0, 8_000 - (Date.now() - existing.firstReceivedAt));
+      const quietWindow = Math.min(existing.texts.length > 1 && windowMs >= 1_000 ? Math.max(windowMs, 1_800) : windowMs, hardRemaining);
+      existing.timer = setTimeout(() => this.#flushBatch(key), quietWindow);
       return { replied: false, reason: 'batched' };
     }
     const ids = new Set<string>();
@@ -368,14 +449,27 @@ export class ChannelTurnDispatcher {
       ids,
       attachmentIds: new Set(input.attachmentIds ?? []),
       timer: setTimeout(() => this.#flushBatch(key), windowMs),
+      firstReceivedAt: Date.now(),
     });
     return { replied: false, reason: 'batched' };
   }
 
-  #flushBatch(key: string): void {
+  async #flushBatch(key: string): Promise<void> {
     const batch = this.#batches.get(key);
     if (!batch) return;
     this.#batches.delete(key);
+    if (batch.durableBatchId && this.deps.utterances) {
+      const claimed = this.deps.utterances.claim(batch.durableBatchId);
+      if (!claimed) return;
+      try {
+        await this.#commitTurn(claimed.input, claimed.messageIds);
+        this.deps.utterances.complete(claimed.id);
+      } catch (err) {
+        this.deps.utterances.retry(claimed.id);
+        this.deps.logger.warn('channel.turn.durable_utterance_failed', { batchId: claimed.id, err: (err as Error).message });
+      }
+      return;
+    }
     const combined: ChannelTurnInput = {
       ...batch.latest,
       text: batch.texts.join('\n'),
@@ -457,7 +551,7 @@ export class ChannelTurnDispatcher {
     let ownership = this.deps.handoffs?.current(input.workspaceId, input.conversationId);
     // The configured operator channel is a permanent live control conversation.
     // Any old/manual handoff is stale here, regardless of where it originated.
-    if (ownership?.state === 'human' && this.#configuredOwnerOperator(input)) {
+    if (ownership?.state === 'human' && this.#isOwnerControlPeer(input)) {
       ownership = this.deps.handoffs?.releaseToAgent(input.workspaceId, input.conversationId);
     }
     if (ownership?.state === 'human') return { replied: false, reason: 'human_handling' };
@@ -467,10 +561,10 @@ export class ChannelTurnDispatcher {
     if (!active) return { replied: false, reason: 'superseded' };
     let turnLease: string | undefined;
     try {
-      // App relationship (Phase 3): record/refresh the contact for this inbound,
-      // so the App's pipeline + lastTouch clock stay current with zero agent effort.
-      // The contact id also scopes this turn's brain recall to THIS customer (G11).
-      const contactId = this.#touchContact(input);
+      // Record identity before any authority or relationship decision. This is
+      // connection-scoped, so an address on another account cannot inherit trust.
+      const proactive = input.initiatedBy === 'proactive';
+      const senderSummary = proactive ? null : this.#recordIdentity(input);
       // Operator takeover (Living Apps Phase 2): a human is driving this thread, so
       // the resident agent stays quiet. The inbound message is already mirrored for
       // the operator to answer; do not auto-reply.
@@ -489,10 +583,15 @@ export class ChannelTurnDispatcher {
       // operator opted into that; an allowed non-owner carries the operator's
       // free-text rules into the turn as guidance (below).
       const configuredOperator = this.#configuredOwnerOperator(input);
-      const resolvedAccess: AccessDecision = configuredOperator
+      const verifiedAuthority = proactive ? null : this.#verifiedAuthority(input);
+      const resolvedAccess: AccessDecision = proactive
+        ? { allow: true, isOwner: false, who: input.from?.trim() ?? input.chatId }
+        : verifiedAuthority
+          ? { allow: true, isOwner: verifiedAuthority === 'owner', who: input.from?.trim() ?? input.chatId }
+        : configuredOperator
         ? { allow: true, isOwner: false, who: configuredOperator.name ?? input.from?.trim() ?? input.chatId }
         : this.#resolveAccess(input);
-      const ownerVerified = this.#isVerifiedConnectionOwner(input);
+      const ownerVerified = !proactive && this.#isVerifiedConnectionOwner(input);
       // A saved default recipient is a routing convenience, never identity
       // evidence. Until the exact peer is explicitly linked to the owner, it
       // receives external-sender authority even if access rules call it owner.
@@ -511,11 +610,16 @@ export class ChannelTurnDispatcher {
         if (access.deny === 'decline') await this.#persistAndDeliver(input, UNKNOWN_SENDER_DECLINE);
         return { replied: access.deny === 'decline', reason: 'not_authorized' };
       }
+      // Owners/delegates control the agent; external principals become durable
+      // relationship Subjects and (for Apps) contact projections.
+      const contactId = proactive ? this.#contactIdForSubject(input.subjectId) : ownerVerified ? null : this.#touchContact(input);
+      const relationship = proactive ? null : this.#touchRelationship(input, contactId);
+      const subjectId = input.subjectId ?? relationship?.subject.id ?? null;
       // Conversation State Machine (GAP B1/B3): if the App has a script that owns
       // this contact, it advances the stage (deterministic where scripted — ZERO
       // tokens) and we do NOT run a general agent turn. This is the primitive for
       // "send → await their reply → branch → run a workflow → stop".
-      if (this.deps.conversation && input.appId) {
+      if (!proactive && this.deps.conversation && input.appId) {
         const advanced = await this.deps.conversation.handleInbound({
           workspaceId: input.workspaceId,
           appId: input.appId,
@@ -539,6 +643,23 @@ export class ChannelTurnDispatcher {
       // else the primary agent participant, else conversations.agentId (back-compat).
       // The primary is seeded idempotently from conversations.agentId on the way in.
       const responderAgentId = this.#resolveResponder(input);
+      const responderRole = this.#agentRole(input.workspaceId, responderAgentId);
+      const allowedToolIds = this.#channelToolScope({
+        role: responderRole,
+        ownerVerified,
+        appBound: Boolean(input.appId),
+      });
+      const immediateCorrectionId = ownerVerified
+        ? this.deps.memoryCapture?.captureImmediateCorrection({
+            workspaceId: input.workspaceId,
+            conversationId: input.conversationId,
+            userId: input.userId,
+            agentId: responderAgentId,
+            userDisplayName: input.from ?? null,
+            userMessage: input.text,
+            senderTrust: 'owner',
+          }) ?? null
+        : null;
       const adapter = this.#resolveAdapter(responderAgentId, input.workspaceId);
       if (!adapter) {
         this.#publishWorkStep(input, clientTurnId, {
@@ -577,6 +698,32 @@ export class ChannelTurnDispatcher {
       const pending = this.#takeFreshPending(pendingKey);
       // A mode command is never a yes/no answer to a pending confirmation.
       const decision = pending && !modeCommand ? interpretConfirmation(input.text) : null;
+      const durableDecision = !pending && !modeCommand && ownerVerified ? interpretConfirmation(input.text) : null;
+      if (durableDecision !== null && this.deps.channelActions && this.deps.identity) {
+        const principal = this.deps.identity.principal({
+          workspaceId: input.workspaceId,
+          connectionId: input.connectionId,
+          channelKind: input.kind,
+          handle: input.chatId,
+        });
+        if (principal.identityId) {
+          const action = await this.deps.channelActions.confirmLatestForRequester(
+            input.workspaceId,
+            principal.identityId,
+            durableDecision ? 'approve' : 'reject',
+            input.userId,
+          );
+          if (action) {
+            const acknowledgement = action.status === 'delivered'
+              ? `Sent to the requested contact.`
+              : action.status === 'cancelled'
+                ? `Cancelled the pending message.`
+                : `The message action is now ${action.status}${action.lastError ? `: ${action.lastError}` : '.'}`;
+            await this.#persistAndDeliver(input, acknowledgement);
+            return { replied: true, reason: 'durable_action_confirmation' };
+          }
+        }
+      }
 
       const channelOrigin: ChannelToolOrigin = {
         kind: input.kind,
@@ -590,7 +737,7 @@ export class ChannelTurnDispatcher {
           return explicitRecipients.length ? { explicitRecipients } : {};
         })(),
       };
-      turnLease = ChatSessionExecutor.issueTurnLease(input.workspaceId, input.conversationId, { channelOrigin });
+      turnLease = ChatSessionExecutor.issueTurnLease(input.workspaceId, input.conversationId, { channelOrigin, ...(allowedToolIds ? { allowedToolIds } : {}) });
       active.turnLease = turnLease;
 
       let stream: AsyncIterable<import('@agentis/core').ChatDelta>;
@@ -627,8 +774,13 @@ export class ChannelTurnDispatcher {
           executionMode: permissionMode === 'plan' ? 'plan' : 'chat',
           permissionMode,
           approvalSensitivity,
+          ...(allowedToolIds ? { allowedToolIds } : {}),
           ...(turnLease ? { turnLease } : {}),
           channelOrigin,
+          // Messaging is an interactive surface: the person is already staring
+          // at "typing…". Route adapters through their low-latency policy and
+          // avoid deep/background transport probes before every reply.
+          qualityMode: 'quick',
           maxTurns: 8,
           viewport: null,
           signal: active.controller.signal,
@@ -636,7 +788,6 @@ export class ChannelTurnDispatcher {
           // enough to be uploaded to that channel after the tool returns.
           artifactPolicy: { mode: 'intentional', saveScreenshots: true, saveGeneratedAssets: true },
         };
-        const senderSummary = this.#recordIdentity(input);
         // §G4 — long-horizon memory: fold turns that scrolled out of the live
         // window into a rolling per-conversation summary, then inject it. Bounded,
         // throttled, and non-throwing — never breaks the turn.
@@ -656,16 +807,33 @@ export class ChannelTurnDispatcher {
               `Do not say that ${input.kind} cannot send an image unless the required tool is genuinely unavailable or its call failed; if it fails, explain the concrete limitation plainly.`,
             ].join('\n')
           : null;
-        const systemAddendum = [permissionMode === 'plan' ? PLAN_MODE_SYSTEM_ADDENDUM : null, audienceAddendum, accessAddendum, conversationSummary, appAddendum, channelMediaAddendum]
+        const relationshipAddendum = subjectId ? this.deps.relationships?.contextBlock(subjectId) ?? null : null;
+        const brainAddendum = ownerVerified
+          ? [
+              'DURABLE BRAIN AVAILABILITY',
+              'The Agentis Brain and durable relationship state are available to this turn. Use agentis.brain.search when recall is needed.',
+              ...(immediateCorrectionId ? ['Agentis already stored the explicit owner correction in this turn durably; acknowledge it as durable, not session-only.'] : []),
+              `When this verified owner asks you to remember a durable correction or fact about your own behavior, use agentis.memory.write with agentId "${responderAgentId}". Never claim that platform memory is unavailable unless an offered Brain tool actually returned an error. Never describe a durable correction as session-only memory.`,
+            ].join('\n')
+          : null;
+        const channelWorldAddendum = ownerVerified ? this.deps.inbox?.compactWorld(input.workspaceId, input.connectionId) ?? null : null;
+        const systemAddendum = [permissionMode === 'plan' ? PLAN_MODE_SYSTEM_ADDENDUM : null, audienceAddendum, accessAddendum, brainAddendum, channelWorldAddendum, relationshipAddendum, conversationSummary, appAddendum, channelMediaAddendum]
           .filter((s): s is string => Boolean(s))
           .join('\n\n');
         if (!this.#isActive(input, active)) return { replied: false, reason: 'superseded' };
         stream = runTurn(adapter, this.#buildHistory(input, excludeMessageIds), runtimeText, ctx, {
           channelContext: { kind: input.kind, from: input.from ?? null, chatId: input.chatId, threadId: input.threadId ?? null, senderSummary },
+          ...(subjectId ? { sessionKey: `relationship:${subjectId}:${input.appId ?? 'workspace'}` } : {}),
           ...(systemAddendum ? { systemAddendum } : {}),
           ...(preparedInput.runtimeInputAttachments?.length
             ? { inputAttachments: preparedInput.runtimeInputAttachments }
             : {}),
+          // One tool owner across every runtime. The selected model emits calls;
+          // Agentis executes the bounded catalog and can recover transports
+          // without losing channel/inbox capabilities.
+          toolMode: 'caller_loop',
+          transportRecovery: 'capability_preserving',
+          skipRuntimePreflight: true,
           liveInput: () => this.#drainActiveMailbox(active),
         });
       }
@@ -750,7 +918,7 @@ export class ChannelTurnDispatcher {
         }
         if (generatedAttachments.length > 0 && !deliveredByChannelTool) {
           const attachments = dedupeAttachmentRefs(generatedAttachments);
-          const gate = this.#gateAppReply(input, '[Media response]');
+          const gate = this.#gateAppReply(input, '[Media response]', subjectId);
           if (gate.action !== 'send') return gate.result;
           await this.#persistAndDeliver(input, '', { attachments });
           if (input.appId) this.deps.outboundPolicy?.record(input.appId, 'agent');
@@ -769,7 +937,7 @@ export class ChannelTurnDispatcher {
       // do NOT gate a direct reply to a human's message (that would silence the
       // desk mid-conversation); they govern the *unsupervised* proactive path. The
       // claim/approval guard applies to every outbound, including replies.
-      const gate = this.#gateAppReply(input, body);
+      const gate = this.#gateAppReply(input, body, subjectId);
       if (gate.action !== 'send') {
         return gate.result;
       }
@@ -784,7 +952,7 @@ export class ChannelTurnDispatcher {
       // BRAIN-BLUEPRINT-10X — channel turns form memory exactly like web chat:
       // operator statements + the agent's own learnings flow through the same
       // formation pipeline. Fire-and-forget; capture must never delay a reply.
-      if (this.deps.memoryCapture) {
+      if (this.deps.memoryCapture && !proactive) {
         void this.deps.memoryCapture.captureTurn({
           workspaceId: input.workspaceId,
           conversationId: input.conversationId,
@@ -892,11 +1060,24 @@ export class ChannelTurnDispatcher {
   #gateAppReply(
     input: ChannelTurnInput,
     body: string,
+    subjectId?: string | null,
   ): { action: 'send' } | { action: 'withheld' | 'held'; result: { replied: boolean; reason?: string } } {
     if (!input.appId || !this.deps.outboundPolicy) return { action: 'send' };
     let decision: { allow: boolean; needsApproval: boolean; reason?: string };
     try {
+      const autonomy = this.deps.outboundPolicy.evaluateAutonomy(
+        input.appId,
+        input.initiatedBy === 'proactive' ? 'proactive_followup' : 'inbound_reply',
+        subjectId,
+      );
+      if (autonomy.decision === 'deny') {
+        return { action: 'withheld', result: { replied: false, reason: 'autonomy_denied' } };
+      }
+      if (autonomy.decision === 'require_approval') {
+        decision = { allow: false, needsApproval: true, reason: autonomy.reason };
+      } else {
       decision = this.deps.outboundPolicy.evaluate(input.appId, { body, source: 'agent' });
+      }
     } catch (err) {
       this.deps.logger.warn('channel.turn.outbound_gate_failed', { appId: input.appId, err: (err as Error).message });
       return { action: 'send' };
@@ -1068,16 +1249,82 @@ export class ChannelTurnDispatcher {
       .where(eq(schema.workspaces.id, input.workspaceId))
       .get();
     if (!workspace?.userId || workspace.userId !== connection.userId) return false;
-    const identity = this.deps.db
-      .select({ userId: schema.channelPeerIdentities.userId })
-      .from(schema.channelPeerIdentities)
-      .where(and(
-        eq(schema.channelPeerIdentities.workspaceId, input.workspaceId),
-        eq(schema.channelPeerIdentities.channelKind, input.kind),
-        eq(schema.channelPeerIdentities.handle, input.chatId),
-      ))
-      .get();
-    return identity?.userId === connection.userId;
+    if (!this.deps.identity) return false;
+    const handle = (input.kind === 'slack' || input.kind === 'discord') ? (input.from ?? input.chatId) : input.chatId;
+    let principal = this.deps.identity.principal({
+      workspaceId: input.workspaceId,
+      connectionId: input.connectionId,
+      channelKind: input.kind,
+      handle,
+    });
+    // Backfill old connections once: ownerChatId was saved by an authenticated
+    // workspace owner, so turn it into the same explicit durable binding used by
+    // new configuration. defaultChatId is intentionally never consulted.
+    if (principal.role === 'external' && this.#configuredOwnerOperator(input)) {
+      this.deps.identity.grantAuthority({
+        workspaceId: input.workspaceId,
+        connectionId: input.connectionId,
+        channelKind: input.kind,
+        handle,
+        role: 'owner',
+        userId: connection.userId,
+        method: 'legacy_authenticated_owner_configuration',
+      });
+      principal = this.deps.identity.principal({ workspaceId: input.workspaceId, connectionId: input.connectionId, channelKind: input.kind, handle });
+    }
+    return principal.role === 'owner' && principal.verified && principal.peerKey === `user:${connection.userId}`;
+  }
+
+  #agentRole(workspaceId: string, agentId: string): string | null {
+    return this.deps.db.select({ role: schema.agents.role }).from(schema.agents).where(and(
+      eq(schema.agents.workspaceId, workspaceId),
+      eq(schema.agents.id, agentId),
+    )).get()?.role ?? null;
+  }
+
+  #channelToolScope(args: { role: string | null; ownerVerified: boolean; appBound: boolean }): string[] | undefined {
+    // Orchestrators and managers are explicit control-plane roles. Every other
+    // role is a bounded resident/specialist, including custom worker role names.
+    if (args.role === 'orchestrator' || args.role === 'manager') return undefined;
+    return [
+      ...BOUNDED_CHANNEL_AGENT_TOOLS,
+      ...(args.ownerVerified ? ['agentis.memory.write'] : []),
+      ...(args.appBound ? APP_RELATIONSHIP_TOOLS : []),
+    ];
+  }
+
+  #verifiedAuthority(input: ChannelTurnInput): 'owner' | 'delegate' | null {
+    if (!this.deps.identity) return null;
+    // Run owner backfill first so legacy ownerChatId configuration joins the
+    // canonical principal model before resolving its role.
+    if (this.#configuredOwnerOperator(input)) void this.#isVerifiedConnectionOwner(input);
+    const handle = (input.kind === 'slack' || input.kind === 'discord') ? (input.from ?? input.chatId) : input.chatId;
+    const principal = this.deps.identity.principal({ workspaceId: input.workspaceId, connectionId: input.connectionId, channelKind: input.kind, handle });
+    return principal.verified && principal.role !== 'external' ? principal.role : null;
+  }
+
+  #contactIdForSubject(subjectId: string | undefined): string | null {
+    if (!subjectId) return null;
+    return this.deps.db.select({ id: schema.appContacts.id }).from(schema.appContacts)
+      .where(eq(schema.appContacts.subjectId, subjectId)).get()?.id ?? null;
+  }
+
+  /** Scheduler recovery path for batches that survived a process restart. */
+  async flushDurableUtterances(now = new Date().toISOString()): Promise<number> {
+    if (!this.deps.utterances) return 0;
+    const due = this.deps.utterances.claimDue(now);
+    let completed = 0;
+    for (const batch of due) {
+      try {
+        await this.#commitTurn(batch.input, batch.messageIds);
+        this.deps.utterances.complete(batch.id);
+        completed += 1;
+      } catch (err) {
+        this.deps.utterances.retry(batch.id);
+        this.deps.logger.warn('channel.turn.durable_utterance_failed', { batchId: batch.id, err: (err as Error).message });
+      }
+    }
+    return completed;
   }
 
   /** Stable channel doctrine shared by every agent identity and App prompt. */
@@ -1118,6 +1365,14 @@ export class ChannelTurnDispatcher {
       : {};
     if (typeof settings.ownerChatId !== 'string' || normalizeHandle(settings.ownerChatId) !== normalizeHandle(input.chatId)) return null;
     return { name: typeof settings.ownerName === 'string' && settings.ownerName.trim() ? settings.ownerName.trim() : null };
+  }
+
+  /** Owner/operator control chats never park their own agent. Configuration is
+   * the natural-conversation declaration; verified connection-scoped Owner
+   * authority is the canonical fallback used by Channel Identities. Delegates
+   * intentionally do not qualify. */
+  #isOwnerControlPeer(input: ChannelTurnInput): boolean {
+    return Boolean(this.#configuredOwnerOperator(input) || this.#isVerifiedConnectionOwner(input));
   }
 
   /**
@@ -1382,13 +1637,39 @@ export class ChannelTurnDispatcher {
         : input.chatId;
       const { summary } = this.deps.identity.recordAndSummarize({
         workspaceId: input.workspaceId,
+        connectionId: input.connectionId,
         channelKind: input.kind,
         handle,
         ...(input.from ? { displayName: input.from } : {}),
       });
+      const identity = this.deps.identity.resolve(input.workspaceId, input.kind, handle, input.connectionId);
+      if (identity && identity.authorityRole === 'external') {
+        this.deps.channelActions?.cancelForPeer(input.workspaceId, identity.id, 'contact replied after this action was planned');
+      }
       return summary;
     } catch (err) {
       this.deps.logger.warn('channel.identity.failed', { connectionId: input.connectionId, err: (err as Error).message });
+      return null;
+    }
+  }
+
+  #touchRelationship(input: ChannelTurnInput, contactId: string | null) {
+    if (!this.deps.relationships) return null;
+    try {
+      const handle = (input.kind === 'slack' || input.kind === 'discord') ? (input.from ?? input.chatId) : input.chatId;
+      return this.deps.relationships.touch({
+        workspaceId: input.workspaceId,
+        appId: input.appId ?? null,
+        connectionId: input.connectionId,
+        channelKind: input.kind,
+        handle,
+        displayName: input.from ?? null,
+        conversationId: input.conversationId,
+        contactId,
+        inboundText: input.text,
+      });
+    } catch (err) {
+      this.deps.logger.warn('channel.turn.relationship_touch_failed', { conversationId: input.conversationId, err: (err as Error).message });
       return null;
     }
   }
@@ -1766,6 +2047,13 @@ export function interpretConfirmation(text: string): boolean | null {
   return null;
 }
 
+/** Deliberately narrow: ordinary short follow-up bubbles belong to the active turn. */
+export function isExplicitActiveStatusRequest(text: string): boolean {
+  const value = text.trim().toLowerCase();
+  if (!value || value.length > 140) return false;
+  return /^(status|progress|update|how('?s| is) it going|are you (still )?(working|there)|what are you doing|andamento|status|progresso|como (está|esta) indo|ainda (está|esta) (trabalhando|aí|ai))\s*[?!.]*$/iu.test(value);
+}
+
 function channelTurnFailureMessage(error: unknown): string {
   const raw = error instanceof Error ? error.message : typeof error === 'string' ? error : '';
   const detail = raw.trim();
@@ -1778,9 +2066,11 @@ function channelTurnFailureMessage(error: unknown): string {
   if (/timeout|timed out|deadline/i.test(detail)) {
     return 'The agent runtime timed out before it could answer this channel message. The turn is visible in Agentis, and you can retry after the runtime is responsive.';
   }
-  return detail
-    ? `I could not complete this channel turn: ${detail}`
-    : 'I could not complete this channel turn. Check the agent runtime in Agentis and try again.';
+  // Raw provider/database/runtime errors belong in the operator log and activity
+  // feed, never in a customer conversation. In particular this prevents SQL
+  // constraint names, filesystem paths, credentials, and provider payloads from
+  // being echoed verbatim over WhatsApp.
+  return 'I’m having trouble answering right now. Please try again in a moment.';
 }
 
 function isCreditOrQuotaError(message: string): boolean {
@@ -1869,6 +2159,53 @@ function dedupeAttachmentRefs(attachments: OutboundAttachmentRef[]): OutboundAtt
     seen.add(key);
     return true;
   });
+}
+
+/** Strip internal/planning leakage from a channel-bound agent reply. */
+function sanitizeChannelReply(text: string): string {
+  if (!text) return text;
+
+  const raw = text.trim();
+  if (!raw) return raw;
+
+  const internalPatterns: RegExp[] = [
+    /^(robson|paty|alexandre|cliente|lead)\s+pediu\s+para/i,
+    /^(robson|paty|alexandre|cliente|lead)\s+perguntou/i,
+    /^(robson|paty|alexandre|cliente|lead)\s+disse/i,
+    /^vou\s+primeiro/i,
+    /^primeiro\s+eu\s+vou/i,
+    /^agora\s+eu\s+preciso/i,
+    /^o\s+que\s+está\s+faltando/i,
+    /^agora\s+eu\s+vou/i,
+    /^vou\s+revisar/i,
+    /workspace\s+atual/i,
+    /app\s+talki/i,
+    /token\s+de\s+acesso/i,
+    /portal\s+expir/i,
+    /autenticação\s+da\s+plataforma/i,
+    /workflows?\s+respons/i,
+    /agente\s+atendente\s+\(chamado/i,
+    /fluxo\s+de\s+atendimento\s+inbound/i,
+    /configurado\s+e\s+conectado/i,
+    /talki\s+já\s+está\s+configurad/i,
+    /esta[mp]\s+parado/i,
+    /esta[mp]\s+parada/i,
+  ];
+
+  // Sentence-level filter: keep only segments that do not look like internal
+  // reasoning / platform status / planning narration.
+  const segments = raw
+    .split(/(?<=[.!?])\s+/)
+    .map((s) => s.trim())
+    .filter((s) => {
+      if (!s) return false;
+      const lower = s.toLowerCase();
+      if (internalPatterns.some((rx) => rx.test(lower))) return false;
+      return true;
+    });
+
+  const cleaned = segments.join(' ').trim();
+  return cleaned || '';
 }
 
 function channelLabel(kind: string): string {

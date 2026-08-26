@@ -4,13 +4,15 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Plus, Building2, Upload, X, ArrowRight, Settings as SettingsIcon } from 'lucide-react';
+import { Plus, Building2, Upload, X, ArrowRight, Settings as SettingsIcon, PackageOpen, Loader2 } from 'lucide-react';
 import { api, apiErrorMessage, workspace as wsStore } from '../lib/api';
 import { useToast } from '../components/shared/Toast';
 import { Button } from '../components/shared/Button';
 import { Skeleton } from '../components/shared/Skeleton';
 import { StatusBadge } from '../components/shared/StatusBadge';
 import { EmptyState } from '../components/shared/EmptyState';
+import { isWorkspaceBundle, workspaceBundleApi } from '../lib/workspaceBundle';
+import type { WorkspaceBundleEnvelope } from '@agentis/core';
 
 interface Workspace {
   id: string;
@@ -208,6 +210,7 @@ function CreateWorkspaceDialog({ open, onClose, onCreated }: { open: boolean; on
   const [imageDataUrl, setImageDataUrl] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
+  const bundleRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (open) { setName(''); setDescription(''); setImageDataUrl(null); }
@@ -245,6 +248,46 @@ function CreateWorkspaceDialog({ open, onClose, onCreated }: { open: boolean; on
     finally { setCreating(false); }
   }
 
+  async function handleBundleImport(file: File | undefined) {
+    if (!file) return;
+    setCreating(true);
+    let createdId: string | null = null;
+    const previousWorkspaceId = wsStore.get();
+    try {
+      const parsed = JSON.parse(await file.text()) as Record<string, unknown>;
+      if (!isWorkspaceBundle(parsed)) throw new Error('Choose a complete Agentis workspace bundle (.agentis).');
+      const envelope = parsed as WorkspaceBundleEnvelope;
+      const preview = await workspaceBundleApi.preview(envelope);
+      const importedName = preview.name.trim() || file.name.replace(/\.agentis$/i, '') || 'Imported workspace';
+      const importedSlug = `${importedName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'imported-workspace'}-${Date.now().toString(36)}`;
+      const created = await api<{ workspace: { id: string } }>('/v1/workspaces', {
+        method: 'POST',
+        body: JSON.stringify({ name: importedName, slug: importedSlug }),
+      });
+      createdId = created.workspace.id;
+      wsStore.set(createdId);
+      await workspaceBundleApi.import(envelope, {
+        includeAgentBrains: true,
+        includeAppBrains: true,
+        includeWorkspaceBrain: true,
+        includeKnowledge: true,
+        includeCollectionData: true,
+      });
+      toast.success('Workspace imported', `${importedName} is ready on this machine.`);
+      onCreated();
+      window.location.assign('/home');
+    } catch (err) {
+      if (createdId) {
+        try { await api(`/v1/workspaces/${createdId}`, { method: 'DELETE' }); } catch { /* retain the empty workspace if rollback itself fails */ }
+      }
+      if (previousWorkspaceId) wsStore.set(previousWorkspaceId);
+      toast.error('Workspace import failed', apiErrorMessage(err));
+    } finally {
+      setCreating(false);
+      if (bundleRef.current) bundleRef.current.value = '';
+    }
+  }
+
   return (
     <div className="animate-fade-in fixed inset-0 z-[60] flex items-center justify-center bg-overlay p-4" role="dialog" aria-modal="true">
       <form onSubmit={handleCreate} className="animate-scale-in w-full max-w-md rounded-modal border border-line bg-surface shadow-modal">
@@ -255,6 +298,23 @@ function CreateWorkspaceDialog({ open, onClose, onCreated }: { open: boolean; on
           </button>
         </header>
         <div className="space-y-4 px-5 py-5">
+          <input ref={bundleRef} type="file" accept=".agentis,application/json" className="hidden" onChange={(event) => void handleBundleImport(event.target.files?.[0])} />
+          <button
+            type="button"
+            disabled={creating}
+            onClick={() => bundleRef.current?.click()}
+            className="group flex w-full items-center gap-3 rounded-card border border-accent/30 bg-accent-soft/25 p-3 text-left transition-colors hover:border-accent hover:bg-accent-soft/40 disabled:opacity-50"
+          >
+            <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-card bg-accent text-canvas">
+              {creating ? <Loader2 size={17} className="animate-spin" /> : <PackageOpen size={17} />}
+            </span>
+            <span className="min-w-0 flex-1">
+              <span className="block text-[13px] font-semibold text-text-primary">Import complete workspace</span>
+              <span className="mt-0.5 block text-[11px] leading-4 text-text-muted">Create a new workspace from a portable <span className="font-mono">.agentis</span> file, including its apps, workflows, extensions, data, and intelligence.</span>
+            </span>
+            <ArrowRight size={14} className="text-accent transition-transform group-hover:translate-x-0.5" />
+          </button>
+          <div className="flex items-center gap-3 text-[10px] uppercase tracking-wider text-text-muted before:h-px before:flex-1 before:bg-line after:h-px after:flex-1 after:bg-line">or start empty</div>
           <div className="flex items-center gap-4">
             <button
               type="button"

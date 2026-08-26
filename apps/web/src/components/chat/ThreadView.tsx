@@ -1,10 +1,10 @@
 ﻿import { useEffect, useMemo, useRef, useState } from 'react';
-import { AlertTriangle, Check, Clock3, Copy, FileText, Loader2, Pencil, Plug, ShieldCheck, X } from 'lucide-react';
+import { AlertTriangle, Check, Clock3, Copy, FileText, Loader2, Pencil, Plug, Redo2, ShieldCheck, Undo2, X } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import clsx from 'clsx';
-import { initialTurnActivityLabel, normalizeAgentPlanText, normalizeToolInvocation, parseChatPermissionDirective, REALTIME_EVENTS, type ChatCommentary, type ChatContextManifest, type ChatDelta, type ChatExecutionEnvelope, type ChatPermissionMode, type ChatPlan, type ChatSwarm, type ChatTurnTrace, type ViewportContext } from '@agentis/core';
+import { initialTurnActivityLabel, normalizeAgentPlanText, normalizeToolInvocation, parseChatPermissionDirective, REALTIME_EVENTS, type ChatCommentary, type ChatContextManifest, type ChatDelta, type ChatExecutionEnvelope, type ChatPermissionMode, type ChatPlan, type ChatSwarm, type ChatTurnTrace, type TurnChangeActionResult, type TurnChangeConflict, type TurnChangeSummary, type ViewportContext } from '@agentis/core';
 import { PermissionModePicker } from './PermissionModePicker';
-import { api, apiErrorMessage, streamSse } from '../../lib/api';
+import { api, apiErrorMessage, streamSse, type ApiError } from '../../lib/api';
 import { useViewportAwareness } from '../../lib/viewportContext';
 import { listInteractions, type InteractionEvent } from '../../lib/connections';
 import { useToast } from '../shared/Toast';
@@ -102,6 +102,16 @@ interface MessageMeta {
   queuePosition?: number;
   /** Concrete runtime failure preserved even when partial work already exists. */
   failureMessage?: string;
+  /** Durable, redacted Undo/Redo state owned by this assistant turn. */
+  changeSet?: TurnChangeSummary | null;
+}
+
+interface TurnChangePrompt {
+  turnId: string;
+  direction: 'undo' | 'redo';
+  kind: 'confirm' | 'conflict';
+  summary: TurnChangeSummary;
+  conflicts?: TurnChangeConflict[];
 }
 
 type ConfirmationStatus = 'pending' | 'approving' | 'approved' | 'cancelled' | 'failed';
@@ -475,6 +485,8 @@ export function ThreadView({
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [hasMore, setHasMore] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
+  const [turnChangeBusyId, setTurnChangeBusyId] = useState<string | null>(null);
+  const [turnChangePrompt, setTurnChangePrompt] = useState<TurnChangePrompt | null>(null);
   const [agentMap, setAgentMap] = useState<Record<string, { name: string; role?: string | null; colorHex?: string | null }>>({});
 
   useEffect(() => {
@@ -558,6 +570,60 @@ export function ThreadView({
   const confirmEndpoint = kind === 'agent' ? `/v1/conversations/${id}/confirm${querySuffix}` : null;
   const stopEndpoint = kind === 'agent' ? `/v1/conversations/${id}/stop${querySuffix}` : null;
   const readOnly = kind === 'agent' && Boolean(archivedAt);
+
+  function updateTurnChangeSummary(turnId: string, changeSet: TurnChangeSummary | null | undefined) {
+    setMessages((current) => current.map((message) => message.metadata?.durableTurnId === turnId
+      ? { ...message, metadata: { ...(message.metadata ?? {}), changeSet: changeSet ?? null } }
+      : message));
+  }
+
+  async function handleTurnChange(
+    message: ChatMessage,
+    options: { confirmed?: boolean; direction?: 'undo' | 'redo' } = {},
+  ) {
+    const changeSet = message.metadata?.changeSet;
+    const turnId = message.metadata?.durableTurnId;
+    if (!changeSet || !turnId || changeSet.reversibleCount <= 0 || kind !== 'agent') return;
+    const direction = options.direction ?? (changeSet.state === 'undone' ? 'redo' : 'undo');
+    if (!options.confirmed && (changeSet.sensitiveCount > 0 || changeSet.externalEffectCount > 0)) {
+      setTurnChangePrompt({ turnId, direction, kind: 'confirm', summary: changeSet });
+      return;
+    }
+    setTurnChangeBusyId(turnId);
+    try {
+      const result = await api<TurnChangeActionResult>(`/v1/conversations/${id}/turns/${turnId}/${direction}`, {
+        method: 'POST',
+        body: JSON.stringify({
+          expectedVersion: changeSet.version,
+          confirmSensitive: Boolean(options.confirmed),
+        }),
+      });
+      updateTurnChangeSummary(turnId, result.changeSet);
+      setTurnChangePrompt(null);
+      toast.success(direction === 'undo' ? 'Changes undone' : 'Changes redone',
+        result.externalEffectsRetained ? 'External actions were left untouched.' : undefined);
+    } catch (error) {
+      const shaped = error as ApiError;
+      const details = shaped?.details as TurnChangeActionResult | undefined;
+      if (shaped?.code === 'TURN_CHANGE_CONFIRMATION_REQUIRED' && details?.changeSet) {
+        updateTurnChangeSummary(turnId, details.changeSet);
+        setTurnChangePrompt({ turnId, direction, kind: 'confirm', summary: details.changeSet });
+      } else if (shaped?.code === 'TURN_CHANGE_CONFLICT' && details?.changeSet) {
+        updateTurnChangeSummary(turnId, details.changeSet);
+        setTurnChangePrompt({
+          turnId,
+          direction,
+          kind: 'conflict',
+          summary: details.changeSet,
+          conflicts: details.conflicts ?? [],
+        });
+      } else {
+        toast.error(`Could not ${direction} changes`, apiErrorMessage(error));
+      }
+    } finally {
+      setTurnChangeBusyId((current) => current === turnId ? null : current);
+    }
+  }
 
   useEffect(() => {
     if (kind !== 'agent') return;
@@ -1027,6 +1093,13 @@ export function ThreadView({
         setRoomResponderActivities((prev) => removeKeys(prev, [roomMessage.authorId!]));
       }
     }
+  });
+
+  useRealtime([REALTIME_EVENTS.CONVERSATION_TURN_CHANGES_UPDATED], (env) => {
+    if (kind !== 'agent') return;
+    const payload = env.payload as { turnId?: string; changeSet?: TurnChangeSummary };
+    if (!payload.turnId || !payload.changeSet) return;
+    updateTurnChangeSummary(payload.turnId, payload.changeSet);
   });
 
   // Queue-then-auto-continue composer: a message was queued/discarded while a
@@ -1536,7 +1609,10 @@ export function ThreadView({
               setAgentTyping(false);
               setActiveTask(null);
               void api<{ turn: DurableConversationTurn }>(`/v1/conversations/${id}/turns/${created.turn.id}`)
-                .then(({ turn }) => setActiveDurableTurn(turn.status === 'completed' || turn.status === 'failed' || turn.status === 'cancelled' ? null : turn))
+                .then(({ turn }) => {
+                  updateTurnChangeSummary(turn.id, turn.changeSet);
+                  setActiveDurableTurn(turn.status === 'completed' || turn.status === 'failed' || turn.status === 'cancelled' ? null : turn);
+                })
                 .catch(() => setActiveDurableTurn(null));
               setMessages((current) => current.map((message) => (
                 message.id === streamId
@@ -1553,6 +1629,8 @@ export function ThreadView({
                 metadata: {
                   ...persisted.metadata,
                   clientTurnId: persisted.metadata?.clientTurnId ?? clientTurnId,
+                  durableTurnId: persisted.metadata?.durableTurnId ?? created.turn.id,
+                  changeSet: persisted.metadata?.changeSet ?? streamMessage?.metadata?.changeSet ?? null,
                   toolCalls: streamMessage?.metadata?.toolCalls ?? persisted.metadata?.toolCalls,
                   activity: persisted.metadata?.activity ?? streamMessage?.metadata?.activity,
                   commentary: persisted.metadata?.commentary ?? streamMessage?.metadata?.commentary,
@@ -1787,6 +1865,7 @@ export function ThreadView({
       },
     }).then(() => api<{ turn: DurableConversationTurn }>(`/v1/conversations/${id}/turns/${turn.id}`))
       .then(({ turn: latest }) => {
+        updateTurnChangeSummary(latest.id, latest.changeSet);
         const terminal = latest.status === 'completed' || latest.status === 'failed' || latest.status === 'cancelled';
         setActiveDurableTurn(terminal ? null : latest);
         if (terminal) {
@@ -2100,6 +2179,11 @@ export function ThreadView({
                 onSaveEdit={(text) => void handleEditSave(message, text)}
                 onCancelEdit={() => setEditingId(null)}
                 onConfirmAction={(confirmation, approved) => void handleConfirmationAction(message.id, confirmation, approved)}
+                onTurnChange={() => void handleTurnChange(message)}
+                onConfirmTurnChange={(direction) => void handleTurnChange(message, { confirmed: true, direction })}
+                onDismissTurnChange={() => setTurnChangePrompt(null)}
+                turnChangeBusy={turnChangeBusyId === message.metadata?.durableTurnId}
+                turnChangePrompt={turnChangePrompt?.turnId === message.metadata?.durableTurnId ? turnChangePrompt : null}
                 chatAgentId={kind === 'agent' ? id : undefined}
               />
             ))}
@@ -2261,6 +2345,7 @@ function hydrateDurableTurnHistory(
       metadata: {
         ...(message.metadata ?? {}),
         durableTurnId: entry.turn.id,
+        changeSet: entry.turn.changeSet ?? null,
         turn: {
           clientTurnId,
           startedAt: entry.turn.startedAt ?? entry.turn.createdAt,
@@ -2338,6 +2423,11 @@ function MessageBubble({
   onSaveEdit,
   onCancelEdit,
   onConfirmAction,
+  onTurnChange,
+  onConfirmTurnChange,
+  onDismissTurnChange,
+  turnChangeBusy,
+  turnChangePrompt,
   showAuthor,
   chatAgentId,
 }: {
@@ -2349,6 +2439,11 @@ function MessageBubble({
   onSaveEdit: (text: string) => void;
   onCancelEdit: () => void;
   onConfirmAction: (confirmation: ConfirmationCardData, approved: boolean) => void;
+  onTurnChange: () => void;
+  onConfirmTurnChange: (direction: 'undo' | 'redo') => void;
+  onDismissTurnChange: () => void;
+  turnChangeBusy: boolean;
+  turnChangePrompt: TurnChangePrompt | null;
   showAuthor?: boolean;
   agentData?: { name: string; role?: string | null; colorHex?: string | null };
   chatAgentId?: string;
@@ -2488,7 +2583,17 @@ function MessageBubble({
             <div className="text-[12px] italic text-text-muted">No text content</div>
           )}
         </div>
-        {!isOperator && <MessageActions onCopy={onCopy} />}
+        {!isOperator && (
+          <MessageActions
+            onCopy={onCopy}
+            changeSet={msg.metadata?.changeSet}
+            changeBusy={turnChangeBusy}
+            changePrompt={turnChangePrompt}
+            onTurnChange={onTurnChange}
+            onConfirmTurnChange={onConfirmTurnChange}
+            onDismissTurnChange={onDismissTurnChange}
+          />
+        )}
       </div>
     </li>
   );
@@ -2707,33 +2812,150 @@ function StreamingCursor() {
   );
 }
 
-function MessageActions({
+export function MessageActions({
   onCopy,
   onEdit,
+  changeSet,
+  changeBusy = false,
+  changePrompt,
+  onTurnChange,
+  onConfirmTurnChange,
+  onDismissTurnChange,
 }: {
   onCopy: () => void;
   onEdit?: () => void;
+  changeSet?: TurnChangeSummary | null;
+  changeBusy?: boolean;
+  changePrompt?: TurnChangePrompt | null;
+  onTurnChange?: () => void;
+  onConfirmTurnChange?: (direction: 'undo' | 'redo') => void;
+  onDismissTurnChange?: () => void;
 }) {
+  const direction = changeSet?.state === 'undone' ? 'redo' : 'undo';
+  const canChange = Boolean(
+    changeSet
+    && changeSet.reversibleCount > 0
+    && (changeSet.state === 'undoable' || changeSet.state === 'undone')
+    && onTurnChange,
+  );
+  const actionLabel = changeSet
+    ? `${direction === 'undo' ? 'Undo' : 'Redo'} ${changeSet.reversibleCount} ${changeSet.reversibleCount === 1 ? 'change' : 'changes'}`
+    : '';
   return (
-    <div className="flex shrink-0 flex-col gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
+    <div className="relative flex shrink-0 flex-col gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
       {onEdit && (
         <button
           type="button"
           onClick={onEdit}
           aria-label="Edit"
-          className="rounded p-0.5 text-text-muted hover:bg-surface-2 hover:text-text-primary"
+          className="grid h-6 w-6 place-items-center rounded-md text-text-muted hover:bg-surface-2 hover:text-text-primary focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent/70"
         >
-          <Pencil size={10} />
+          <Pencil size={11} />
+        </button>
+      )}
+      {canChange && (
+        <button
+          type="button"
+          onClick={onTurnChange}
+          disabled={changeBusy}
+          aria-label={actionLabel}
+          title={actionLabel}
+          className="grid h-6 w-6 place-items-center rounded-md text-text-muted transition hover:bg-surface-2 hover:text-text-primary focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent/70 disabled:cursor-wait disabled:opacity-70"
+        >
+          {changeBusy
+            ? <Loader2 size={12} className="animate-spin" />
+            : direction === 'undo'
+              ? <Undo2 size={12} />
+              : <Redo2 size={12} />}
         </button>
       )}
       <button
         type="button"
         onClick={onCopy}
         aria-label="Copy"
-        className="rounded p-0.5 text-text-muted hover:bg-surface-2 hover:text-text-primary"
+        title="Copy"
+        className="grid h-6 w-6 place-items-center rounded-md text-text-muted hover:bg-surface-2 hover:text-text-primary focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent/70"
       >
-        <Copy size={10} />
+        <Copy size={11} />
       </button>
+
+      {changePrompt && (
+        <div
+          role={changePrompt.kind === 'conflict' ? 'alert' : 'dialog'}
+          aria-label={changePrompt.kind === 'conflict' ? 'Undo conflict' : 'Confirm restoration'}
+          className="absolute right-full top-0 z-40 mr-2 w-[280px] overflow-hidden rounded-xl border border-line/80 bg-canvas/98 p-3 text-left opacity-100 shadow-[0_18px_55px_-22px_rgba(0,0,0,0.9)] backdrop-blur"
+        >
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <div className="text-[12px] font-semibold text-text-primary">
+                {changePrompt.kind === 'conflict'
+                  ? `Can’t ${changePrompt.direction} safely`
+                  : `${changePrompt.direction === 'undo' ? 'Undo' : 'Redo'} these changes?`}
+              </div>
+              <div className="mt-1 text-[11px] leading-4 text-text-muted">
+                {changePrompt.kind === 'conflict'
+                  ? 'Later work overlaps this response. Nothing was changed.'
+                  : `${changePrompt.summary.reversibleCount} local ${changePrompt.summary.reversibleCount === 1 ? 'change' : 'changes'} will be ${changePrompt.direction === 'undo' ? 'restored' : 'reapplied'}.`}
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={onDismissTurnChange}
+              aria-label="Close"
+              className="grid h-5 w-5 shrink-0 place-items-center rounded text-text-muted hover:bg-surface-2 hover:text-text-primary"
+            >
+              <X size={12} />
+            </button>
+          </div>
+
+          {changePrompt.kind === 'confirm' ? (
+            <div className="mt-2 space-y-1 rounded-lg border border-line/55 bg-surface-2/55 px-2.5 py-2 text-[10px] leading-4 text-text-secondary">
+              {changePrompt.summary.sensitiveCount > 0 && (
+                <div className="flex items-start gap-1.5">
+                  <ShieldCheck size={11} className="mt-0.5 shrink-0 text-warn" />
+                  <span>Includes security-sensitive local configuration.</span>
+                </div>
+              )}
+              {changePrompt.summary.externalEffectCount > 0 && (
+                <div className="flex items-start gap-1.5">
+                  <AlertTriangle size={11} className="mt-0.5 shrink-0 text-warn" />
+                  <span>External messages and provider actions will remain untouched.</span>
+                </div>
+              )}
+            </div>
+          ) : (
+            <div className="mt-2 max-h-36 space-y-1 overflow-y-auto rounded-lg border border-danger/20 bg-danger/5 px-2.5 py-2">
+              {(changePrompt.conflicts ?? []).slice(0, 6).map((item, index) => (
+                <div key={`${item.resourceKind}:${item.resourceId}:${index}`} className="text-[10px] leading-4 text-text-secondary">
+                  <span className="font-medium text-text-primary">{item.label}</span>
+                  {item.fields.length > 0 ? ` · ${item.fields.join(', ')}` : ''}
+                </div>
+              ))}
+            </div>
+          )}
+
+          <div className="mt-2.5 flex justify-end gap-1.5">
+            <button
+              type="button"
+              onClick={onDismissTurnChange}
+              className="h-7 rounded-md px-2.5 text-[11px] font-medium text-text-muted hover:bg-surface-2 hover:text-text-primary"
+            >
+              {changePrompt.kind === 'conflict' ? 'Close' : 'Cancel'}
+            </button>
+            {changePrompt.kind === 'confirm' && (
+              <button
+                type="button"
+                onClick={() => onConfirmTurnChange?.(changePrompt.direction)}
+                disabled={changeBusy}
+                className="inline-flex h-7 items-center gap-1.5 rounded-md bg-text-primary px-2.5 text-[11px] font-semibold text-canvas transition hover:opacity-90 disabled:cursor-wait disabled:opacity-60"
+              >
+                {changeBusy ? <Loader2 size={11} className="animate-spin" /> : changePrompt.direction === 'undo' ? <Undo2 size={11} /> : <Redo2 size={11} />}
+                {changePrompt.direction === 'undo' ? 'Undo' : 'Redo'}
+              </button>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

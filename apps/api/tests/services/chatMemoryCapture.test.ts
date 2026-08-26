@@ -257,6 +257,32 @@ describe('ChatMemoryCaptureService', () => {
     expect(promotion?.payload).toMatchObject({ scopeId: agentId, originSurface: 'operator_chat' });
   });
 
+  it('recognizes an explicit Portuguese owner correction before the reply starts', () => {
+    const agentId = seedAgent();
+    const conversations = new ConversationStore({ db: ctx.db, bus: ctx.bus });
+    const conversation = conversations.getOrCreateByAgent({
+      workspaceId: ctx.workspace.id,
+      ambientId: ctx.ambient.id,
+      userId: ctx.user.id,
+      agentId,
+    });
+    const { service } = buildCaptureStack();
+
+    const id = service.captureImmediateCorrection({
+      workspaceId: ctx.workspace.id,
+      conversationId: conversation.id,
+      userId: ctx.user.id,
+      agentId,
+      userDisplayName: 'Robson',
+      userMessage: 'Isso está errado; a partir de agora não confunda exemplos de clientes com fatos sobre mim.',
+      senderTrust: 'owner',
+    });
+
+    expect(id).toBeTruthy();
+    const memory = ctx.db.select().from(schema.memoryEpisodes).where(eq(schema.memoryEpisodes.id, id!)).get();
+    expect(memory).toMatchObject({ scopeId: agentId, governing: true, source: 'operator_write' });
+  });
+
   it('does not capture a question as a preference', async () => {
     const agentId = seedAgent();
     const conversations = new ConversationStore({ db: ctx.db, bus: ctx.bus });

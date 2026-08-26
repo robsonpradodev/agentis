@@ -10,6 +10,7 @@ export const REALTIME_EVENTS = {
   // Workspace
   WORKSPACE_SELECTED: 'workspace.selected',
   AMBIENT_SELECTED: 'ambient.selected',
+  CONVERSATION_TURN_CHANGES_UPDATED: 'conversation.turn_changes.updated',
 
   // Fleet overview
   FLEET_SNAPSHOT_UPDATED: 'fleet.snapshot.updated',

@@ -6,7 +6,7 @@
  */
 
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
-import { AlertTriangle, CheckCircle2, CircleHelp, Loader2, Plug, Plus, RefreshCcw, Trash2, XCircle } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, CircleHelp, Clock3, Loader2, MessageCircle, Plug, Plus, RefreshCcw, Send, ShieldCheck, Trash2, UserRound, XCircle } from 'lucide-react';
 import clsx from 'clsx';
 import { api } from '../../lib/api';
 import { Button } from '../shared/Button';
@@ -90,6 +90,43 @@ interface ChannelConnection {
   lastError?: string | null;
 }
 
+interface ChannelInboxPeer {
+  recipientRef: string;
+  peerIdentityId: string;
+  connectionId: string;
+  channelKind: string;
+  displayName: string | null;
+  conversationId: string | null;
+  lastInboundAt: string | null;
+  lastOutboundAt: string | null;
+  lastMessageAt: string | null;
+  lastMessagePreview: string | null;
+  lastMessageDirection: 'inbound' | 'outbound' | null;
+  handoffState: string | null;
+  subjectId: string | null;
+  stage: string | null;
+  goal: string | null;
+  aliases: Array<{ value: string; kind: string; verified: boolean }>;
+}
+
+type ChannelActionStatus = 'planned' | 'awaiting_approval' | 'authorized' | 'executing' | 'delivered' | 'failed' | 'cancelled' | 'superseded';
+
+interface ChannelActionIntent {
+  id: string;
+  agentId: string | null;
+  connectionId: string;
+  peerIdentityId: string;
+  goal: string;
+  body: string;
+  authorizationBasis: string;
+  status: ChannelActionStatus;
+  attempts: number;
+  scheduledFor: string | null;
+  lastError: string | null;
+  deliveredAt: string | null;
+  createdAt: string;
+}
+
 interface Provider {
   kind: ChannelKind;
   label: string;
@@ -152,7 +189,7 @@ export function AgentChannelsTab({ agentId, agentName }: { agentId: string; agen
   if (connections === null) return <Skeleton height={360} />;
 
   return (
-    <div className="max-w-2xl space-y-3">
+    <div className="max-w-4xl space-y-3">
       <div>
         <div className="text-[11px] font-semibold uppercase tracking-[0.16em] text-text-muted">Channels</div>
         <p className="mt-1 text-[13px] text-text-secondary">
@@ -190,6 +227,16 @@ export function AgentChannelsTab({ agentId, agentName }: { agentId: string; agen
         </div>
       )}
 
+      {(connections.length > 0 || workspaceConnections.length > 0) && (
+        <ChannelOperationsPanel
+          agentId={agentId}
+          connections={[
+            ...connections,
+            ...workspaceConnections.filter((connection) => access[connection.id] !== false),
+          ]}
+        />
+      )}
+
       {PROVIDERS.map((provider) => (
         <ProviderCard
           key={provider.kind}
@@ -205,10 +252,248 @@ export function AgentChannelsTab({ agentId, agentName }: { agentId: string; agen
   );
 }
 
+function ChannelOperationsPanel({ agentId, connections }: { agentId: string; connections: ChannelConnection[] }) {
+  const toast = useToast();
+  const [open, setOpen] = useState(true);
+  const [loading, setLoading] = useState(true);
+  const [peers, setPeers] = useState<ChannelInboxPeer[]>([]);
+  const [actions, setActions] = useState<ChannelActionIntent[]>([]);
+  const [cancelling, setCancelling] = useState<string | null>(null);
+  const connectionIds = [...new Set(connections.map((connection) => connection.id))];
+  const connectionKey = connectionIds.sort().join(',');
+
+  const load = useCallback(async (quiet = false) => {
+    if (!connectionIds.length) return;
+    if (!quiet) setLoading(true);
+    try {
+      const batches = await Promise.all(connectionIds.map(async (connectionId) => {
+        const [inbox, ledger] = await Promise.all([
+          api<{ peers?: ChannelInboxPeer[] }>(`/v1/channels/inbox?connectionId=${encodeURIComponent(connectionId)}&limit=12`),
+          api<{ actions?: ChannelActionIntent[] }>(`/v1/channels/actions?connectionId=${encodeURIComponent(connectionId)}&limit=20`),
+        ]);
+        return { peers: inbox.peers ?? [], actions: ledger.actions ?? [] };
+      }));
+      setPeers(dedupeBy(batches.flatMap((batch) => batch.peers), (peer) => peer.peerIdentityId)
+        .sort((a, b) => (b.lastMessageAt ?? '').localeCompare(a.lastMessageAt ?? '')).slice(0, 12));
+      setActions(dedupeBy(batches.flatMap((batch) => batch.actions), (action) => action.id)
+        .filter((action) => action.agentId === agentId)
+        .sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, 20));
+    } catch {
+      if (!quiet) {
+        setPeers([]);
+        setActions([]);
+      }
+    } finally {
+      if (!quiet) setLoading(false);
+    }
+  // connectionKey is the intentionally stable dependency for the connection set.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agentId, connectionKey]);
+
+  useEffect(() => {
+    void load();
+    const timer = window.setInterval(() => void load(true), 15_000);
+    return () => window.clearInterval(timer);
+  }, [load]);
+
+  async function cancelAction(actionId: string) {
+    setCancelling(actionId);
+    try {
+      await api(`/v1/channels/actions/${actionId}/cancel`, {
+        method: 'POST',
+        body: JSON.stringify({ reason: 'cancelled from channel operations' }),
+      });
+      toast.success('Outbound action cancelled');
+      await load(true);
+    } catch (err) {
+      toast.error('Could not cancel outbound action', String(err));
+    } finally {
+      setCancelling(null);
+    }
+  }
+
+  const activeActions = actions.filter((action) => ['planned', 'awaiting_approval', 'authorized', 'executing'].includes(action.status));
+  const peerById = new Map(peers.map((peer) => [peer.peerIdentityId, peer]));
+
+  return (
+    <section className="overflow-hidden rounded-card border border-line bg-surface">
+      <button
+        type="button"
+        onClick={() => setOpen((value) => !value)}
+        className="flex w-full items-center gap-3 px-4 py-3 text-left"
+        aria-expanded={open}
+      >
+        <div className="flex h-8 w-8 items-center justify-center rounded-input border border-accent/25 bg-accent/10 text-accent">
+          <MessageCircle size={15} />
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2 text-[13px] font-medium text-text-primary">
+            Channel context &amp; actions
+            {activeActions.length > 0 && <span className="rounded-full bg-amber-500/10 px-1.5 py-0.5 text-[10px] text-amber-400">{activeActions.length} active</span>}
+          </div>
+          <p className="mt-0.5 text-[11px] text-text-muted">Canonical contacts, relationship context, authority, and durable outbound work.</p>
+        </div>
+        <span className="text-[11px] text-text-muted">{peers.length} contacts · {actions.length} actions</span>
+      </button>
+
+      {open && (
+        <div className="grid border-t border-line lg:grid-cols-2">
+          <div className="min-w-0 border-b border-line lg:border-b-0 lg:border-r">
+            <PanelLabel icon={<UserRound size={12} />} label="Recent contacts" />
+            {loading ? (
+              <div className="p-3"><Skeleton height={96} /></div>
+            ) : peers.length === 0 ? (
+              <EmptyLedger text="Contacts appear here after inbound or outbound channel activity." />
+            ) : (
+              <div className="divide-y divide-line">
+                {peers.slice(0, 6).map((peer) => (
+                  <div key={peer.peerIdentityId} className="px-3.5 py-2.5">
+                    <div className="flex items-start gap-2">
+                      <span className={clsx('mt-1 h-1.5 w-1.5 shrink-0 rounded-full', peer.lastMessageDirection === 'inbound' ? 'bg-accent' : 'bg-text-muted')} />
+                      <div className="min-w-0 flex-1">
+                        <div className="flex min-w-0 items-center gap-2">
+                          <span className="truncate text-[12px] font-medium text-text-primary">{peer.displayName || primaryAlias(peer)}</span>
+                          <span className="shrink-0 text-[10px] uppercase tracking-wide text-text-muted">{peer.channelKind}</span>
+                          <span className="ml-auto shrink-0 text-[10px] text-text-muted">{relativeTime(peer.lastMessageAt)}</span>
+                        </div>
+                        <p className="mt-0.5 truncate text-[11px] text-text-secondary">{peer.lastMessagePreview || 'No message preview'}</p>
+                        <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[10px] text-text-muted">
+                          {peer.stage && <LedgerChip>{peer.stage}</LedgerChip>}
+                          {peer.handoffState === 'human' && <LedgerChip tone="warn">Human control</LedgerChip>}
+                          {peer.goal && <span className="max-w-[220px] truncate">Goal: {peer.goal}</span>}
+                          {peer.aliases.length > 1 && <span>{peer.aliases.length} linked identities</span>}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div className="min-w-0">
+            <PanelLabel icon={<Send size={12} />} label="Outbound action ledger" />
+            {loading ? (
+              <div className="p-3"><Skeleton height={96} /></div>
+            ) : actions.length === 0 ? (
+              <EmptyLedger text="Goal-driven sends and follow-ups will be recorded here before delivery." />
+            ) : (
+              <div className="divide-y divide-line">
+                {actions.slice(0, 6).map((action) => {
+                  const peer = peerById.get(action.peerIdentityId);
+                  const cancellable = ['planned', 'awaiting_approval', 'authorized'].includes(action.status);
+                  return (
+                    <div key={action.id} className="px-3.5 py-2.5">
+                      <div className="flex items-start gap-2">
+                        <ActionStatusIcon status={action.status} />
+                        <div className="min-w-0 flex-1">
+                          <div className="flex min-w-0 items-center gap-2">
+                            <span className="truncate text-[12px] font-medium text-text-primary">{peer?.displayName || (peer ? primaryAlias(peer) : 'Channel contact')}</span>
+                            <ActionStatusBadge status={action.status} />
+                            <span className="ml-auto shrink-0 text-[10px] text-text-muted">{relativeTime(action.createdAt)}</span>
+                          </div>
+                          <p className="mt-0.5 truncate text-[11px] text-text-secondary">{action.body || action.goal}</p>
+                          <div className="mt-1 flex items-center gap-1.5 text-[10px] text-text-muted">
+                            <ShieldCheck size={10} />
+                            <span>{authorizationLabel(action.authorizationBasis)}</span>
+                            {action.attempts > 0 && <span>· attempt {action.attempts}</span>}
+                            {action.scheduledFor && action.status === 'planned' && <span>· due {relativeTime(action.scheduledFor)}</span>}
+                            {cancellable && (
+                              <button
+                                type="button"
+                                className="ml-auto text-text-muted hover:text-danger"
+                                disabled={cancelling === action.id}
+                                onClick={() => void cancelAction(action.id)}
+                              >
+                                {cancelling === action.id ? 'Cancelling…' : 'Cancel'}
+                              </button>
+                            )}
+                          </div>
+                          {action.lastError && <p className="mt-1 truncate text-[10px] text-danger">{action.lastError}</p>}
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function PanelLabel({ icon, label }: { icon: ReactNode; label: string }) {
+  return <div className="flex items-center gap-1.5 bg-surface-2/60 px-3.5 py-2 text-[10px] font-semibold uppercase tracking-[0.14em] text-text-muted">{icon}{label}</div>;
+}
+
+function EmptyLedger({ text }: { text: string }) {
+  return <p className="px-4 py-6 text-center text-[11px] leading-relaxed text-text-muted">{text}</p>;
+}
+
+function LedgerChip({ children, tone = 'neutral' }: { children: ReactNode; tone?: 'neutral' | 'warn' }) {
+  return <span className={clsx('rounded-full px-1.5 py-0.5', tone === 'warn' ? 'bg-amber-500/10 text-amber-400' : 'bg-surface-3 text-text-secondary')}>{children}</span>;
+}
+
+function ActionStatusIcon({ status }: { status: ChannelActionStatus }) {
+  if (status === 'delivered') return <CheckCircle2 size={13} className="mt-0.5 shrink-0 text-success" />;
+  if (status === 'failed') return <XCircle size={13} className="mt-0.5 shrink-0 text-danger" />;
+  if (status === 'executing') return <Loader2 size={13} className="mt-0.5 shrink-0 animate-spin text-accent" />;
+  return <Clock3 size={13} className="mt-0.5 shrink-0 text-amber-400" />;
+}
+
+function ActionStatusBadge({ status }: { status: ChannelActionStatus }) {
+  const tone = status === 'delivered' ? 'bg-success-soft text-success'
+    : status === 'failed' ? 'bg-danger-soft text-danger'
+      : status === 'cancelled' || status === 'superseded' ? 'bg-surface-3 text-text-muted'
+        : 'bg-amber-500/10 text-amber-400';
+  return <span className={clsx('shrink-0 rounded-full px-1.5 py-0.5 text-[9px] uppercase tracking-wide', tone)}>{status.replace('_', ' ')}</span>;
+}
+
+function primaryAlias(peer: ChannelInboxPeer): string {
+  return peer.aliases.find((alias) => alias.kind === 'phone')?.value ?? peer.aliases[0]?.value ?? 'Unknown contact';
+}
+
+function authorizationLabel(value: string): string {
+  if (value === 'verified_owner_command') return 'Owner command';
+  if (value === 'operator_approval') return 'Operator approved';
+  if (value === 'relationship_next_action') return 'Relationship plan';
+  if (value === 'standing_goal') return 'Standing goal';
+  return 'Connection grant';
+}
+
+function relativeTime(value: string | null): string {
+  if (!value) return '—';
+  const delta = new Date(value).getTime() - Date.now();
+  if (!Number.isFinite(delta)) return '—';
+  const absolute = Math.abs(delta);
+  const suffix = delta >= 0 ? 'from now' : 'ago';
+  if (absolute < 60_000) return delta >= 0 ? 'now' : 'just now';
+  if (absolute < 3_600_000) return `${Math.round(absolute / 60_000)}m ${suffix}`;
+  if (absolute < 86_400_000) return `${Math.round(absolute / 3_600_000)}h ${suffix}`;
+  return `${Math.round(absolute / 86_400_000)}d ${suffix}`;
+}
+
+function dedupeBy<T>(items: T[], key: (item: T) => string): T[] {
+  const seen = new Set<string>();
+  return items.filter((item) => {
+    const value = key(item);
+    if (seen.has(value)) return false;
+    seen.add(value);
+    return true;
+  });
+}
+
 interface QrState {
   connectionId: string;
   dataUrl?: string;
   status: string;
+  recovery?: {
+    reason: string;
+    attempt: number;
+    nextRetryAt?: string;
+  };
 }
 
 function ProviderCard({
@@ -269,9 +554,9 @@ function ProviderCard({
     pollRef.current = setInterval(() => {
       void (async () => {
         try {
-          const state = await api<{ status: string; qrDataUrl?: string }>(`/v1/channels/${qrConnId}/login`);
+          const state = await api<{ status: string; qrDataUrl?: string; recovery?: QrState['recovery'] }>(`/v1/channels/${qrConnId}/login`);
           setQr((prev) => (prev && prev.connectionId === qrConnId
-            ? { ...prev, status: state.status, dataUrl: state.qrDataUrl ?? prev.dataUrl }
+            ? { ...prev, status: state.status, dataUrl: state.qrDataUrl, recovery: state.recovery }
             : prev));
           if (state.status === 'open') {
             toast.success(`${provider.label} transport open`);
@@ -372,8 +657,8 @@ function ProviderCard({
         connId = created.connection.id;
         setLastHealth(created.health);
       }
-      const login = await api<{ status: string; qrDataUrl?: string }>(`/v1/channels/${connId}/login`, { method: 'POST' });
-      setQr({ connectionId: connId, status: login.status, dataUrl: login.qrDataUrl });
+      const login = await api<{ status: string; qrDataUrl?: string; recovery?: QrState['recovery'] }>(`/v1/channels/${connId}/login`, { method: 'POST' });
+      setQr({ connectionId: connId, status: login.status, dataUrl: login.qrDataUrl, recovery: login.recovery });
       setConnecting(true);
     } catch (err) {
       toast.error(`Could not start ${provider.label} login`, String(err));
@@ -461,7 +746,12 @@ function ProviderCard({
       </div>
 
       {qr ? (
-        <QrPanel provider={provider} qr={qr} onCancel={() => { setQr(null); setConnecting(false); }} />
+        <QrPanel
+          provider={provider}
+          qr={qr}
+          onCancel={() => { setQr(null); setConnecting(false); }}
+          onRetry={() => void startQrLogin(qr.connectionId)}
+        />
       ) : connection ? (
         <>
           <div className="mt-1 text-[12px] text-text-muted">
@@ -631,19 +921,39 @@ function ProviderCard({
   );
 }
 
-function QrPanel({ provider, qr, onCancel }: { provider: Provider; qr: QrState; onCancel: () => void }) {
+function QrPanel({ provider, qr, onCancel, onRetry }: { provider: Provider; qr: QrState; onCancel: () => void; onRetry: () => void }) {
+  const failed = qr.status === 'closed' || qr.status === 'error' || qr.status === 'logged_out';
+  const retryAt = qr.recovery?.nextRetryAt ? new Date(qr.recovery.nextRetryAt).toLocaleTimeString() : null;
   return (
     <div className="mt-3 flex flex-col items-center gap-2 rounded-input border border-line bg-surface-2 p-4">
-      {qr.dataUrl ? (
+      {qr.status === 'qr' && qr.dataUrl ? (
         <img src={qr.dataUrl} alt={`${provider.label} login QR`} className="h-44 w-44 rounded bg-white p-1" />
-      ) : (
+      ) : !failed ? (
         <Loader2 size={28} className="animate-spin text-text-muted" />
+      ) : (
+        <AlertTriangle size={28} className="text-danger" />
       )}
       <p className="text-center text-[12px] text-text-secondary">
-        Open WhatsApp Linked Devices and scan this code.
+        {qr.status === 'qr'
+          ? 'Open WhatsApp Linked Devices and scan this code.'
+          : failed
+            ? 'WhatsApp closed the pairing transport before it generated a QR code.'
+            : 'Starting the WhatsApp pairing transport…'}
       </p>
       <p className="text-[11px] text-text-muted">Transport status: {qr.status}</p>
-      <Button size="sm" variant="ghost" onClick={onCancel}>Cancel</Button>
+      {failed && (
+        <p className="text-center text-[11px] text-text-muted">
+          {qr.recovery?.reason === 'exhausted'
+            ? 'Automatic retries are exhausted.'
+            : retryAt
+              ? `Automatic retry scheduled for ${retryAt}.`
+              : 'You can retry immediately.'}
+        </p>
+      )}
+      <div className="flex gap-2">
+        {failed && <Button size="sm" variant="secondary" onClick={onRetry}>Retry now</Button>}
+        <Button size="sm" variant="ghost" onClick={onCancel}>Cancel</Button>
+      </div>
     </div>
   );
 }

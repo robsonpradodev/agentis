@@ -104,6 +104,35 @@ describe('realtimeActivity task spine events', () => {
     });
   });
 
+  it('preserves typed runtime metadata and uses a stable activity id for cumulative updates', () => {
+    const first = describeRealtimeActivity({
+      event: REALTIME_EVENTS.AGENT_WORK_STEP,
+      emittedAt: '2026-08-23T12:00:00.000Z',
+      payload: {
+        activityId: 'runtime-wait-1', runId: 'run-1', nodeId: 'node-1',
+        activityKind: 'waiting', activityStatus: 'running', phase: 'model_waiting',
+        description: 'Provider has not produced output yet.', transport: 'hermes_acp',
+        attempt: 1, startedAt: '2026-08-23T11:59:45.000Z', durationMs: 15_000,
+      },
+    });
+    const update = describeRealtimeActivity({
+      event: REALTIME_EVENTS.AGENT_WORK_STEP,
+      emittedAt: '2026-08-23T12:00:05.000Z',
+      payload: {
+        activityId: 'runtime-wait-1', runId: 'run-1', nodeId: 'node-1',
+        activityKind: 'fallback', activityStatus: 'success', phase: 'transport_recovery',
+        description: 'Continuing through Hermes CLI.', transport: 'hermes_cli',
+        attempt: 1, completedAt: '2026-08-23T12:00:05.000Z', durationMs: 20_000,
+      },
+    });
+
+    expect(first).toMatchObject({
+      id: 'runtime-wait-1', activityKind: 'waiting', status: 'running',
+      transport: 'hermes_acp', attempt: 1, durationMs: 15_000,
+    });
+    expect(update).toMatchObject({ id: 'runtime-wait-1', activityKind: 'fallback', transport: 'hermes_cli' });
+  });
+
   it('does not present mechanical completion as success when the business verdict failed', () => {
     const activity = describeRealtimeActivity({
       event: REALTIME_EVENTS.RUN_COMPLETED,
