@@ -36,7 +36,7 @@
     "@huggingface/transformers": "4.2.0",
     "@scalar/hono-api-reference": "^0.5.150",
     "baileys": "7.0.0-rc13",
-    "bcryptjs": "^2.4.3",
+    "bcryptjs": "^3.0.3",
     "discord.js": "^14.16.0",
     "drizzle-orm": "^0.45.2",
     "exceljs": "^4.4.0",
@@ -53,7 +53,7 @@
     "zod": "^3.23.8"
   },
   "devDependencies": {
-    "@types/bcryptjs": "^2.4.6",
+    "@types/bcryptjs": "^3.0.0",
     "@types/qrcode": "^1.5.5",
     "better-sqlite3": "^12.4.1",
     "tsx": "^4.19.0",
