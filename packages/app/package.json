@@ -17,7 +17,7 @@
   "dependencies": {
     "@agentis/core": "workspace:*",
     "@agentis/db": "workspace:*",
-    "drizzle-orm": "^0.45.2",
+    "drizzle-orm": "^0.45.3",
     "zod": "^3.23.8"
   },
   "devDependencies": {
