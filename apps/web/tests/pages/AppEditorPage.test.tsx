@@ -70,7 +70,7 @@ function surfaceRow(name: string, view: unknown = { type: 'Stack', children: [] 
   };
 }
 
-function renderEditor(facet: 'interface' | 'workflow' = 'interface') {
+function renderEditor(facet: 'interface' | 'workflow' | 'data' | 'brain' = 'interface') {
   render(
     <MemoryRouter initialEntries={[`/apps/app-1?facet=${facet}`]}>
       <Routes>
@@ -95,6 +95,48 @@ describe('<AppEditorPage />', () => {
     localStorage.clear();
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
+  });
+
+  it('reveals a completed managed React build instead of an empty legacy editor', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input);
+      const method = init?.method ?? 'GET';
+      const realtime = realtimeStreamResponse(path, method);
+      if (realtime) return realtime;
+      if (path === '/v1/apps/app-1' && method === 'GET') return jsonResponse({ data: appRecord() });
+      if (path === '/v1/apps/app-1/surfaces' && method === 'GET') {
+        return jsonResponse({ data: [surfaceRow('legacy')] });
+      }
+      if (path === '/v1/apps/app-1/collections' && method === 'GET') return jsonResponse({ data: [] });
+      if (path === '/v1/apps/app-1/workflows' && method === 'GET') return jsonResponse({ data: [] });
+      if (path === '/v1/apps/app-1/project' && method === 'GET') return jsonResponse({
+        project: { appId: 'app-1', headCommit: '1234567890abcdef' },
+        builds: [{
+          id: 'build-1', appId: 'app-1', workspaceId: 'ws-1', sourceCommit: '1234567890abcdef',
+          status: 'completed', artifactPath: 'artifact', artifactSha256: 'sha', sbomPath: null,
+          log: '', startedAt: null, completedAt: null, createdAt: '', updatedAt: '',
+        }],
+      });
+      if (path === '/v1/apps/app-1/frontend/' && method === 'GET') {
+        return new Response('<!doctype html><html><head></head><body><div>Real React UI</div></body></html>');
+      }
+      throw new Error(`Unexpected request: ${method} ${path}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    renderEditor('interface');
+
+    expect(await screen.findByTitle('Managed app interface', {}, { timeout: 5_000 })).toBeInTheDocument();
+    expect(screen.queryByText('Empty surface')).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.getByTestId('location-search')).toHaveTextContent('mode=live'));
+    expect(screen.getByRole('tab', { name: 'Workflow' })).toBeInTheDocument();
+    expect(screen.queryByRole('tab', { name: 'Runtime' })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Open interface full screen' }));
+    expect(screen.getByRole('button', { name: 'Return to App' })).toBeInTheDocument();
+    await userEvent.keyboard('{Escape}');
+    expect(screen.queryByRole('button', { name: 'Return to App' })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Open interface full screen' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Return to App' }));
+    expect(screen.queryByRole('button', { name: 'Return to App' })).not.toBeInTheDocument();
   });
 
   it('keeps the workflow facet mounted after renaming a workflow', async () => {
@@ -131,7 +173,6 @@ describe('<AppEditorPage />', () => {
         expect.objectContaining({ method: 'PATCH', body: JSON.stringify({ title: 'Renamed workflow' }) }),
       );
     });
-
     expect(screen.getByRole('tab', { name: 'Renamed workflow' })).toBeInTheDocument();
     expect(screen.getByTestId('workflow-canvas')).toHaveTextContent('Canvas wf-1');
   });
@@ -363,6 +404,11 @@ describe('<AppEditorPage />', () => {
       if (path === '/v1/apps/app-1/surfaces' && method === 'GET') return jsonResponse({ data: [surfaceRow('Dashboard')] });
       if (path === '/v1/apps/app-1/collections' && method === 'GET') return jsonResponse({ data: [] });
       if (path === '/v1/apps/app-1/workflows' && method === 'GET') return jsonResponse({ data: [] });
+      if (path === '/v1/apps/app-1/definition' && method === 'GET') return jsonResponse({ definition: null });
+      if (path === '/v1/apps/app-1/operations' && method === 'GET') return jsonResponse({ operations: [] });
+      if (path === '/v1/apps/app-1/tasks' && method === 'GET') return jsonResponse({ tasks: [] });
+      if (path === '/v1/effects?appId=app-1' && method === 'GET') return jsonResponse({ effects: [] });
+      if (path === '/v1/apps/app-1/project' && method === 'GET') return jsonResponse({ project: null, builds: [] });
       if (path === '/v1/apps/app-1' && method === 'PATCH') {
         lastPatch = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
         appState = {
@@ -382,6 +428,9 @@ describe('<AppEditorPage />', () => {
     await userEvent.click(screen.getByRole('button', { name: 'App engine' }));
 
     const dialog = screen.getByRole('dialog', { name: 'App engine' });
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Runtime' }));
+    expect(await within(dialog).findByText('AGENTIC APP · SEMANTIC CONTROL PLANE')).toBeInTheDocument();
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Overview' }));
     // Overview is the default, merged (identity + entry surface + organization) page.
     await userEvent.clear(within(dialog).getByLabelText('Name'));
     await userEvent.type(within(dialog).getByLabelText('Name'), 'Store Command Center');

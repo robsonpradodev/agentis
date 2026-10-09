@@ -10,11 +10,16 @@ import { randomUUID } from 'node:crypto';
 import type { AgentisToolDefinition, ApprovalSensitivity, ChatPermissionMode, ChatTurnContext } from '@agentis/core';
 import type { Logger } from '../../logger.js';
 import type { AgentisToolRegistry } from '../agentisToolRegistry.js';
+import type { AgentMissionService } from '../agentMissions.js';
 import { decideToolApproval } from './chatApprovalPolicy.js';
+import { canonicalAgentisToolName, reconcileMissionToolResult } from '../missionToolResultReconciler.js';
+
+export { canonicalAgentisToolName } from '../missionToolResultReconciler.js';
 
 export interface ChatToolExecutorDeps {
   registry: AgentisToolRegistry;
   logger?: Logger;
+  missions?: AgentMissionService;
 }
 
 export class ChatToolExecutor {
@@ -25,7 +30,7 @@ export class ChatToolExecutor {
   }
 
   static definition(name: string): AgentisToolDefinition | undefined {
-    return this.#deps?.registry.get(name);
+    return this.#deps?.registry.get(canonicalAgentisToolName(name));
   }
 
   /**
@@ -83,6 +88,7 @@ export class ChatToolExecutor {
   ]);
 
   static isHighImpact(name: string): boolean {
+    name = canonicalAgentisToolName(name);
     if (name.startsWith('workflow.')) return true;
     if (name.startsWith('agentis.command.')) return true;
     if (this.#HIGH_IMPACT_TOOL_IDS.has(name)) return true;
@@ -97,6 +103,7 @@ export class ChatToolExecutor {
   }
 
   static isMutating(name: string): boolean {
+    name = canonicalAgentisToolName(name);
     if (name.startsWith('workflow.')) return true;
     return Boolean(this.definition(name)?.mutating);
   }
@@ -111,6 +118,7 @@ export class ChatToolExecutor {
     name: string,
     args: unknown,
     ctx: ChatTurnContext,
+    sourceToolCallId?: string,
   ): Promise<{ data?: unknown; error?: string }> {
     if (!this.#deps) {
       return { error: `Tool "${name}" is not available because the Agentis tool registry is not configured.` };
@@ -123,16 +131,17 @@ export class ChatToolExecutor {
     // Dynamic per-workflow tools surface as `workflow.<id>`. Rewrite them to
     // the generic agentis.workflow.run handler with the id pulled from the
     // tool name and the model's args passed straight through as inputs.
-    let toolId = name;
-    let toolInput = input;
+    let toolId = canonicalAgentisToolName(name);
+    let toolInput = name === 'image.generate' ? { modality: 'image', ...input } : input;
     if (name.startsWith('workflow.')) {
       const workflowId = name.slice('workflow.'.length);
       toolId = 'agentis.workflow.run';
       toolInput = { workflowId, inputs: input };
     }
 
+    const toolCallId = sourceToolCallId?.trim() || randomUUID();
     const outcome = await this.#deps.registry.execute(
-      { id: randomUUID(), toolId, arguments: toolInput },
+      { id: toolCallId, toolId, arguments: toolInput },
       {
         workspaceId: ctx.workspaceId,
         ambientId: ctx.ambientId ?? null,
@@ -140,6 +149,7 @@ export class ChatToolExecutor {
         userId: ctx.userId,
         runId: ctx.runId,
         conversationId: ctx.conversationId,
+        missionId: ctx.missionId,
         durableTurnId: ctx.durableTurnId,
         consultationId: ctx.consultationId,
         consultationDepth: ctx.consultationDepth,
@@ -159,6 +169,18 @@ export class ChatToolExecutor {
     );
 
     if (outcome.ok) {
+      if (ctx.missionId && this.#deps.missions) reconcileMissionToolResult(
+        this.#deps.missions,
+        this.#deps.registry,
+        {
+          workspaceId: ctx.workspaceId,
+          missionId: ctx.missionId,
+          toolId,
+          toolCallId,
+          toolInput,
+          output: outcome.output,
+        },
+      );
       return { data: outcome.output };
     }
 

@@ -6,7 +6,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { randomUUID } from 'node:crypto';
 import { eq } from 'drizzle-orm';
-import { REALTIME_EVENTS, type WorkflowGraph } from '@agentis/core';
+import { REALTIME_EVENTS, REALTIME_ROOMS, type WorkflowGraph } from '@agentis/core';
 import { AppStore, AppDatastore } from '@agentis/app';
 import { schema } from '@agentis/db/sqlite';
 import { WorkflowEngine } from '../../src/engine/WorkflowEngine.js';
@@ -30,7 +30,10 @@ beforeEach(async () => {
 });
 afterEach(() => ctx.close());
 
-async function runDataQuery(config: Record<string, unknown>): Promise<Record<string, unknown>> {
+async function runDataQuery(
+  config: Record<string, unknown>,
+  options: { quietWorkspaceEvents?: boolean; workspaceEvents?: string[] } = {},
+): Promise<Record<string, unknown>> {
   const graph = {
     version: 1, viewport: { x: 0, y: 0, zoom: 1 },
     nodes: [
@@ -55,13 +58,19 @@ async function runDataQuery(config: Record<string, unknown>): Promise<Record<str
     appData: new AppDatastore(ctx.db),
   });
   const initialState = buildInitialRunState({ runId, workflowId: wfId, graph, inputs: {} });
+  const stopWorkspaceCapture = ctx.bus.subscribe((message) => {
+    if (message.room === REALTIME_ROOMS.workspace(ctx.workspace.id)) {
+      options.workspaceEvents?.push(message.envelope.event);
+    }
+  });
   await new Promise<void>((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error('timeout')), 15_000);
     const off = ctx.bus.subscribe((m) => {
       if (m.room === `run:${runId}` && (m.envelope.event === REALTIME_EVENTS.RUN_COMPLETED || m.envelope.event === REALTIME_EVENTS.RUN_FAILED)) { clearTimeout(timer); off(); resolve(); }
     });
-    void engine.startRun({ workspaceId: ctx.workspace.id, ambientId: ctx.ambient.id, workflowId: wfId, userId: ctx.user.id, triggerId: null, inputs: {}, initialState, graph });
+    void engine.startRun({ workspaceId: ctx.workspace.id, ambientId: ctx.ambient.id, workflowId: wfId, userId: ctx.user.id, triggerId: null, inputs: {}, initialState, graph, quietWorkspaceEvents: options.quietWorkspaceEvents });
   });
+  stopWorkspaceCapture();
   const run = ctx.db.select().from(schema.workflowRuns).where(eq(schema.workflowRuns.id, runId)).get()!;
   expect(run.status).toBe('COMPLETED');
   const state = run.runState as { nodeStates: Record<string, { outputData?: Record<string, unknown> }> };
@@ -90,5 +99,13 @@ describe('WorkflowEngine — data_query node', () => {
     const out = await runDataQuery({ mode: 'query', paginate: true, limit: 10, outputKey: 'deals' });
     expect((out.deals as unknown[]).length).toBe(25);
     expect(out.count).toBe(25);
+  });
+
+  it('keeps internal query lifecycle events out of the workspace notification room', async () => {
+    const workspaceEvents: string[] = [];
+    await runDataQuery({ mode: 'query', outputKey: 'deals' }, { quietWorkspaceEvents: true, workspaceEvents });
+    expect(workspaceEvents).not.toContain(REALTIME_EVENTS.RUN_RUNNING);
+    expect(workspaceEvents).not.toContain(REALTIME_EVENTS.RUN_COMPLETED);
+    expect(workspaceEvents).not.toContain(REALTIME_EVENTS.RUN_SETTLED);
   });
 });

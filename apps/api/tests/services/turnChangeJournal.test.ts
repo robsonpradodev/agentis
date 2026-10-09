@@ -22,7 +22,7 @@ function fixture() {
     INSERT INTO workspaces (id, user_id, name, slug)
     VALUES ('ws-1', 'user-1', 'Workspace', 'workspace');
     INSERT INTO agents (id, workspace_id, user_id, name, adapter_type)
-    VALUES ('agent-1', 'ws-1', 'user-1', 'Bia', 'codex');
+    VALUES ('agent-1', 'ws-1', 'user-1', 'Ava', 'codex');
     INSERT INTO conversations (id, workspace_id, user_id, agent_id)
     VALUES ('conv-1', 'ws-1', 'user-1', 'agent-1');
   `);
@@ -52,18 +52,18 @@ describe('TurnChangeJournal', () => {
     const sealed = journal.seal('ws-1', 'turn-1')!;
     expect(sealed).toMatchObject({ state: 'undoable', reversibleCount: 1, sensitiveCount: 0 });
 
-    sqlite.prepare("UPDATE agents SET name = 'Bia Later' WHERE id = 'agent-1'").run();
+    sqlite.prepare("UPDATE agents SET name = 'Ava Later' WHERE id = 'agent-1'").run();
     const undone = journal.undo({ workspaceId: 'ws-1', turnId: 'turn-1', expectedVersion: sealed.version });
     expect(undone.conflicts).toBeUndefined();
     expect(undone.changeSet.state).toBe('undone');
     expect(sqlite.prepare("SELECT name, description FROM agents WHERE id = 'agent-1'").get()).toEqual({
-      name: 'Bia Later', description: null,
+      name: 'Ava Later', description: null,
     });
 
     const redone = journal.redo({ workspaceId: 'ws-1', turnId: 'turn-1', expectedVersion: undone.changeSet.version });
     expect(redone.changeSet.state).toBe('undoable');
     expect(sqlite.prepare("SELECT name, description FROM agents WHERE id = 'agent-1'").get()).toEqual({
-      name: 'Bia Later', description: 'Changed by agent',
+      name: 'Ava Later', description: 'Changed by agent',
     });
   });
 

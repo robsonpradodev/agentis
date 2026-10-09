@@ -76,9 +76,23 @@ export function messageTimestampMs(message: unknown): number {
   return Number.isFinite(seconds) && seconds > 0 ? seconds * 1_000 : Date.now();
 }
 
-/** Decide which Baileys upserts may enter live conversation state. */
-export function shouldProcessWhatsAppUpsert(type: string, _fromMe: boolean): boolean {
-  return type === 'notify';
+/**
+ * Decide which Baileys upserts may enter live conversation state.
+ *
+ * Baileys occasionally labels a genuinely new message as `append` while a
+ * companion is catching up. Treating every append as inert history orphaned
+ * those messages until the customer wrote again. A recent provider timestamp remains
+ * safe to process live: downstream provider-id deduplication prevents a later
+ * `notify` copy from running twice. Older appends remain silent reconciliation.
+ */
+export function shouldProcessWhatsAppUpsert(
+  type: string,
+  _fromMe: boolean,
+  occurredAt = 0,
+  now = Date.now(),
+): boolean {
+  if (type === 'notify') return true;
+  return type === 'append' && occurredAt > 0 && occurredAt >= now - 30_000 && occurredAt <= now + 5_000;
 }
 
 /** Stable recovery classes persisted as diagnostics; provider codes stay in logs. */

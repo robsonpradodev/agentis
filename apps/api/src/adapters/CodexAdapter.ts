@@ -496,15 +496,16 @@ export class CodexAdapter implements AgentAdapter {
       return parts;
     };
 
-    const runtimeConfig: CliChatRuntimeConfig = {
+    let runtimeConfig: CliChatRuntimeConfig = {
       binary: this.opts.binaryPath ?? 'codex',
       args,
       cwd: this.opts.cwd,
       env: this.opts.env,
-      stdin: buildCodexChatPrompt(messages, tools, this.#mcpNative() && !callerOwnsToolLoop, Boolean(storedSession)),
+      stdin: buildCodexChatPrompt(messages, tools, this.#mcpNative() && !callerOwnsToolLoop, Boolean(storedSession), callerOwnsToolLoop),
       displayName: 'Codex',
       logTag: 'codex.chat',
       logger: this.opts.logger,
+      tools,
       signal: options?.signal,
       idleTimeoutMs,
       hardCeilingMs: chatHardCeilingMs(idleTimeoutMs, 'AGENTIS_CODEX_CHAT_HARD_CEILING_MS'),
@@ -516,9 +517,29 @@ export class CodexAdapter implements AgentAdapter {
       onEmptyResult: () => this.opts.logger.warn('codex.chat.no_output_parsed', { types: [...seenTypes].slice(0, 40) }),
     };
     let cacheRecoveryUsed = false;
+    let sessionRecoveryUsed = false;
     for (;;) {
       let retry = false;
+      let retryReason: 'model_cache' | 'stale_session' | null = null;
       for await (const delta of runCliChatTurn(runtimeConfig)) {
+        if (storedSession && !sessionRecoveryUsed && delta.type === 'tool_result' && delta.id === 'adapter'
+          && delta.name === 'adapter.chat' && typeof delta.error === 'string'
+          && isCodexSessionResumeFailure(delta.error)) {
+          sessionRecoveryUsed = true;
+          retry = true;
+          retryReason = 'stale_session';
+          this.#sessions.delete(sessionKey);
+          if (this.opts.sessionStore && this.opts.workspaceId) {
+            this.opts.sessionStore.remove(this.opts.workspaceId, this.opts.agentId, sessionKey);
+          }
+          runtimeConfig = {
+            ...runtimeConfig,
+            args: [...baseArgs, ...imageArgs],
+            stdin: buildCodexChatPrompt(messages, tools, this.#mcpNative() && !callerOwnsToolLoop, false, callerOwnsToolLoop),
+          };
+          this.opts.logger.warn('codex.chat.stale_session_recovered', { sessionKey });
+          continue;
+        }
         if (!cacheRecoveryUsed && delta.type === 'tool_result' && delta.id === 'adapter'
           && delta.name === 'adapter.chat' && typeof delta.error === 'string'
           && isCodexModelCacheFailure(delta.error)) {
@@ -526,6 +547,7 @@ export class CodexAdapter implements AgentAdapter {
           if (recovered) {
             cacheRecoveryUsed = true;
             retry = true;
+            retryReason = 'model_cache';
             yield {
               type: 'activity', id: 'codex-model-cache-recovery', phase: 'runtime', status: 'running',
               label: 'Refreshing incompatible Codex model cache',
@@ -538,10 +560,15 @@ export class CodexAdapter implements AgentAdapter {
         yield delta;
       }
       if (!retry) return;
-      yield {
-        type: 'activity', id: 'codex-model-cache-recovery', phase: 'runtime', status: 'success',
-        label: 'Codex model cache refreshed', detail: 'Retrying the original request with a fresh model catalogue.',
-      };
+      yield retryReason === 'stale_session'
+        ? {
+            type: 'activity', id: 'codex-session-recovery', phase: 'runtime', status: 'running',
+            label: 'Refreshing the conversation runtime', detail: 'The saved runtime session was unavailable; retrying this turn once in a fresh session.',
+          }
+        : {
+            type: 'activity', id: 'codex-model-cache-recovery', phase: 'runtime', status: 'success',
+            label: 'Codex model cache refreshed', detail: 'Retrying the original request with a fresh model catalogue.',
+          };
     }
   }
 
@@ -566,6 +593,12 @@ export class CodexAdapter implements AgentAdapter {
       timestamp: new Date().toISOString(),
     });
   }
+}
+
+/** A persisted Codex thread can disappear after an upgrade, cleanup, or runtime switch. */
+export function isCodexSessionResumeFailure(detail: string): boolean {
+  return /(?:thread|session|conversation).{0,80}(?:not found|does not exist|missing|unavailable|failed to (?:load|resume))/iu.test(detail)
+    || /failed to resume/iu.test(detail);
 }
 
 function buildCodexArgs(
@@ -1121,13 +1154,13 @@ function firstString(...values: unknown[]): string | undefined {
   return undefined;
 }
 
-function buildCodexChatPrompt(messages: ChatMessage[], tools: ToolDefinition[], mcpNative = false, resumedSession = false): string {
+function buildCodexChatPrompt(messages: ChatMessage[], tools: ToolDefinition[], mcpNative = false, resumedSession = false, callerManagedTools = false): string {
   // MCP-native: the harness mounts the `agentis` MCP server and calls those tools
   // itself, so we drop the marker-protocol instructions entirely and just give it
   // the conversation. It runs its own loop and returns the final answer.
   const toolPreamble = mcpNative
     ? 'You have the Agentis platform tools available via the "agentis" MCP server (build workflows, run them, inspect the workspace, dispatch agents, etc.). Use them directly to fulfill the request, then reply with a concise final answer.'
-    : buildMarkerToolPrompt(tools);
+    : buildMarkerToolPrompt(tools, { nativeTools: !callerManagedTools });
   // A resumed Codex thread already owns its prior conversation and tool history.
   // Re-sending Agentis's history duplicates the same turns inside the harness
   // and makes every subsequent model pass progressively more expensive. Refresh

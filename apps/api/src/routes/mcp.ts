@@ -21,6 +21,7 @@
  * Publication state lives in `workflow.settings.mcp`.
  */
 
+import { randomUUID } from 'node:crypto';
 import { Hono } from 'hono';
 import { and, eq } from 'drizzle-orm';
 import {
@@ -43,6 +44,11 @@ import type { ConversationTurnLeaseRegistry } from '../services/conversation/con
 import { APPROVAL_SENSITIVITY_HEADER, CONVERSATION_ID_HEADER, TURN_LEASE_HEADER } from '../services/mcp/mcpHarnessSession.js';
 import { decideToolApproval, resolveToolApprovalPolicy } from '../services/chat/chatApprovalPolicy.js';
 import { resultProvidesCompletionEvidence } from '../services/chat/completionEvidence.js';
+import type { AgentMissionService } from '../services/agentMissions.js';
+import { AppOperationRuntime } from '../services/appOperationRuntime.js';
+import { AppDefinitionStore } from '@agentis/app';
+import type { ExtensionRuntime } from '../services/extensionRuntime.js';
+import { reconcileMissionToolResult } from '../services/missionToolResultReconciler.js';
 
 interface McpSettings { published?: boolean; slug?: string }
 
@@ -51,7 +57,9 @@ const PROTOCOL_VERSION = '2025-06-18';
 const MCP_CAPABILITIES = {
   tools: { listChanged: false },
   resources: { listChanged: false },
+  extensions: { 'io.modelcontextprotocol/tasks': {} },
 };
+const APP_OPERATION_PREFIX = 'agentis_app__';
 const AGENTIS_GATEWAY_INSTRUCTIONS = [
   'Agentis exposes a progressive-disclosure gateway, not its full internal control plane.',
   'Start with agentis.orient. Use agentis.tools.search, then agentis.tools.describe, then agentis.tools.call.',
@@ -76,6 +84,8 @@ export interface McpRoutesDeps {
   toolRegistry?: AgentisToolRegistry;
   /** Revocable capabilities for tools called by interactive CLI harness turns. */
   turnLeases?: ConversationTurnLeaseRegistry;
+  missions: AgentMissionService;
+  extensions?: ExtensionRuntime;
 }
 
 export function buildMcpRoutes(deps: McpRoutesDeps) {
@@ -200,6 +210,29 @@ export function buildMcpRoutes(deps: McpRoutesDeps) {
           if (!contents) return c.json(rpcError(id, -32602, `Unknown resource '${params.uri}'`));
           return c.json(rpcResult(id, contents));
         }
+        case 'tasks/get': {
+          const params = (body.params ?? {}) as { taskId?: string };
+          if (!params.taskId) return c.json(rpcError(id, -32602, 'tasks/get requires params.taskId'));
+          return c.json(rpcResult(id, toMcpTask(deps.missions.inspect(ws.workspaceId, params.taskId))));
+        }
+        case 'tasks/list': {
+          const params = (body.params ?? {}) as { limit?: number };
+          return c.json(rpcResult(id, { tasks: deps.missions.list(ws.workspaceId, { limit: params.limit }).map(toMcpTask) }));
+        }
+        case 'tasks/cancel': {
+          const params = (body.params ?? {}) as { taskId?: string };
+          if (!params.taskId) return c.json(rpcError(id, -32602, 'tasks/cancel requires params.taskId'));
+          return c.json(rpcResult(id, toMcpTask(deps.missions.cancel(ws.workspaceId, params.taskId, 'Cancelled by MCP client'))));
+        }
+        case 'tasks/update': {
+          const params = (body.params ?? {}) as { taskId?: string; inputResponses?: Record<string, unknown> };
+          if (!params.taskId || !params.inputResponses) return c.json(rpcError(id, -32602, 'tasks/update requires taskId and inputResponses'));
+          let task = deps.missions.inspect(ws.workspaceId, params.taskId);
+          for (const [requestId, response] of Object.entries(params.inputResponses)) {
+            task = deps.missions.submitInput(ws.workspaceId, task.id, requestId, response, ws.user.id);
+          }
+          return c.json(rpcResult(id, toMcpTask(task)));
+        }
         case 'tools/list': {
           // A conversation lease already carries the exact catalog selected by
           // ChatSessionExecutor. Native harnesses need those real schemas (not
@@ -226,12 +259,59 @@ export function buildMcpRoutes(deps: McpRoutesDeps) {
             channelOrigin = leaseContext?.channelOrigin;
           }
           const startedAt = Date.now();
+          const effectiveArguments = params.name === 'agentis.tools.call'
+            && params.arguments?.arguments && typeof params.arguments.arguments === 'object' && !Array.isArray(params.arguments.arguments)
+            ? params.arguments.arguments as Record<string, unknown> : params.arguments ?? {};
+          const toolCallId = `mcp:${turnLease ?? 'unleased'}:${String(id ?? randomUUID())}`;
+          const appOperation = parseAppOperationTool(effectiveToolName);
+          if (appOperation) {
+            const invoked = await new AppOperationRuntime(deps).invoke({
+              workspaceId: ws.workspaceId, ambientId: ws.ambientId, userId: ws.user.id,
+              appId: appOperation.appId, operationId: appOperation.operationId, input: effectiveArguments,
+            });
+            if (isObject(invoked) && invoked.kind === 'task' && isObject(invoked.task) && typeof invoked.task.id === 'string') {
+              const task = deps.missions.inspect(ws.workspaceId, invoked.task.id);
+              return c.json(rpcResult(id, textResult(JSON.stringify({ resultType: 'task', taskId: task.id, status: toMcpTask(task).status, pollIntervalMs: 1000 }))));
+            }
+            if (leaseContext?.missionId) reconcileMissionToolResult(deps.missions, deps.toolRegistry, {
+              workspaceId: ws.workspaceId,
+              missionId: leaseContext.missionId,
+              toolId: effectiveToolName,
+              toolCallId,
+              toolInput: effectiveArguments,
+              output: invoked,
+            });
+            // MCP tools/call results MUST carry `content` as a ContentBlock[];
+            // AppOperationRuntime's own `content` field is an unrelated
+            // ContentEnvelope (object), so returning `invoked` verbatim here
+            // shadows that key and fails strict MCP client validation.
+            return c.json(rpcResult(id, textResult(JSON.stringify(invoked))));
+          }
           const result = await callMcpTool(
             deps,
-            { ...ws, agentId, executionMode, approvalSensitivity, ...(conversationId ? { conversationId } : {}), ...(turnSignal ? { turnSignal } : {}), ...(channelOrigin ? { channelOrigin } : {}) },
+            {
+              ...ws,
+              agentId,
+              executionMode,
+              approvalSensitivity,
+              ...(conversationId ? { conversationId } : {}),
+              ...(leaseContext?.missionId ? { missionId: leaseContext.missionId } : {}),
+              ...(turnSignal ? { turnSignal } : {}),
+              ...(channelOrigin ? { channelOrigin } : {}),
+              toolCallId,
+            },
             params.name,
             params.arguments ?? {},
           );
+          const resultPayload = experiencePayload(result);
+          if (result.isError !== true && leaseContext?.missionId) reconcileMissionToolResult(deps.missions, deps.toolRegistry, {
+            workspaceId: ws.workspaceId,
+            missionId: leaseContext.missionId,
+            toolId: effectiveToolName,
+            toolCallId,
+            toolInput: effectiveArguments,
+            output: resultPayload,
+          });
           if (conversationId && turnLease && deps.turnLeases) {
             const gatewayTarget = params.name === 'agentis.tools.call' && typeof params.arguments?.name === 'string'
               ? params.arguments.name
@@ -255,8 +335,8 @@ export function buildMcpRoutes(deps: McpRoutesDeps) {
               token: turnLease,
               name: gatewayTarget,
               toolArgs: gatewayArguments,
-              result: experiencePayload(result),
-              ok: result.isError !== true && resultProvidesCompletionEvidence(experiencePayload(result)),
+              result: resultPayload,
+              ok: result.isError !== true && resultProvidesCompletionEvidence(resultPayload),
               mutating,
               durationMs: Date.now() - startedAt,
             });
@@ -299,7 +379,7 @@ interface McpTool {
   name: string;
   description: string;
   inputSchema: Record<string, unknown>;
-  kind: 'workflow' | 'registry';
+  kind: 'workflow' | 'registry' | 'app';
   /** workflow slug or registry tool id. */
   ref: string;
   annotations?: {
@@ -378,6 +458,26 @@ function allMcpOperations(deps: McpRoutesDeps, workspaceId: string): McpTool[] {
       });
     }
   }
+  const definitions = new AppDefinitionStore(deps.db);
+  const apps = deps.db.select({ id: schema.apps.id }).from(schema.apps)
+    .where(eq(schema.apps.workspaceId, workspaceId)).all();
+  for (const app of apps) {
+    const definition = definitions.get(workspaceId, app.id);
+    if (definition?.projections?.mcp.enabled === false) continue;
+    for (const operation of definition?.contract?.operations ?? []) {
+      tools.push({
+        name: `${APP_OPERATION_PREFIX}${app.id}__${operation.id}`,
+        description: operation.description || operation.title,
+        inputSchema: operation.inputSchema,
+        kind: 'app', ref: `${app.id}:${operation.id}`,
+        annotations: {
+          readOnlyHint: operation.effects.every((effect) => effect.level === 'read'),
+          destructiveHint: operation.effects.some((effect) => effect.level === 'irreversible'),
+          openWorldHint: operation.effects.some((effect) => effect.kind !== 'data_mutation'),
+        },
+      });
+    }
+  }
   return tools;
 }
 
@@ -423,7 +523,7 @@ function toMcpDescriptor(t: McpTool) {
 /** Execute an MCP tool call → MCP `content` result shape. */
 async function callMcpTool(
   deps: McpRoutesDeps,
-  ws: { workspaceId: string; ambientId: string | null; user: { id: string }; agentId?: string; executionMode?: 'chat' | 'plan' | 'ask'; approvalSensitivity?: ApprovalSensitivity; conversationId?: string; turnSignal?: AbortSignal; channelOrigin?: ChannelToolOrigin },
+  ws: { workspaceId: string; ambientId: string | null; user: { id: string }; agentId?: string; executionMode?: 'chat' | 'plan' | 'ask'; approvalSensitivity?: ApprovalSensitivity; conversationId?: string; missionId?: string; toolCallId?: string; turnSignal?: AbortSignal; channelOrigin?: ChannelToolOrigin },
   name: string,
   args: Record<string, unknown>,
 ): Promise<{ content: Array<{ type: 'text'; text: string }>; isError?: boolean }> {
@@ -512,11 +612,12 @@ async function callMcpTool(
       ...(ws.executionMode ? { executionMode: ws.executionMode } : {}),
       ...(ws.approvalSensitivity ? { approvalSensitivity: ws.approvalSensitivity } : {}),
       ...(ws.conversationId ? { conversationId: ws.conversationId } : {}),
+      ...(ws.missionId ? { missionId: ws.missionId } : {}),
       ...(ws.channelOrigin ? { channelOrigin: ws.channelOrigin } : {}),
       ...(ws.turnSignal ? { signal: ws.turnSignal } : {}),
       caller: 'mcp',
     };
-    const res = await deps.toolRegistry.execute({ id: '', toolId: name, arguments: args }, ctx);
+    const res = await deps.toolRegistry.execute({ id: ws.toolCallId ?? '', toolId: name, arguments: args }, ctx);
     // §F7 — hand the agent the directive: code + message + remediation + details, not a bare enum.
     return res.ok
       ? textResult(JSON.stringify(compactMcpOutput(res.output, args)))
@@ -579,6 +680,32 @@ function experiencePayload(result: { content: Array<{ type: 'text'; text: string
   const text = result.content.map((entry) => entry.text).join('\n');
   try { return JSON.parse(text) as unknown; } catch { return text; }
 }
+
+function parseAppOperationTool(name: string): { appId: string; operationId: string } | null {
+  if (!name.startsWith(APP_OPERATION_PREFIX)) return null;
+  const separator = name.indexOf('__', APP_OPERATION_PREFIX.length);
+  if (separator < 0) return null;
+  return { appId: name.slice(APP_OPERATION_PREFIX.length, separator), operationId: name.slice(separator + 2) };
+}
+
+function toMcpTask(task: import('@agentis/core').AgentMission) {
+  const status = task.status === 'accomplished' ? 'completed'
+    : task.status === 'cancelled' || task.status === 'rejected' ? 'cancelled'
+    : task.status === 'input_required' || task.status === 'approval_required' ? 'input_required'
+    : task.status === 'failed' || task.status === 'blocked' ? 'failed' : 'working';
+  return {
+    taskId: task.id, status, statusMessage: task.lastProgress ?? undefined,
+    inputRequests: status === 'input_required'
+      ? Object.fromEntries(task.inputRequests.filter((request) => request.status === 'pending').map((request) => [request.id, {
+        type: 'elicitation', message: request.description ?? request.title, schema: request.schema,
+      }])) : undefined,
+    result: status === 'completed' ? { artifacts: task.artifacts, receipts: task.receipts } : undefined,
+    error: status === 'failed' ? { code: task.blocker?.code ?? 'TASK_FAILED', message: task.blocker?.detail ?? 'Task failed' } : undefined,
+    createdAt: task.createdAt, updatedAt: task.updatedAt,
+  };
+}
+
+function isObject(value: unknown): value is Record<string, unknown> { return Boolean(value) && typeof value === 'object' && !Array.isArray(value); }
 
 // ─── JSON-RPC helpers ───────────────────────────────────────────────────────
 

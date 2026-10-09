@@ -1,6 +1,6 @@
 {
   "name": "@agentis-labs/cli",
-  "version": "1.1.5",
+  "version": "1.1.6",
   "description": "Multi-harness dashboard for agents you own — Claude Code, Codex, Cursor, Antigravity, Hermes, and OpenClaw, with a permanent Brain of memory that survives any harness or model swap. Install with `npm install -g @agentis-labs/cli`.",
   "license": "Apache-2.0",
   "author": "Robson Prado <robsonpradodev>",

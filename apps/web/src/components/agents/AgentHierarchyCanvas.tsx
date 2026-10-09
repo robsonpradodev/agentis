@@ -315,10 +315,21 @@ function buildGraph(
     unassigned: agents.filter((agent) => normalizeRole(agent) === 'unassigned'),
   };
 
+  // A specialist cluster is wider than a manager card. Size the manager lane
+  // from the widest child cluster so Tidy leaves a real gutter between
+  // neighboring managers and their subagents.
+  const specialistCountByManager = new Map<string, number>();
+  for (const worker of groups.worker) {
+    if (worker.reportsTo && groups.manager.some((manager) => manager.id === worker.reportsTo)) {
+      specialistCountByManager.set(worker.reportsTo, (specialistCountByManager.get(worker.reportsTo) ?? 0) + 1);
+    }
+  }
+  const managerSpacing = managerLaneSpacing(specialistCountByManager);
+
   const nodes: Node<AgentNodeData>[] = [];
   const placeTier = (tier: 'orchestrator' | 'manager' | 'unassigned', list: AgentHierarchyAgent[]) => {
     list.sort((a, b) => a.name.localeCompare(b.name)).forEach((agent, index) => {
-      const fallback = fallbackPosition(tier, index, list.length);
+      const fallback = fallbackPosition(tier, index, list.length, managerSpacing);
       nodes.push({
         id: agent.id,
         type: 'agentHierarchy',
@@ -879,7 +890,12 @@ function relativeTime(iso: string): string {
   return `${Math.floor(diff / 86_400_000)}d ago`;
 }
 
-function fallbackPosition(tier: 'orchestrator' | 'manager' | 'worker' | 'unassigned', index: number, count: number) {
+function fallbackPosition(
+  tier: 'orchestrator' | 'manager' | 'worker' | 'unassigned',
+  index: number,
+  count: number,
+  managerSpacing = 300,
+) {
   if (tier === 'orchestrator') return { x: 0, y: TIER_Y.orchestrator };
 
   if (tier === 'manager') {
@@ -887,7 +903,7 @@ function fallbackPosition(tier: 'orchestrator' | 'manager' | 'worker' | 'unassig
     const row = Math.floor(index / columns);
     const col = index % columns;
     const columnsInRow = Math.min(columns, count - row * columns);
-    return { x: (col - (columnsInRow - 1) / 2) * 300, y: TIER_Y.manager + row * 150 };
+    return { x: (col - (columnsInRow - 1) / 2) * managerSpacing, y: TIER_Y.manager + row * 150 };
   }
 
   const layout = compactTierLayout(count);
@@ -949,6 +965,15 @@ function requestFleetFit(instance: ReactFlowInstance<Node<AgentNodeData>, Edge> 
 
 function isPosition(value: unknown): value is { x: number; y: number } {
   return Boolean(value && typeof value === 'object' && typeof (value as { x?: unknown }).x === 'number' && typeof (value as { y?: unknown }).y === 'number');
+}
+
+function managerLaneSpacing(specialistCountByManager: Map<string, number>): number {
+  let widestCluster = 0;
+  for (const count of specialistCountByManager.values()) {
+    const perRow = Math.min(count, count > 6 ? 4 : 3);
+    widestCluster = Math.max(widestCluster, Math.max(0, perRow - 1) * 158 + 150);
+  }
+  return Math.max(300, widestCluster + 32);
 }
 
 /** Legacy rows can contain null, NaN, or coordinates outside a usable canvas. */

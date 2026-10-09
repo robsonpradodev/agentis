@@ -147,6 +147,13 @@ explicitly for harness smoke testing.
   updates immediately, and the API resolves the directive before execution classification: Plan
   turns can never be promoted into Mission acceptance, even when the task contains build language.
 
+Substantive Full access turns enter the shared `AgentExecutionController`. The configured Agent
+model classifies them as `reply`, `clarify`, `act`, `wait`, or receipt-backed `complete` and authors
+the dependency-aware execution plan. Action decisions compile into durable Agent Missions;
+answer-only requests stay ordinary turns. This is semantic model behavior across languages, not a
+phrase or keyword router. A runtime turn may emit a natural progress message while its mission
+continues; future-tense text is never evidence of terminal work.
+
 ### Execution truth and operator progress
 
 Every turn terminates as `completed`, `failed`, `interrupted`, or `blocked`. A provider-capacity
@@ -212,8 +219,23 @@ function-calling HTTP adapters, and text-only HTTP-compatible models all enter t
 when they advertise chat. The executor is the sole owner of Agentis platform calls: a runtime either
 forwards a structured call or emits a marker for that executor, but never executes the same platform
 catalog in a second hidden loop. Node turn limits are enforced, and only a clean `stop` with a
-contract-valid result completes an `agent_task`; all other terminal states remain recoverable,
-operator-visible pauses.
+contract-valid result completes an answer task. For action work, a clean model `stop` is still
+nonterminal while commitments lack receipts: the executor returns the missing requirement ids and
+tool observations to the same execution. External waits are event-driven and budget exhaustion
+parks the Mission for recovery rather than fabricating completion.
+
+The marker boundary normalizes canonical Agentis JSON, Hermes `<tool_call>` JSON, Hermes native
+special-token blocks, nested named-tool XML, and legacy `REQUESTED TOOLS` transcripts. A bare
+arguments object binds only when exactly one currently offered tool schema matches. Recognized
+protocol is executed and stripped before any channel reply; ambiguous or malformed protocol enters
+one immediate schema-repair round and must never be delivered to WhatsApp as human-facing prose.
+
+Chat, channel turns, workflow Agent Tasks, standing goals, and mission wakes use one effective
+capability resolver. Resident Agents receive the complete Agentis workspace API surface, while
+relevance narrows what is presented to the model for the current objective. Required native
+effects are checked before model spend. `GET /v1/agents/:agentId/effective-capabilities` exposes
+the resolved tools, owned connections, active persistent grants, and authority basis without
+exposing host secrets.
 
 Antigravity's headless runtime writes its model turn to the current conversation transcript while
 it runs. Agentis tails only that new turn and streams the model's operator-facing `content` as
@@ -250,6 +272,13 @@ workers, Apps, and sources in one deterministic collision pass. Manual coordinat
 anchors; event activity never recalculates topology or animates a stable layout.
 
 ## API surface
+
+- Missions: `POST /v1/agents/:id/missions`, `GET /v1/agents/:id/missions`,
+  `GET /v1/missions/:id`, mission SSE, resume, and cancel.
+- Capability inspection: `GET /v1/agents/:id/effective-capabilities`.
+- Standing goals: list, inspect, compile, revise/version, review diff, activate, and pause under
+  `/v1/agents/:id/standing-goals`. The Agent detail Autonomy tab exposes the same scope, wake,
+  pacing, safety, and mission-control operations without raw resource IDs.
 
 ## Chat-native temporary teams
 

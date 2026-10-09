@@ -1,11 +1,13 @@
-import { AgentisError } from '@agentis/core';
+import { createHash } from 'node:crypto';
+import { AgentisError, type AgentisToolContext } from '@agentis/core';
 import { and, eq } from 'drizzle-orm';
 import { schema } from '@agentis/db/sqlite';
-import type { ChannelKind, OutboundAttachmentRef, OutboundNativeContent } from '../../adapters/channels/types.js';
+import type { ChannelKind, ChannelQuote, OutboundAttachmentRef, OutboundNativeContent } from '../../adapters/channels/types.js';
 import type { AgentisToolRegistry } from '../agentisToolRegistry.js';
 import type { ToolHandlerDeps } from './deps.js';
 import { resolveAndSend } from '../conversation/channelSend.js';
 import { normalizeHandle } from '../conversation/channelAccess.js';
+import type { ChannelPostAckMutation } from '../conversation/channelActionIntentService.js';
 
 const CHANNEL_KINDS = new Set<ChannelKind>(['telegram', 'discord', 'slack', 'whatsapp', 'voice']);
 
@@ -16,6 +18,29 @@ function sameChannelRecipient(kind: string, left: string, right: string): boolea
     return Boolean(a && b && a === b);
   }
   return left.trim().toLowerCase() === right.trim().toLowerCase();
+}
+
+/** Stable for identical calls inside one durable turn/run, different for a new
+ * explicit owner command. Provider and action ledgers both use this key. */
+function channelToolIdempotencyKey(
+  ctx: AgentisToolContext,
+  operation: string,
+  payload: Record<string, unknown>,
+): string {
+  const turn = ctx.missionId ?? ctx.durableTurnId ?? ctx.channelOrigin?.durableTurnId ?? ctx.runId ?? ctx.conversationId ?? 'undurable';
+  const canonical = JSON.stringify(stableChannelPayload(payload));
+  const digest = createHash('sha256').update(`${ctx.workspaceId}\n${ctx.agentId ?? ''}\n${turn}\n${operation}\n${canonical}`).digest('hex');
+  return `agent-tool:${digest}`;
+}
+
+function stableChannelPayload(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stableChannelPayload);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, entry]) => [key, stableChannelPayload(entry)]));
+  }
+  return value;
 }
 
 /** One attachment item — shared by the top-level `attachments` and each `messages[]` entry. */
@@ -162,6 +187,7 @@ export function registerChannelTools(registry: AgentisToolRegistry, deps: ToolHa
           properties: {
             connectionId: { type: 'string' },
             recipientRef: { type: 'string' },
+            recipientQuery: { type: 'string', description: 'Name, phone, or selector to resolve; retained as a durable missing slot when unresolved.' },
             goal: { type: 'string' },
             goalRef: { type: 'string' },
             subjectId: { type: 'string' },
@@ -169,8 +195,9 @@ export function registerChannelTools(registry: AgentisToolRegistry, deps: ToolHa
             messages: { type: 'array', items: { type: 'object', properties: { body: { type: 'string' } } } },
             scheduledFor: { type: 'string' },
             requireApproval: { type: 'boolean' },
+            postAckMutations: { type: 'array', items: { type: 'object' }, description: 'Data mutations committed only after provider acknowledgement.' },
           },
-          required: ['recipientRef', 'goal'],
+          required: ['goal'],
         },
         mutating: true,
         approval: { riskLevel: 'medium', reversible: false, externalSideEffects: true },
@@ -180,29 +207,55 @@ export function registerChannelTools(registry: AgentisToolRegistry, deps: ToolHa
         if (!deps.channelActions) throw new AgentisError('CHANNEL_BRIDGE_UNAVAILABLE', 'channel action engine is not configured');
         if (!ctx.agentId) throw new AgentisError('VALIDATION_FAILED', 'an operating agent is required');
         const connectionId = typeof args.connectionId === 'string' ? args.connectionId : ctx.channelOrigin?.connectionId ?? '';
-        const recipientRef = typeof args.recipientRef === 'string' ? args.recipientRef : '';
+        const recipientRef = typeof args.recipientRef === 'string' ? args.recipientRef : undefined;
         const goal = typeof args.goal === 'string' ? args.goal : '';
         const ownerIdentity = ctx.channelOrigin?.ownerVerified && deps.channelIdentity
           ? deps.channelIdentity.principal({ workspaceId: ctx.workspaceId, connectionId: ctx.channelOrigin.connectionId, channelKind: ctx.channelOrigin.kind, handle: ctx.channelOrigin.chatId }).identityId
           : null;
+        const body = typeof args.body === 'string' ? args.body : '';
+        const messages = Array.isArray(args.messages) ? parseMessages(args.messages) : undefined;
+        const recipientQuery = typeof args.recipientQuery === 'string' ? args.recipientQuery : undefined;
         return deps.channelActions.createAndExecute({
           workspaceId: ctx.workspaceId,
           appId: ctx.appId,
           agentId: ctx.agentId,
+          missionId: ctx.missionId ?? null,
           requesterIdentityId: ownerIdentity,
           connectionId,
           recipientRef,
+          recipientQuery,
           conversationId: null,
           subjectId: typeof args.subjectId === 'string' ? args.subjectId : null,
           goalRef: typeof args.goalRef === 'string' ? args.goalRef : null,
           goal,
-          body: typeof args.body === 'string' ? args.body : '',
-          messages: Array.isArray(args.messages) ? parseMessages(args.messages) : undefined,
+          body,
+          messages,
           authorizationBasis: ctx.channelOrigin?.ownerVerified ? 'verified_owner_command' : 'standing_goal',
           scheduledFor: typeof args.scheduledFor === 'string' ? args.scheduledFor : null,
           requireApproval: args.requireApproval === true,
+          idempotencyKey: channelToolIdempotencyKey(ctx, 'action.create', {
+            connectionId, recipientRef: recipientRef ?? '', recipientQuery: recipientQuery ?? '', goal,
+            goalRef: typeof args.goalRef === 'string' ? args.goalRef : '',
+            subjectId: typeof args.subjectId === 'string' ? args.subjectId : '', body, messages: messages ?? [],
+          }),
           userId: ctx.userId,
+          postAckMutations: parsePostAckMutations(args.postAckMutations),
         });
+      },
+    },
+    {
+      definition: {
+        id: 'agentis.channel.action.resume',
+        family: 'run',
+        description: 'Fill the missing recipient on a durable channel action and resume its authorized delivery without re-drafting or re-asking approval.',
+        inputSchema: { type: 'object', properties: { actionId: { type: 'string' }, recipient: { type: 'string' } }, required: ['actionId', 'recipient'] },
+        mutating: true,
+        approval: { riskLevel: 'medium', reversible: false, externalSideEffects: true },
+        mcpExposed: true,
+      },
+      handler: async (args, ctx) => {
+        if (!deps.channelActions) throw new AgentisError('CHANNEL_BRIDGE_UNAVAILABLE', 'channel action engine is not configured');
+        return { action: await deps.channelActions.resolveRecipientAndExecute(ctx.workspaceId, String(args.actionId ?? ''), String(args.recipient ?? '')) };
       },
     },
     {
@@ -289,6 +342,112 @@ export function registerChannelTools(registry: AgentisToolRegistry, deps: ToolHa
     },
     {
       definition: {
+        id: 'agentis.channel.reply',
+        family: 'run',
+        description: [
+          'Send rich content to the CURRENT inbound channel conversation; no connectionId or recipient is needed or accepted.',
+          'Use this instead of printing attachment syntax or provider formats into chat.',
+          'Existing file/image/video/audio/sticker: attachments:[{url:"artifact:<id>",kind:"file|image|video|audio|sticker",filename:"name.ext"}].',
+          'Spoken WhatsApp voice note: attachments:[{kind:"voice",text:"words to speak"}].',
+          'Native contact: native:{kind:"contact",displayName:"Name",phone:"+15551234567"}.',
+          'Native location: native:{kind:"location",latitude:0,longitude:0,name:"Place"}.',
+          'Native poll: native:{kind:"poll",question:"Question",options:["A","B"]}.',
+          'A successful delivery returns sent:true plus provider acknowledgement; never claim delivery without it.',
+        ].join(' '),
+        inputSchema: {
+          type: 'object',
+          properties: {
+            body: { type: 'string', description: 'Optional caption or accompanying message.' },
+            quotedMessage: {
+              type: 'object',
+              description: 'Quote a message from the current conversation using its local message id.',
+              properties: { messageId: { type: 'string' } },
+              required: ['messageId'],
+              additionalProperties: false,
+            },
+            deliveryRole: {
+              type: 'string',
+              enum: ['progress', 'final'],
+              description: 'Defaults to final. Use progress only when another final answer will follow.',
+            },
+            attachments: {
+              type: 'array',
+              description: 'Existing artifacts/data URLs/HTTP URLs or text synthesized as a voice note.',
+              items: ATTACHMENT_ITEM_SCHEMA,
+            },
+            native: NATIVE_CONTENT_SCHEMA,
+            messages: {
+              type: 'array',
+              description: 'Optional ordered burst to the current conversation. Each item is a separate provider message.',
+              items: {
+                type: 'object',
+                properties: {
+                  id: { type: 'string' },
+                  body: { type: 'string' },
+                  attachments: { type: 'array', items: ATTACHMENT_ITEM_SCHEMA },
+                  native: NATIVE_CONTENT_SCHEMA,
+                  quotedMessage: {
+                    type: 'object',
+                    properties: { messageId: { type: 'string' } },
+                    required: ['messageId'],
+                    additionalProperties: false,
+                  },
+                },
+              },
+            },
+          },
+        },
+        mutating: true,
+        approval: { riskLevel: 'medium', reversible: false, externalSideEffects: true },
+        mcpExposed: true,
+      },
+      handler: async (args, ctx) => {
+        if (!deps.channels) throw new AgentisError('CHANNEL_BRIDGE_UNAVAILABLE', 'channel bridge not configured');
+        const origin = ctx.channelOrigin;
+        if (!origin) {
+          throw new AgentisError(
+            'VALIDATION_FAILED',
+            'agentis.channel.reply is available only while answering an inbound channel conversation; use agentis.channel.send elsewhere',
+          );
+        }
+        const attachments = parseAttachments(args.attachments);
+        const messages = Array.isArray(args.messages) ? parseMessages(args.messages) : undefined;
+        const quotedMessage = parseQuotedMessage(args.quotedMessage);
+        if (quotedMessage && messages?.length && !messages[0]!.quotedMessage) {
+          messages[0]!.quotedMessage = quotedMessage;
+        }
+        return resolveAndSend(
+          { channels: deps.channels, ...(deps.connectionGrants ? { connectionGrants: deps.connectionGrants } : {}) },
+          {
+            workspaceId: ctx.workspaceId,
+            body: typeof args.body === 'string' ? args.body : '',
+            connectionId: origin.connectionId,
+            kind: origin.kind,
+            to: origin.chatId,
+            agentId: ctx.agentId ?? null,
+            deliveryRole: args.deliveryRole === 'progress' ? 'progress' : 'final',
+            attachments,
+            ...(quotedMessage ? { quotedMessage } : {}),
+            ...(args.native != null ? { native: parseNativeContent(args.native) } : {}),
+            ...(messages ? { messages } : {}),
+            idempotencyKey: channelToolIdempotencyKey(ctx, 'channel.reply', {
+              connectionId: origin.connectionId,
+              chatId: origin.chatId,
+              body: typeof args.body === 'string' ? args.body : '',
+              deliveryRole: args.deliveryRole === 'progress' ? 'progress' : 'final',
+              attachments,
+              quotedMessage: quotedMessage ?? null,
+              native: args.native ?? null,
+              messages: messages ?? [],
+            }),
+            ...(origin.conversationId ? { conversationId: origin.conversationId } : {}),
+            ...(origin.automationEpoch !== undefined ? { expectedAutomationEpoch: origin.automationEpoch } : {}),
+          },
+        );
+      },
+    },
+    {
+      definition: {
         id: 'agentis.channel.send',
         family: 'run',
         description: 'Send a message through a native Agentis channel. Prefer recipientRef from agentis.channel.inbox for another contact; Agentis resolves provider addresses internally and records an idempotent action. Raw `to` remains for explicit phone/JID/backward compatibility. In a channel-origin turn, omit the destination only for the current conversation.',
@@ -315,18 +474,34 @@ export function registerChannelTools(registry: AgentisToolRegistry, deps: ToolHa
               items: ATTACHMENT_ITEM_SCHEMA,
             },
             native: NATIVE_CONTENT_SCHEMA,
+            quotedMessage: {
+              type: 'object',
+              description: 'Quote a message in the destination conversation using its local message id.',
+              properties: { messageId: { type: 'string' } },
+              required: ['messageId'],
+              additionalProperties: false,
+            },
             messages: {
               type: 'array',
               description: 'Send these as a natural burst, in order, to the same destination. Each item is its own message with an optional body and attachments. When set, top-level body/attachments are ignored.',
               items: {
                 type: 'object',
                 properties: {
+                  id: { type: 'string', description: 'Stable item id within this ordered burst.' },
+                  requirementId: { type: 'string', description: 'Mission requirement id satisfied by this item after provider acknowledgement.' },
                   body: { type: 'string' },
                   attachments: { type: 'array', items: ATTACHMENT_ITEM_SCHEMA },
                   native: NATIVE_CONTENT_SCHEMA,
+                  quotedMessage: {
+                    type: 'object',
+                    properties: { messageId: { type: 'string' } },
+                    required: ['messageId'],
+                    additionalProperties: false,
+                  },
                 },
               },
             },
+            postAckMutations: { type: 'array', items: { type: 'object' }, description: 'App record updates to commit only after provider acknowledgement.' },
           },
         },
         mutating: true,
@@ -375,21 +550,40 @@ export function registerChannelTools(registry: AgentisToolRegistry, deps: ToolHa
             const requesterIdentityId = origin?.ownerVerified && deps.channelIdentity
               ? deps.channelIdentity.principal({ workspaceId: ctx.workspaceId, connectionId: origin.connectionId, channelKind: origin.kind, handle: origin.chatId }).identityId
               : null;
+            const body = typeof args.body === 'string' ? args.body : '';
+            const attachments = parseAttachments(args.attachments);
+            const messages = Array.isArray(args.messages) ? parseMessages(args.messages) : undefined;
+            const quotedMessage = parseQuotedMessage(args.quotedMessage);
+            if (quotedMessage && messages?.length && !messages[0]!.quotedMessage) {
+              messages[0]!.quotedMessage = quotedMessage;
+            }
+            const durableMessages = messages ?? (attachments.length > 0 || args.native != null || quotedMessage
+              ? [{ body, attachments, ...(args.native != null ? { native: parseNativeContent(args.native) } : {}), ...(quotedMessage ? { quotedMessage } : {}) }]
+              : undefined);
+            const goal = typeof args.goal === 'string' && args.goal.trim() ? args.goal : 'fulfil the explicit outbound messaging instruction';
             const action = await deps.channelActions.createAndExecute({
               workspaceId: ctx.workspaceId,
               appId: ctx.appId,
               agentId: ctx.agentId,
+              missionId: ctx.missionId ?? null,
               requesterIdentityId,
               connectionId,
               recipientRef: resolved.peer.recipientRef,
               conversationId: resolved.peer.conversationId,
               subjectId: typeof args.subjectId === 'string' ? args.subjectId : resolved.peer.subjectId,
               goalRef: typeof args.goalRef === 'string' ? args.goalRef : null,
-              goal: typeof args.goal === 'string' && args.goal.trim() ? args.goal : 'fulfil the explicit outbound messaging instruction',
-              body: typeof args.body === 'string' ? args.body : '',
-              messages: Array.isArray(args.messages) ? parseMessages(args.messages) : undefined,
+              goal,
+              body: durableMessages ? '' : body,
+              messages: durableMessages,
               authorizationBasis: origin?.ownerVerified ? 'verified_owner_command' : 'standing_goal',
+              idempotencyKey: channelToolIdempotencyKey(ctx, 'channel.send.action', {
+                connectionId, recipientRef: resolved.peer.recipientRef, goal,
+                goalRef: typeof args.goalRef === 'string' ? args.goalRef : '',
+                subjectId: typeof args.subjectId === 'string' ? args.subjectId : resolved.peer.subjectId ?? '',
+                body, messages: durableMessages ?? [], quotedMessage: quotedMessage ?? null,
+              }),
               userId: ctx.userId,
+              postAckMutations: parsePostAckMutations(args.postAckMutations),
             });
             return { ...action.result, action: action.action };
           }
@@ -441,25 +635,128 @@ export function registerChannelTools(registry: AgentisToolRegistry, deps: ToolHa
             }
           }
         }
-        // Shared resolve→authorize→deliver flow (same one the deterministic
-        // `channel` workflow node uses) so tool and node behave identically.
+        // All external sends, including legacy raw-number calls, are converted
+        // into the same durable effect intent. No tool path may bypass receipts.
+        const body = typeof args.body === 'string' ? args.body : '';
+        const attachments = parseAttachments(args.attachments);
+        const messages = Array.isArray(args.messages) ? parseMessages(args.messages) : undefined;
+        const quotedMessage = parseQuotedMessage(args.quotedMessage);
+        if (quotedMessage && messages?.length && !messages[0]!.quotedMessage) {
+          messages[0]!.quotedMessage = quotedMessage;
+        }
+        if (deps.channelActions && deps.channelInbox && ctx.agentId) {
+          const resolvedConnectionId = connectionId ?? resolveConnectionId(deps.channels, ctx.workspaceId, { connectionId, kind });
+          if (!resolvedConnectionId) throw new AgentisError('CHANNEL_TARGET_AMBIGUOUS_OR_MISSING', 'No single authorized channel connection matched.');
+          const connection = deps.channels.get(ctx.workspaceId, resolvedConnectionId);
+          const destination = deps.channels.resolveDestination({ connectionId: resolvedConnectionId, to });
+          if (!destination.chatId) throw new AgentisError('CHANNEL_TARGET_AMBIGUOUS_OR_MISSING', 'No channel recipient could be resolved.');
+          const peer = deps.channelInbox.ensurePeer({
+            workspaceId: ctx.workspaceId, connectionId: resolvedConnectionId,
+            channelKind: connection.kind, address: destination.chatId,
+          });
+          const requesterIdentityId = origin?.ownerVerified && deps.channelIdentity
+            ? deps.channelIdentity.principal({ workspaceId: ctx.workspaceId, connectionId: origin.connectionId, channelKind: origin.kind, handle: origin.chatId }).identityId
+            : null;
+          const goal = typeof args.goal === 'string' && args.goal.trim() ? args.goal : 'fulfil the requested outbound message';
+          const durableMessages = messages ?? (attachments.length > 0 || args.native != null || quotedMessage
+            ? [{ body, attachments, ...(args.native != null ? { native: parseNativeContent(args.native) } : {}), ...(quotedMessage ? { quotedMessage } : {}) }]
+            : undefined);
+          const action = await deps.channelActions.createAndExecute({
+            workspaceId: ctx.workspaceId, appId: ctx.appId, agentId: ctx.agentId, missionId: ctx.missionId ?? null,
+            requesterIdentityId, connectionId: resolvedConnectionId, recipientRef: peer.recipientRef,
+            // The effect belongs to the TARGET peer's conversation. Reusing the
+            // verified owner's origin conversation for a raw-number send binds
+            // one conversation to two canonical peers and is correctly rejected
+            // by ChannelBridge before transport. A new peer has no conversation
+            // yet; the durable delivery path creates it after provider dispatch.
+            conversationId: peer.conversationId,
+            subjectId: typeof args.subjectId === 'string' ? args.subjectId : peer.subjectId,
+            goalRef: typeof args.goalRef === 'string' ? args.goalRef : null,
+            goal, body: durableMessages ? '' : body, messages: durableMessages,
+            authorizationBasis: origin?.ownerVerified ? 'verified_owner_command' : 'standing_goal',
+            idempotencyKey: channelToolIdempotencyKey(ctx, 'channel.send.effect', {
+              connectionId: resolvedConnectionId, recipientRef: peer.recipientRef, goal,
+              body, messages: durableMessages ?? [], quotedMessage: quotedMessage ?? null,
+            }),
+            userId: ctx.userId, postAckMutations: parsePostAckMutations(args.postAckMutations),
+          });
+          return { ...action.result, action: action.action };
+        }
         return resolveAndSend(
           { channels: deps.channels, ...(deps.connectionGrants ? { connectionGrants: deps.connectionGrants } : {}) },
           {
             workspaceId: ctx.workspaceId,
-            body: typeof args.body === 'string' ? args.body : '',
+            body,
             kind,
             connectionId,
             to,
             agentId: ctx.agentId ?? null,
             ...(args.deliveryRole === 'progress' || args.deliveryRole === 'final' ? { deliveryRole: args.deliveryRole } : {}),
-            attachments: parseAttachments(args.attachments),
+            attachments,
+            ...(quotedMessage ? { quotedMessage } : {}),
             ...(args.native != null ? { native: parseNativeContent(args.native) } : {}),
-            ...(Array.isArray(args.messages) ? { messages: parseMessages(args.messages) } : {}),
-            ...(origin?.conversationId ? { conversationId: origin.conversationId } : {}),
+            ...(messages ? { messages } : {}),
+            idempotencyKey: channelToolIdempotencyKey(ctx, 'channel.send.direct', {
+              connectionId: connectionId ?? '', kind: kind ?? '', to: to ?? '', body,
+              deliveryRole: typeof args.deliveryRole === 'string' ? args.deliveryRole : '',
+              attachments, native: args.native ?? null, quotedMessage: quotedMessage ?? null, messages: messages ?? [],
+            }),
+            ...(targetConversationId
+              ? { conversationId: targetConversationId }
+              : origin?.conversationId && sameChannelRecipient(origin.kind, to ?? origin.chatId, origin.chatId)
+                ? { conversationId: origin.conversationId }
+                : {}),
             ...(origin?.automationEpoch !== undefined ? { expectedAutomationEpoch: origin.automationEpoch } : {}),
           },
         );
+      },
+    },
+    {
+      definition: {
+        id: 'agentis.channel.read',
+        family: 'run',
+        description: 'Acknowledge the inbound message that started this conversation turn as read. Uses the provider message reference and connection policy; only supported for WhatsApp QR and Cloud.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            messageId: { type: 'string', description: 'Optional local message ID from this conversation; defaults to the current inbound message.' },
+          },
+        },
+        mutating: true,
+        mcpExposed: true,
+      },
+      handler: async (args, ctx) => {
+        const origin = ctx.channelOrigin;
+        if (!deps.channels || !origin?.conversationId) {
+          throw new AgentisError('VALIDATION_FAILED', 'channel.read is available only in an inbound channel conversation');
+        }
+        const messageId = typeof args.messageId === 'string' && args.messageId.trim()
+          ? args.messageId.trim()
+          : origin.inboundMessageId;
+        if (!messageId) {
+          throw new AgentisError('VALIDATION_FAILED', 'No inbound provider message is available to acknowledge');
+        }
+        return deps.channels.markMessageRead(ctx.workspaceId, origin.connectionId, origin.conversationId, messageId);
+      },
+    },
+    {
+      definition: {
+        id: 'agentis.channel.templates',
+        family: 'inspect',
+        description: 'Discover approved WhatsApp Cloud message templates available on the current Cloud connection. QR connections do not support templates.',
+        inputSchema: { type: 'object', properties: { connectionId: { type: 'string' } } },
+        mutating: false,
+        mcpExposed: true,
+      },
+      handler: async (args, ctx) => {
+        if (!deps.channels) throw new AgentisError('CHANNEL_BRIDGE_UNAVAILABLE', 'channel bridge not configured');
+        const connectionId = ctx.channelOrigin?.connectionId ?? resolveConnectionId(deps.channels, ctx.workspaceId, args);
+        if (!connectionId) throw new AgentisError('RESOURCE_NOT_FOUND', 'no matching channel connection');
+        const capabilities = deps.channels.capabilitiesFor(connectionId);
+        if (!capabilities?.supportsTemplates) {
+          throw new AgentisError('VALIDATION_FAILED', 'This channel connection does not support templates');
+        }
+        return deps.channels.listWhatsAppCloudTemplates(ctx.workspaceId, connectionId);
       },
     },
     {
@@ -678,18 +975,57 @@ function parseAttachments(value: unknown): OutboundAttachmentRef[] {
 }
 
 /** Normalize a burst of loosely-typed messages into typed send messages. */
-function parseMessages(value: unknown): { body?: string; attachments?: OutboundAttachmentRef[]; native?: OutboundNativeContent }[] {
+function parseMessages(value: unknown): { id?: string; requirementId?: string; body?: string; attachments?: OutboundAttachmentRef[]; native?: OutboundNativeContent; quotedMessage?: ChannelQuote }[] {
   if (!Array.isArray(value)) throw new AgentisError('VALIDATION_FAILED', 'messages must be an array');
   return value.map((raw, i) => {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
       throw new AgentisError('VALIDATION_FAILED', `messages[${i}] must be an object`);
     }
     const obj = raw as Record<string, unknown>;
-    const message: { body?: string; attachments?: OutboundAttachmentRef[]; native?: OutboundNativeContent } = {};
+    const message: { id?: string; requirementId?: string; body?: string; attachments?: OutboundAttachmentRef[]; native?: OutboundNativeContent; quotedMessage?: ChannelQuote } = {};
+    if (typeof obj.id === 'string' && obj.id.trim()) message.id = obj.id.trim();
+    if (typeof obj.requirementId === 'string' && obj.requirementId.trim()) message.requirementId = obj.requirementId.trim();
     if (typeof obj.body === 'string') message.body = obj.body;
     if (obj.attachments != null) message.attachments = parseAttachments(obj.attachments);
     if (obj.native != null) message.native = parseNativeContent(obj.native);
+    if (obj.quotedMessage != null) message.quotedMessage = parseQuotedMessage(obj.quotedMessage);
     return message;
+  });
+}
+
+function parseQuotedMessage(value: unknown): ChannelQuote | undefined {
+  if (value == null) return undefined;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new AgentisError('VALIDATION_FAILED', 'quotedMessage must contain a local messageId');
+  }
+  const messageId = (value as Record<string, unknown>).messageId;
+  if (typeof messageId !== 'string' || !messageId.trim()) {
+    throw new AgentisError('VALIDATION_FAILED', 'quotedMessage requires a local messageId');
+  }
+  return { messageId: messageId.trim() };
+}
+
+function parsePostAckMutations(value: unknown): ChannelPostAckMutation[] {
+  if (value == null) return [];
+  if (!Array.isArray(value)) throw new AgentisError('VALIDATION_FAILED', 'postAckMutations must be an array');
+  return value.map((raw, index) => {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      throw new AgentisError('VALIDATION_FAILED', `postAckMutations[${index}] must be an object`);
+    }
+    const entry = raw as Record<string, unknown>;
+    const appId = typeof entry.appId === 'string' ? entry.appId.trim() : '';
+    const collection = typeof entry.collection === 'string' ? entry.collection.trim() : '';
+    const recordId = typeof entry.recordId === 'string' ? entry.recordId.trim() : '';
+    const patch = entry.patch && typeof entry.patch === 'object' && !Array.isArray(entry.patch)
+      ? entry.patch as Record<string, unknown> : null;
+    if (entry.kind !== 'app_data_update' || !appId || !collection || !recordId || !patch) {
+      throw new AgentisError('VALIDATION_FAILED', `postAckMutations[${index}] requires kind=app_data_update, appId, collection, recordId, and patch`);
+    }
+    return {
+      kind: 'app_data_update', appId, collection, recordId, patch,
+      ...(typeof entry.expectedVersion === 'number' ? { expectedVersion: entry.expectedVersion } : {}),
+      ...(entry.receiptKind === 'subject_update' ? { receiptKind: 'subject_update' as const } : {}),
+    };
   });
 }
 

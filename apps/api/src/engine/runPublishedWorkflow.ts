@@ -28,8 +28,12 @@ export interface RunPublishedWorkflowArgs {
   inputs: Record<string, unknown>;
   /** Interactive chat origin; enables scoped Stop without touching other runs. */
   conversationId?: string | null;
+  /** Durable App Task/Mission which owns this run. */
+  missionId?: string | null;
   /** Poll budget before returning the last-seen (possibly non-terminal) state. */
   timeoutMs?: number;
+  /** Keep lifecycle events scoped to the run room (used by synchronous App operations). */
+  quietWorkspaceEvents?: boolean;
 }
 
 export interface RunPublishedWorkflowResult {
@@ -68,6 +72,7 @@ export async function startPublishedWorkflow(
     status: 'CREATED',
     runState: initialState,
     conversationId: args.conversationId ?? null,
+    missionId: args.missionId ?? null,
   }).run();
   await args.engine.startRun({
     workspaceId: args.workspaceId,
@@ -79,6 +84,7 @@ export async function startPublishedWorkflow(
     inputs,
     initialState,
     graph: args.graph,
+    quietWorkspaceEvents: args.quietWorkspaceEvents,
   });
   return { runId };
 }

@@ -16,6 +16,18 @@ import { appIdentitySchema, appPolicySchema, appSourceSchema } from './app.js';
 import { upsertSurfaceSchema, surfaceActionSchema } from './view.js';
 import { collectionSchemaSchema } from './datastore.js';
 import { capabilityDeclSchema } from './capability.js';
+import {
+  appArtifactsFacetSchema,
+  appBrainFacetSchema,
+  appComponentFacetSchema,
+  appContractFacetSchema,
+  appFrontendFacetSchema,
+  appOrchestrationFacetSchema,
+  appPermissionsV3FacetSchema,
+  appProtocolProjectionFacetSchema,
+  appQualityFacetSchema,
+  appStorageFacetSchema,
+} from './agenticApp.js';
 
 /**
  * A portable Brain atom — the serializable projection of one `memory_episodes`
@@ -216,7 +228,7 @@ export type AppDependency = z.infer<typeof appDependencySchema>;
 export const appManifestSchema = z.object({
   // Missing means the legacy contract. New exporters set the current schema
   // revision explicitly; retaining the default keeps old packages importable.
-  manifestVersion: z.union([z.literal(1), z.literal(2)]).default(1),
+  manifestVersion: z.union([z.literal(1), z.literal(2), z.literal(3)]).default(1),
   agentisVersion: z.string().min(1).default('1.0.0'),
   /**
    * The App's id IN THE SOURCE workspace — the rebinding key for the App's own
@@ -248,13 +260,25 @@ export const appManifestSchema = z.object({
   dependencies: z.array(appDependencySchema).default([]),
   migrations: z.array(collectionMigrationSchema).default([]),
   source: appSourceSchema.nullable().optional(),
+  // Agentic Apps v3 facets. They coexist with the v1/v2 row projections so an
+  // imported v3 package can degrade safely on an older runtime.
+  contract: appContractFacetSchema.optional(),
+  frontend: appFrontendFacetSchema.optional(),
+  components: appComponentFacetSchema.optional(),
+  storage: appStorageFacetSchema.optional(),
+  orchestration: appOrchestrationFacetSchema.optional(),
+  brainPolicy: appBrainFacetSchema.optional(),
+  permissionsV3: appPermissionsV3FacetSchema.optional(),
+  quality: appQualityFacetSchema.optional(),
+  artifacts: appArtifactsFacetSchema.optional(),
+  projections: appProtocolProjectionFacetSchema.optional(),
 });
 export type AppManifest = z.infer<typeof appManifestSchema>;
 
 /** The serialized `.agentisapp` envelope: a manifest + integrity + provenance. */
 export const appManifestEnvelopeSchema = z.object({
   format: z.literal('.agentisapp'),
-  formatVersion: z.union([z.literal(1), z.literal(2)]),
+  formatVersion: z.union([z.literal(1), z.literal(2), z.literal(3)]),
   manifest: appManifestSchema,
   checksum: z.string(), // sha256 over canonical(manifest)
   exportedAt: z.string(),

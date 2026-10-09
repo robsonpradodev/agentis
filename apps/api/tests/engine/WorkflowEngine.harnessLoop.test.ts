@@ -18,12 +18,13 @@ import { ActivityFeedService } from '../../src/services/activityFeed.js';
 import { ApprovalInboxService } from '../../src/services/approvalInbox.js';
 import { AdapterManager } from '../../src/adapters/AdapterManager.js';
 import { AgentisToolRegistry } from '../../src/services/agentisToolRegistry.js';
+import { ChatToolExecutor } from '../../src/services/chat/chatToolExecutor.js';
 import type { ExtensionRuntime } from '../../src/services/extensionRuntime.js';
 import { createTestContext, type TestContext } from '../_helpers/createTestContext.js';
 
 let ctx: TestContext;
 beforeEach(async () => { ctx = await createTestContext(); });
-afterEach(() => ctx.close());
+afterEach(() => { ChatToolExecutor.configure(null); ctx.close(); });
 
 function markerChatAdapter(
   seenTools: string[][],
@@ -170,6 +171,119 @@ describe('WorkflowEngine — E1 harness chat tool loop', () => {
     // Terminal cleanup removes the live run context; replay still comes from the
     // durable store and therefore survives a process restart as well.
     expect(engine.getRunActivity(runId).length).toBe(durableActivity.length);
+  });
+
+  it('never turns a legacy action prompt green when Hermes returns raw tool syntax without receipts', async () => {
+    const agentId = randomUUID();
+    ctx.db.insert(schema.agents).values({
+      id: agentId, workspaceId: ctx.workspace.id, ambientId: ctx.ambient.id, userId: ctx.user.id,
+      name: 'Ava', role: 'specialist', adapterType: 'hermes_agent', capabilityTags: [], config: {}, status: 'online',
+    }).run();
+    const adapters = new AdapterManager(ctx.logger);
+    adapters.register(agentId, markerChatAdapter([], '<tool_call>\nagentis.channel.send {"to":"Valente Store","body":"Olá"}\n</tool_call>'));
+    const registry = new AgentisToolRegistry({ logger: ctx.logger });
+    registry.register(
+      { id: 'agentis.channel.send', family: 'run', description: 'send', inputSchema: { type: 'object', properties: {} }, mutating: true, mcpExposed: true },
+      async () => ({ sent: true }),
+    );
+    registry.register(
+      { id: 'agentis.data.update', family: 'data', description: 'update', inputSchema: { type: 'object', properties: {} }, mutating: true, mcpExposed: true },
+      async () => ({ id: 'lead-1' }),
+    );
+    const engine = new WorkflowEngine({
+      db: ctx.db, bus: ctx.bus, logger: ctx.logger,
+      ledger: new LedgerService(ctx.db, ctx.bus), scratchpad: new ScratchpadService(ctx.bus, ctx.logger),
+      activity: new ActivityFeedService(ctx.db, ctx.bus), approvals: new ApprovalInboxService(ctx.db, ctx.bus),
+      extensions: {} as unknown as ExtensionRuntime, adapters, toolRegistry: registry,
+    });
+    const graph = {
+      version: 1, viewport: { x: 0, y: 0, zoom: 1 },
+      nodes: [
+        { id: 'T', type: 'trigger', title: 'trigger', position: { x: 0, y: 0 }, config: { kind: 'trigger', triggerType: 'manual' } },
+        { id: 'A', type: 'agent_task', title: 'First contact', position: { x: 1, y: 0 }, config: {
+          kind: 'agent_task', agentId, prompt: 'Select a new lead, send a WhatsApp message, and move the lead to contacted after success.', outputKeys: [],
+        } },
+      ], edges: [{ id: 'e', source: 'T', target: 'A' }],
+    } as unknown as WorkflowGraph;
+    const workflowId = randomUUID(); const runId = randomUUID();
+    ctx.db.insert(schema.workflows).values({ id: workflowId, workspaceId: ctx.workspace.id, ambientId: ctx.ambient.id, userId: ctx.user.id, title: 'receipt-gate', graph, settings: {} }).run();
+    ctx.db.insert(schema.workflowRuns).values({ id: runId, workspaceId: ctx.workspace.id, ambientId: ctx.ambient.id, workflowId, userId: ctx.user.id, status: 'CREATED', runState: {} }).run();
+    const done = Promise.race([waitForRunStatus(runId, 'COMPLETED'), waitForRunStatus(runId, 'FAILED')]);
+    await engine.startRun({ workspaceId: ctx.workspace.id, ambientId: ctx.ambient.id, workflowId, userId: ctx.user.id, triggerId: null, inputs: {}, initialState: buildInitialRunState({ runId, workflowId, graph, inputs: {} }), graph });
+    await done;
+    const row = ctx.db.select().from(schema.workflowRuns).where(eq(schema.workflowRuns.id, runId)).get()!;
+    expect(row.status).toBe('FAILED');
+    expect(JSON.stringify(row.runState)).toContain('ACTION_NOT_ACCOMPLISHED');
+  });
+
+  it('completes a legacy Sample action only after delivery acknowledgement then verified lead mutation', async () => {
+    const agentId = randomUUID();
+    ctx.db.insert(schema.agents).values({
+      id: agentId, workspaceId: ctx.workspace.id, ambientId: ctx.ambient.id, userId: ctx.user.id,
+      name: 'Ava', role: 'specialist', adapterType: 'hermes_agent', capabilityTags: [], config: {}, status: 'online',
+    }).run();
+    let round = 0; const seenTools: string[][] = [];
+    const adapter = {
+      ...markerChatAdapter([], 'unused'),
+      adapterType: 'hermes_agent',
+      chat: async function* (_messages: unknown, tools: Array<{ name: string }>) {
+        seenTools.push(tools.map((tool) => tool.name));
+        round += 1;
+        if (round === 1) {
+          yield { type: 'tool_call', id: 'send-1', name: 'agentis.channel.send', args: { to: '+15551234567', body: 'Conheça a Acme.' } } as const;
+          yield { type: 'done', finishReason: 'tool_calls' } as const;
+          return;
+        }
+        if (round === 2) {
+          yield { type: 'tool_call', id: 'update-1', name: 'agentis.data.update', args: { id: 'lead-1', stage: 'contacted' } } as const;
+          yield { type: 'done', finishReason: 'tool_calls' } as const;
+          return;
+        }
+        yield { type: 'text', delta: 'WhatsApp acknowledged message wa-1. Moved lead to Contacted.' } as const;
+        yield { type: 'done', finishReason: 'stop' } as const;
+      },
+    } as unknown as AgentAdapter;
+    const adapters = new AdapterManager(ctx.logger); adapters.register(agentId, adapter);
+    const registry = new AgentisToolRegistry({ logger: ctx.logger });
+    registry.register(
+      { id: 'agentis.channel.send', family: 'run', description: 'send', inputSchema: { type: 'object', properties: {} }, mutating: true, mcpExposed: true },
+      async () => ({ sent: true, providerAcknowledged: true, receipt: { providerMessageId: 'wa-1', status: 'accepted', acceptedAt: new Date().toISOString() } }),
+    );
+    registry.register(
+      { id: 'agentis.data.update', family: 'data', description: 'update', inputSchema: { type: 'object', properties: {} }, mutating: true, mcpExposed: true },
+      async () => ({ id: 'lead-1', stage: 'contacted', mutationReceipt: { failed: 0, verification: { performed: true, passed: true } } }),
+    );
+    registry.register(
+      { id: 'agentis.code.execute', family: 'run', description: 'run code', inputSchema: { type: 'object', properties: {} }, mutating: true, mcpExposed: true },
+      async () => ({ ok: true }),
+    );
+    ChatToolExecutor.configure({ registry, logger: ctx.logger });
+    const engine = new WorkflowEngine({
+      db: ctx.db, bus: ctx.bus, logger: ctx.logger,
+      ledger: new LedgerService(ctx.db, ctx.bus), scratchpad: new ScratchpadService(ctx.bus, ctx.logger),
+      activity: new ActivityFeedService(ctx.db, ctx.bus), approvals: new ApprovalInboxService(ctx.db, ctx.bus),
+      extensions: {} as unknown as ExtensionRuntime, adapters, toolRegistry: registry,
+    });
+    const graph = {
+      version: 1, viewport: { x: 0, y: 0, zoom: 1 },
+      nodes: [
+        { id: 'T', type: 'trigger', title: 'trigger', position: { x: 0, y: 0 }, config: { kind: 'trigger', triggerType: 'manual' } },
+        { id: 'A', type: 'agent_task', title: 'First contact', position: { x: 1, y: 0 }, config: {
+          kind: 'agent_task', agentId, prompt: 'Select a lead, send the Acme message by WhatsApp, and move it to contacted only after success.', outputKeys: [],
+        } },
+      ], edges: [{ id: 'e', source: 'T', target: 'A' }],
+    } as unknown as WorkflowGraph;
+    const workflowId = randomUUID(); const runId = randomUUID();
+    ctx.db.insert(schema.workflows).values({ id: workflowId, workspaceId: ctx.workspace.id, ambientId: ctx.ambient.id, userId: ctx.user.id, title: 'sample-receipts', graph, settings: {} }).run();
+    ctx.db.insert(schema.workflowRuns).values({ id: runId, workspaceId: ctx.workspace.id, ambientId: ctx.ambient.id, workflowId, userId: ctx.user.id, status: 'CREATED', runState: {} }).run();
+    const done = Promise.race([waitForRunStatus(runId, 'COMPLETED'), waitForRunStatus(runId, 'FAILED')]);
+    await engine.startRun({ workspaceId: ctx.workspace.id, ambientId: ctx.ambient.id, workflowId, userId: ctx.user.id, triggerId: null, inputs: {}, initialState: buildInitialRunState({ runId, workflowId, graph, inputs: {} }), graph });
+    await done;
+    const row = ctx.db.select().from(schema.workflowRuns).where(eq(schema.workflowRuns.id, runId)).get()!;
+    expect(row.status, JSON.stringify(row.runState)).toBe('COMPLETED');
+    const state = row.runState as { nodeStates?: Record<string, { outputData?: { _effectReceipts?: Array<{ kind: string }> } }> };
+    expect(state.nodeStates?.A?.outputData?._effectReceipts?.map((receipt) => receipt.kind)).toEqual(['channel_delivery', 'data_mutation']);
+    expect(seenTools[0]).not.toContain('agentis.code.execute');
   });
 
   it('routes an mcp_native adapter through the same caller-managed chat executor', async () => {

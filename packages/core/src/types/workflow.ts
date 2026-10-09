@@ -357,8 +357,17 @@ export interface AgentArtifactPolicy {
   saveGeneratedAssets?: boolean;
 }
 
+export type AgentTaskEffectKind = 'channel_delivery' | 'data_mutation' | 'schedule' | 'subject_update';
+export interface AgentTaskCompletionContract {
+  requiredEffects: AgentTaskEffectKind[];
+  timeoutMs?: number;
+}
+
 export interface AgentTaskNodeConfig {
   kind: 'agent_task';
+  /** `act` requires evidence-bearing native tool effects before this node can complete. */
+  taskMode?: 'answer' | 'act';
+  completionContract?: AgentTaskCompletionContract;
   agentId?: string;
   /**
    * Reference a specialist by role; the engine resolves it to the workspace's

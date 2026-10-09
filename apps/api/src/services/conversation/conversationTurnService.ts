@@ -280,6 +280,22 @@ export class ConversationTurnService {
     return this.require(workspaceId, turnId);
   }
 
+  /** Replace the runtime prompt for a turn that has not started yet. */
+  updateQueuedPrompt(workspaceId: string, turnId: string, prompt: string): ConversationTurnRow {
+    const turn = this.require(workspaceId, turnId);
+    if (turn.status !== 'queued') {
+      throw new AgentisError('VALIDATION_FAILED', 'Only queued turns can be edited.');
+    }
+    this.deps.db.update(schema.conversationTurns).set({
+      prompt,
+      updatedAt: new Date().toISOString(),
+    }).where(and(
+      eq(schema.conversationTurns.id, turnId),
+      eq(schema.conversationTurns.status, 'queued'),
+    )).run();
+    return this.require(workspaceId, turnId);
+  }
+
   async cancel(workspaceId: string, turnId: string): Promise<ConversationTurnRow> {
     const turn = this.require(workspaceId, turnId);
     if (TERMINAL_STATUSES.includes(turn.status as ConversationTurnStatus)) return turn;
@@ -447,7 +463,11 @@ export class ConversationTurnService {
 }
 
 function isRecoverableRuntimeBlock(message: string): boolean {
-  return /\b(?:capacity|overloaded|rate.?limit|quota|credits?|billing|payment required|temporarily unavailable|try again|no healthy runtime)\b/i.test(message);
+  // Keep only concrete transient conditions recoverable. Generic wording such
+  // as “try again” also appears in permanent configuration errors (for
+  // example, a missing interactive chat harness) and would leave the turn
+  // active indefinitely for the UI to resume.
+  return /\b(?:capacity|overloaded|rate.?limit|quota|credits?|billing|payment required|temporarily unavailable|no healthy runtime)\b/i.test(message);
 }
 
 export function projectTurnEvent(turn: ConversationTurnRow, event: ConversationTurnEventRow): TurnEventV2 {
@@ -456,7 +476,7 @@ export function projectTurnEvent(turn: ConversationTurnRow, event: ConversationT
   const runId = typeof value.runId === 'string' ? value.runId : undefined;
   const category: TurnEventV2['category'] = type === 'commentary'
     ? 'narration'
-    : type === 'activity' || type === 'agent_consultation' || type === 'tool_call' || type === 'tool_result'
+    : type === 'activity' || type === 'agent_consultation' || type === 'suspension' || type === 'tool_call' || type === 'tool_result'
       ? 'operation'
       : type === 'plan'
         ? 'verification'
@@ -490,6 +510,7 @@ function safeEventSummary(type: string, value: Record<string, unknown>, fallback
     return sanitizeSafeText(`${value.label}${detail}`);
   }
   if (type === 'agent_consultation') return sanitizeSafeText(String(value.summary ?? 'Agent consultation updated'));
+  if (type === 'suspension') return sanitizeSafeText(String(value.summary ?? 'Durable suspension updated'));
   if (type === 'tool_call') return `Started ${typeof value.name === 'string' ? value.name : 'an operation'}`;
   if (type === 'tool_result') return `${value.error ? 'Failed' : 'Completed'} ${typeof value.name === 'string' ? value.name : 'an operation'}`;
   if (type === 'turn_status' && typeof value.status === 'string') return `Turn ${value.status}`;
@@ -526,6 +547,16 @@ function safeReplayData(type: string, value: Record<string, unknown>): unknown {
     targetName: typeof value.targetName === 'string' ? sanitizeSafeText(value.targetName) : value.targetName,
     round: value.round,
     maxRounds: value.maxRounds,
+    summary: typeof value.summary === 'string' ? sanitizeSafeText(value.summary) : value.summary,
+    status: value.status,
+    createdAt: value.createdAt,
+  };
+  if (type === 'suspension') return {
+    type,
+    suspensionId: value.suspensionId,
+    phase: value.phase,
+    conditionType: value.conditionType,
+    audienceType: value.audienceType,
     summary: typeof value.summary === 'string' ? sanitizeSafeText(value.summary) : value.summary,
     status: value.status,
     createdAt: value.createdAt,

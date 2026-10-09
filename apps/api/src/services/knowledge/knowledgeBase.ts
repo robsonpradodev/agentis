@@ -109,6 +109,28 @@ export class KnowledgeBaseService {
     return this.repairOrphanedDocumentLinks();
   }
 
+  /**
+   * Run the same idempotent repair without monopolising Node's event loop.
+   * Large imported workspaces can contain tens of thousands of documents; a
+   * synchronous pass makes even /healthz and channel webhooks appear dead.
+   */
+  async repairOrphanedLinksCooperatively(yieldEvery = 1, yieldDelayMs = 10): Promise<number> {
+    if (!this.autoLinker) return 0;
+    const documents = this.activeDocumentsWithScope();
+    const batchSize = Math.max(1, Math.floor(yieldEvery));
+    let linked = 0;
+    for (let index = 0; index < documents.length; index += 1) {
+      const { document, scopeId } = documents[index]!;
+      linked += this.repairDocumentLinks(document, scopeId);
+      if ((index + 1) % batchSize === 0) {
+        // A timer (not setImmediate) deliberately gives network/webhook I/O a
+        // quiet slice and prevents maintenance from saturating one CPU core.
+        await new Promise<void>((resolve) => setTimeout(resolve, Math.max(0, yieldDelayMs)));
+      }
+    }
+    return linked;
+  }
+
   setEmbeddingProviderResolver(resolver: (workspaceId: string) => EmbeddingProvider): void {
     this.embeddingProviderResolver = resolver;
   }
@@ -763,48 +785,61 @@ export class KnowledgeBaseService {
 
   private repairOrphanedDocumentLinks(): number {
     if (!this.autoLinker) return 0;
-    const documents = this.db.select({ document: schema.kbDocuments, scopeId: schema.knowledgeBases.scopeId })
+    let linked = 0;
+    for (const { document, scopeId } of this.activeDocumentsWithScope()) {
+      linked += this.repairDocumentLinks(document, scopeId);
+    }
+    return linked;
+  }
+
+  private activeDocumentsWithScope() {
+    return this.db.select({ document: schema.kbDocuments, scopeId: schema.knowledgeBases.scopeId })
       .from(schema.kbDocuments)
       .innerJoin(schema.knowledgeBases, eq(schema.kbDocuments.knowledgeBaseId, schema.knowledgeBases.id))
       .all()
       .filter(({ document }) => !document.archivedAt);
+  }
+
+  private repairDocumentLinks(
+    document: typeof schema.kbDocuments.$inferSelect,
+    scopeId: string | null,
+  ): number {
+    if (!this.autoLinker) return 0;
     let linked = 0;
-    for (const { document, scopeId } of documents) {
-      const chunks = this.db.select().from(schema.kbChunks)
-        .where(and(
-          eq(schema.kbChunks.workspaceId, document.workspaceId),
-          eq(schema.kbChunks.documentId, document.id),
-        ))
-        .all()
-        .sort((a, b) => a.chunkIndex - b.chunkIndex);
-      const head = chunks[0];
-      if (!head) continue;
-      if (chunks.length === 1) {
-        if (!this.atomHasAnyLink(document.workspaceId, head.id)) {
-          linked += this.autoLinker.autoLink({
-            workspaceId: document.workspaceId,
-            sourceId: head.id,
-            sourceKind: 'kb_chunk',
-            sourceTitle: document.name,
-            sourceContent: head.content,
-            scopeId,
-          });
-        }
-        continue;
-      }
-      for (const chunk of chunks.slice(1)) {
-        if (this.hasSiblingLink(document.workspaceId, chunk.id, head.id)) continue;
+    const chunks = this.db.select().from(schema.kbChunks)
+      .where(and(
+        eq(schema.kbChunks.workspaceId, document.workspaceId),
+        eq(schema.kbChunks.documentId, document.id),
+      ))
+      .all()
+      .sort((a, b) => a.chunkIndex - b.chunkIndex);
+    const head = chunks[0];
+    if (!head) return 0;
+    if (chunks.length === 1) {
+      if (!this.atomHasAnyLink(document.workspaceId, head.id)) {
         linked += this.autoLinker.autoLink({
           workspaceId: document.workspaceId,
-          sourceId: chunk.id,
+          sourceId: head.id,
           sourceKind: 'kb_chunk',
           sourceTitle: document.name,
-          sourceContent: chunk.content,
+          sourceContent: head.content,
           scopeId,
-          siblingHeadId: head.id,
-          siblingHeadKind: 'kb_chunk',
         });
       }
+      return linked;
+    }
+    for (const chunk of chunks.slice(1)) {
+      if (this.hasSiblingLink(document.workspaceId, chunk.id, head.id)) continue;
+      linked += this.autoLinker.autoLink({
+        workspaceId: document.workspaceId,
+        sourceId: chunk.id,
+        sourceKind: 'kb_chunk',
+        sourceTitle: document.name,
+        sourceContent: chunk.content,
+        scopeId,
+        siblingHeadId: head.id,
+        siblingHeadKind: 'kb_chunk',
+      });
     }
     return linked;
   }

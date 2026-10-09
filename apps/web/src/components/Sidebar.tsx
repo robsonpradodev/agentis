@@ -61,7 +61,8 @@ export function Sidebar() {
   }, [collapsed]);
 
   return (
-    <aside
+    <>
+      <aside
       data-agentis-sidebar
       className={clsx(
         'flex shrink-0 flex-col border-r border-line bg-surface transition-[width] duration-150',
@@ -85,7 +86,26 @@ export function Sidebar() {
         {collapsed ? <ChevronsRight size={14} /> : <ChevronsLeft size={14} />}
         {!collapsed && <span>{t('navigation.collapse')}</span>}
       </button>
-    </aside>
+      </aside>
+      <nav data-agentis-mobile-nav aria-label="Primary navigation">
+        {NAV.map((item) => <MobileNavigationLink key={item.to} item={item} />)}
+      </nav>
+    </>
+  );
+}
+
+function MobileNavigationLink({ item }: { item: NavItem }) {
+  const { t } = useTranslation();
+  const Icon = item.icon;
+  return (
+    <NavLink
+      to={item.to}
+      title={item.title ?? t(item.labelKey)}
+      className={({ isActive }) => clsx('agentis-mobile-nav__link', isActive && 'agentis-mobile-nav__link--active')}
+    >
+      <Icon size={18} strokeWidth={1.8} />
+      <span>{t(item.labelKey)}</span>
+    </NavLink>
   );
 }
 

@@ -91,6 +91,14 @@ export function HumanInputApprovalForm({
                   <option key={opt.value} value={opt.value}>{opt.label ?? opt.value}</option>
                 ))}
               </select>
+            ) : field.type === 'textarea' ? (
+              <textarea
+                id={id}
+                rows={5}
+                value={values[field.key] == null ? '' : String(values[field.key])}
+                onChange={(e) => set(field.key, e.target.value || undefined)}
+                className="s-input resize-y"
+              />
             ) : (
               <input
                 id={id}
@@ -114,7 +122,7 @@ export function HumanInputApprovalForm({
           onClick={() => void onResolve('approve', values)}
           className="s-btn s-btn-primary"
         >
-          <Check size={13} /> Submit &amp; approve
+          <Check size={13} /> Submit
         </button>
         <button
           type="button"

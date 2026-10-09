@@ -367,6 +367,7 @@ export class CursorAdapter implements AgentAdapter {
       displayName: 'Cursor',
       logTag: 'cursor.chat',
       logger: this.opts.logger,
+      tools,
       signal: options?.signal,
       idleTimeoutMs,
       hardCeilingMs: chatHardCeilingMs(idleTimeoutMs, 'AGENTIS_CURSOR_CHAT_HARD_CEILING_MS'),

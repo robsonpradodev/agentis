@@ -141,6 +141,16 @@ export class ChannelInboxService {
     return identity.handle;
   }
 
+  /** Resolve an observed address into the canonical inbox, creating only the identity record (never sending). */
+  ensurePeer(args: { workspaceId: string; connectionId: string; channelKind: string; address: string; displayName?: string | null }): ChannelInboxPeer {
+    const identity = this.deps.identities.observeAliases({
+      workspaceId: args.workspaceId, connectionId: args.connectionId, channelKind: args.channelKind,
+      primaryHandle: args.address, aliases: [args.address], displayName: args.displayName ?? undefined,
+      source: 'verified_owner', verified: true, countMessage: false,
+    });
+    return this.#project(identity);
+  }
+
   compactWorld(workspaceId: string, connectionId: string, limit = 6): string | null {
     const peers = this.list({ workspaceId, connectionId, excludeOwner: true, limit }).peers;
     if (peers.length === 0) return null;
@@ -202,7 +212,25 @@ export class ChannelInboxService {
       stage: typeof active?.stage === 'string' ? active.stage : null,
       goal: typeof active?.goal === 'string' ? active.goal : null,
       aliases,
+      authorityRole: identity.authorityRole,
     };
+  }
+
+  /**
+   * The workspace's verified staff on this connection (or every connection when
+   * omitted) — the owner plus any granted delegates, expired grants excluded.
+   * This is the "who is my team" primitive: it gives an agent a stable
+   * recipientRef for escalating or reporting, instead of only recognizing staff
+   * reactively when they happen to message in.
+   */
+  team(workspaceId: string, connectionId?: string | null): ChannelInboxPeer[] {
+    const now = Date.now();
+    return this.deps.identities.list(workspaceId)
+      .filter((identity) => identity.authorityRole !== 'external')
+      .filter((identity) => !identity.grantExpiresAt || Date.parse(identity.grantExpiresAt) > now)
+      .filter((identity) => !connectionId || identity.connectionId === connectionId)
+      .map((identity) => this.#project(identity))
+      .sort((a, b) => (a.authorityRole === b.authorityRole ? 0 : a.authorityRole === 'owner' ? -1 : 1));
   }
 
   #searchText(peer: ChannelInboxPeer): string {

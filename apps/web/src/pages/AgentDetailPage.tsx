@@ -26,9 +26,10 @@ import { REALTIME_ACTIVITY_EVENTS, describeRealtimeActivity, type RealtimeActivi
 import { RuntimeNativePanel } from '../components/agents/RuntimeNativePanel';
 import { DeleteAgentDialog } from '../components/agents/DeleteAgentDialog';
 import { DomainEditorSheet, type DomainOption } from '../components/agents/DomainEditorSheet';
+import { AgentAutonomyTab } from '../components/agents/AgentAutonomyTab';
 import { useAgentInstallSession } from '../hooks/useBackgroundInstall';
 
-type TabKey = 'identity' | 'instructions' | 'runtime' | 'channels' | 'history';
+type TabKey = 'identity' | 'instructions' | 'autonomy' | 'runtime' | 'channels' | 'history';
 
 /** Map legacy tab values (overview / connections / interactions) onto the redesigned set. */
 function normalizeTab(raw: string | null): TabKey {
@@ -44,6 +45,7 @@ function normalizeTab(raw: string | null): TabKey {
     case 'history':
       return 'history';
     case 'instructions':
+    case 'autonomy':
     case 'channels':
       return raw;
     default:
@@ -89,6 +91,7 @@ interface AgentSummary {
   name: string;
   role?: string | null;
 }
+
 
 function initials(name: string): string {
   const p = name.trim().split(/\s+/).filter(Boolean);
@@ -332,6 +335,7 @@ export function AgentDetailPage() {
         tabs={[
           { value: 'identity',     label: 'Identity' },
           { value: 'instructions', label: 'Instructions' },
+          { value: 'autonomy',     label: 'Autonomy' },
           { value: 'runtime',      label: 'Runtime' },
           { value: 'channels',     label: 'Channels' },
           { value: 'history',      label: 'History' },
@@ -342,6 +346,7 @@ export function AgentDetailPage() {
       <div className="flex-1 overflow-y-auto px-6 py-5">
         {tab === 'identity' && <IdentityTab agent={agent} allAgents={allAgents} allSpaces={allSpaces} onChange={refresh} />}
         {tab === 'instructions' && <RuntimeNativePanel agentId={agent.id} mode="resources" />}
+        {tab === 'autonomy' && <AgentAutonomyTab agent={agent} />}
         {tab === 'runtime' && <RuntimeTab agent={agent} allAgents={allAgents} onChange={refresh} />}
         {tab === 'channels' && <AgentChannelsTab agentId={agent.id} agentName={agent.name} />}
         {tab === 'history' && <HistoryTab agent={agent} />}

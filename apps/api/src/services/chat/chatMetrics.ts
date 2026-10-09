@@ -95,6 +95,10 @@ export interface TurnSample {
   /** True when the turn was answered through the orchestrator fast-path. */
   fastPath: boolean;
   adapterType: string;
+  /** Sum of the prompt tokens estimated immediately before each model round. */
+  promptInputTokens?: number;
+  /** Number of rounds where the preflight removed oversized context. */
+  promptCompactions?: number;
 }
 
 const TURN_WINDOW = 500;
@@ -113,6 +117,13 @@ interface StageSummary {
   samples: number;
 }
 
+interface QuantitySummary {
+  avg: number;
+  p50: number;
+  p95: number;
+  samples: number;
+}
+
 function summarize(values: number[]): StageSummary {
   if (values.length === 0) return { avgMs: 0, p50Ms: 0, p95Ms: 0, samples: 0 };
   const sorted = [...values].sort((a, b) => a - b);
@@ -125,6 +136,17 @@ function summarize(values: number[]): StageSummary {
   };
 }
 
+function summarizeQuantity(values: number[]): QuantitySummary {
+  if (values.length === 0) return { avg: 0, p50: 0, p95: 0, samples: 0 };
+  const sorted = [...values].sort((a, b) => a - b);
+  return {
+    avg: Math.round(sorted.reduce((total, value) => total + value, 0) / sorted.length),
+    p50: percentile(sorted, 50),
+    p95: percentile(sorted, 95),
+    samples: sorted.length,
+  };
+}
+
 export interface TurnMetrics {
   turns: number;
   fastPathRate: number;
@@ -133,6 +155,8 @@ export interface TurnMetrics {
   firstToken: StageSummary;
   model: StageSummary;
   tools: StageSummary;
+  promptInputTokens: QuantitySummary;
+  promptCompactions: number;
   byFinishReason: Record<string, number>;
 }
 
@@ -152,6 +176,8 @@ export function getTurnMetrics(): TurnMetrics {
     firstToken: summarize(turnSamples.map((s) => s.firstTokenMs).filter(notNull)),
     model: summarize(turnSamples.map((s) => s.modelMs)),
     tools: summarize(turnSamples.map((s) => s.toolMs)),
+    promptInputTokens: summarizeQuantity(turnSamples.map((s) => s.promptInputTokens ?? 0)),
+    promptCompactions: turnSamples.reduce((total, sample) => total + (sample.promptCompactions ?? 0), 0),
     byFinishReason,
   };
 }

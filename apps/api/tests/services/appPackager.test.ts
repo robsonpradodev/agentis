@@ -10,7 +10,13 @@ import { createHash, randomUUID } from 'node:crypto';
 import { eq } from 'drizzle-orm';
 import { canonicalizeManifest } from '@agentis/core';
 import { schema } from '@agentis/db/sqlite';
-import { AppDatastore, AppPackager, AppStore, AppSurfaceStore } from '@agentis/app';
+import {
+  AppDatastore,
+  AppDefinitionStore,
+  AppPackager,
+  AppStore,
+  AppSurfaceStore,
+} from '@agentis/app';
 import { createTestContext, type TestContext } from '../_helpers/createTestContext.js';
 
 let ctx: TestContext;
@@ -25,12 +31,28 @@ beforeEach(async () => {
   store.update(ctx.workspace.id, appId, { version: '1.2.0', policy: { customCode: 'allowed' } });
 
   const data = new AppDatastore(ctx.db);
-  data.defineCollection(ctx.workspace.id, appId, { name: 'tickets', schema: { fields: [{ key: 'subject', type: 'string', required: true }] } });
+  data.defineCollection(ctx.workspace.id, appId, {
+    name: 'tickets',
+    schema: { fields: [{ key: 'subject', type: 'string', required: true }] },
+  });
   data.insert(ctx.workspace.id, appId, 'tickets', { subject: 'private customer data' }); // must NOT travel
 
-  new AppSurfaceStore({ db: ctx.db }).render(ctx.workspace.id, appId, 'home', { type: 'Stack', children: [{ type: 'Heading', value: 'Tickets' }] });
+  new AppSurfaceStore({ db: ctx.db }).render(ctx.workspace.id, appId, 'home', {
+    type: 'Stack',
+    children: [{ type: 'Heading', value: 'Tickets' }],
+  });
 
-  ctx.db.insert(schema.workflows).values({ id: randomUUID(), workspaceId: ctx.workspace.id, userId: ctx.user.id, appId, title: 'Notify', graph: { version: 1, nodes: [], edges: [] } }).run();
+  ctx.db
+    .insert(schema.workflows)
+    .values({
+      id: randomUUID(),
+      workspaceId: ctx.workspace.id,
+      userId: ctx.user.id,
+      appId,
+      title: 'Notify',
+      graph: { version: 1, nodes: [], edges: [] },
+    })
+    .run();
 });
 
 afterEach(() => ctx.close());
@@ -42,12 +64,59 @@ function comparable(m: ReturnType<AppPackager['toManifest']>) {
     version: m.identity.version,
     policy: m.policy,
     workflows: m.workflows.map((w) => ({ title: w.title, graph: w.graph })),
-    surfaces: m.surfaces.map((s) => ({ name: s.name, kind: s.kind, view: s.view, actions: s.actions })),
+    surfaces: m.surfaces.map((s) => ({
+      name: s.name,
+      kind: s.kind,
+      view: s.view,
+      actions: s.actions,
+    })),
     collections: m.collections.map((c) => ({ name: c.name, schema: c.schema })),
   };
 }
 
 describe('AppPackager — IR projection', () => {
+  it('round-trips every Agentic App v3 definition facet', () => {
+    new AppDefinitionStore(ctx.db).upsert(ctx.workspace.id, appId, {
+      contract: {
+        operations: [],
+        resources: [],
+        events: [],
+      },
+      frontend: {
+        framework: 'react',
+        entry: 'src/main.tsx',
+        outputDir: 'dist',
+        styling: 'tailwind',
+      },
+      permissionsV3: {
+        scopes: [],
+        egress: [],
+        maxEffectLevel: 'read',
+        maxSpendCentsPerTask: null,
+        guardrails: [],
+      },
+      projections: {
+        rest: true,
+        mcp: { enabled: true, tasks: true },
+        a2a: { enabled: true, exposeOperations: [] },
+      },
+    });
+
+    const envelope = packager.export(ctx.workspace.id, appId);
+    expect(envelope.formatVersion).toBe(3);
+    expect(envelope.manifest).toMatchObject({
+      manifestVersion: 3,
+      frontend: { framework: 'react', styling: 'tailwind' },
+      projections: { rest: true, mcp: { tasks: true } },
+    });
+
+    const imported = packager.import(ctx.workspace.id, ctx.user.id, envelope);
+    const definition = new AppDefinitionStore(ctx.db).require(ctx.workspace.id, imported.appId);
+    expect(definition.frontend).toEqual(envelope.manifest.frontend);
+    expect(definition.permissionsV3).toEqual(envelope.manifest.permissionsV3);
+    expect(definition.projections).toEqual(envelope.manifest.projections);
+  });
+
   it('round-trips rows → manifest → rows → manifest as identity (modulo ids/slug)', () => {
     const m1 = packager.toManifest(ctx.workspace.id, appId);
     const { appId: newId } = packager.fromManifest(ctx.workspace.id, ctx.user.id, m1);
@@ -90,7 +159,9 @@ describe('AppPackager — IR projection', () => {
       format: '.agentisapp' as const,
       formatVersion: 1 as const,
       manifest: rawManifest as never,
-      checksum: createHash('sha256').update(canonicalizeManifest(rawManifest as never)).digest('hex'),
+      checksum: createHash('sha256')
+        .update(canonicalizeManifest(rawManifest as never))
+        .digest('hex'),
       exportedAt: '2026-01-01T00:00:00.000Z',
     };
     // Verifies over raw bytes → passes; returns the strict (stripped) manifest.
@@ -109,9 +180,17 @@ describe('AppPackager — IR projection', () => {
     expect(envelope.manifest.workflows).toHaveLength(1);
 
     const { appId: newId } = packager.import(ctx.workspace.id, ctx.user.id, envelope);
-    expect(new AppSurfaceStore({ db: ctx.db }).list(ctx.workspace.id, newId).map((s) => s.name)).toEqual(['home']);
+    expect(
+      new AppSurfaceStore({ db: ctx.db }).list(ctx.workspace.id, newId).map((s) => s.name),
+    ).toEqual(['home']);
     expect(new AppStore(ctx.db).get(ctx.workspace.id, newId).entrySurfaceId).toBe('home');
-    expect(ctx.db.select({ id: schema.workflows.id }).from(schema.workflows).where(eq(schema.workflows.appId, newId)).all()).toHaveLength(1);
+    expect(
+      ctx.db
+        .select({ id: schema.workflows.id })
+        .from(schema.workflows)
+        .where(eq(schema.workflows.appId, newId))
+        .all(),
+    ).toHaveLength(1);
   });
 
   it('preserves Hub provenance and checksum through install and export', () => {
@@ -135,20 +214,56 @@ describe('AppPackager — IR projection', () => {
   });
 
   it('exports the immutable active graph by default and candidate only when explicit', () => {
-    const workflow = ctx.db.select().from(schema.workflows).where(eq(schema.workflows.appId, appId)).get()!;
+    const workflow = ctx.db
+      .select()
+      .from(schema.workflows)
+      .where(eq(schema.workflows.appId, appId))
+      .get()!;
     const activeId = randomUUID();
     const candidateId = randomUUID();
-    const activeGraph = { version: 1 as const, nodes: [], edges: [], viewport: { x: 1, y: 0, zoom: 1 } };
-    const candidateGraph = { version: 1 as const, nodes: [], edges: [], viewport: { x: 2, y: 0, zoom: 1 } };
-    for (const [id, graph, status] of [[activeId, activeGraph, 'active'], [candidateId, candidateGraph, 'candidate']] as const) {
-      ctx.db.insert(schema.workflowGraphRevisions).values({
-        id, workspaceId: ctx.workspace.id, workflowId: workflow.id,
-        graphJson: graph, semanticHash: `${id}-semantic`, presentationHash: `${id}-presentation`,
-        source: 'test', reason: 'test', status, trustState: status === 'active' ? 'proven' : 'unverified',
-      }).run();
+    const activeGraph = {
+      version: 1 as const,
+      nodes: [],
+      edges: [],
+      viewport: { x: 1, y: 0, zoom: 1 },
+    };
+    const candidateGraph = {
+      version: 1 as const,
+      nodes: [],
+      edges: [],
+      viewport: { x: 2, y: 0, zoom: 1 },
+    };
+    for (const [id, graph, status] of [
+      [activeId, activeGraph, 'active'],
+      [candidateId, candidateGraph, 'candidate'],
+    ] as const) {
+      ctx.db
+        .insert(schema.workflowGraphRevisions)
+        .values({
+          id,
+          workspaceId: ctx.workspace.id,
+          workflowId: workflow.id,
+          graphJson: graph,
+          semanticHash: `${id}-semantic`,
+          presentationHash: `${id}-presentation`,
+          source: 'test',
+          reason: 'test',
+          status,
+          trustState: status === 'active' ? 'proven' : 'unverified',
+        })
+        .run();
     }
-    ctx.db.update(schema.workflows).set({ activeRevisionId: activeId, candidateRevisionId: candidateId, graph: candidateGraph }).where(eq(schema.workflows.id, workflow.id)).run();
-    expect(packager.export(ctx.workspace.id, appId).manifest.workflows[0]!.graph).toEqual(activeGraph);
-    expect(packager.export(ctx.workspace.id, appId, { revisionTarget: 'candidate' }).manifest.workflows[0]!.graph).toEqual(candidateGraph);
+    ctx.db
+      .update(schema.workflows)
+      .set({ activeRevisionId: activeId, candidateRevisionId: candidateId, graph: candidateGraph })
+      .where(eq(schema.workflows.id, workflow.id))
+      .run();
+    expect(packager.export(ctx.workspace.id, appId).manifest.workflows[0]!.graph).toEqual(
+      activeGraph,
+    );
+    expect(
+      packager.export(ctx.workspace.id, appId, { revisionTarget: 'candidate' }).manifest
+        .workflows[0]!.graph,
+    ).toEqual(candidateGraph);
   });
 });

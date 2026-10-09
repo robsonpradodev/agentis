@@ -208,6 +208,7 @@ import { artifactPolicyFromUnknown } from '../services/artifactRetentionPolicy.j
 import type { WorkflowRevisionService } from '../services/workflow/workflowRevisionService.js';
 import type { WorkflowExperienceService } from '../services/workflow/workflowExperienceService.js';
 import { classifyWorkflowFailure, workflowFailureFingerprint } from '../services/workflow/workflowFailureClassification.js';
+import type { AgentMissionService } from '../services/agentMissions.js';
 
 export interface EngineDeps {
   db: AgentisSqliteDb;
@@ -242,6 +243,8 @@ export interface EngineDeps {
   commandModel?: { briefingBlock(workspaceId: string, agentId: string): string };
   /** Native channel send — required for the deterministic `channel` node. */
   channelSend?: ChannelSendPort;
+  /** Shared mission/effect ledger; workflow nodes write the same receipt shape as chat/tools. */
+  missions?: AgentMissionService;
   /** Agentic App datastore access for the `data_query` / `data_mutate` nodes. */
   appData?: AppDataPort;
   /** Resolve the owning App id from the running workflow when a data node omits `appId`. */
@@ -435,6 +438,9 @@ export interface StartRunArgs {
   /** P1.2: when true, suppress self-heal + fallback recovery so a debugging agent
    *  observes the RAW per-node failure. For test/debug runs, not production. */
   debugRun?: boolean;
+  /** Internal synchronous operations still need run-scoped lifecycle events for
+   *  their caller, but should not duplicate feedback in the workspace stream. */
+  quietWorkspaceEvents?: boolean;
 }
 
 export interface RunHandle {
@@ -448,6 +454,8 @@ export class WorkflowEngine {
   /** P1.2: runIds started in debug/test mode — self-heal + fallback recovery are
    *  suppressed so an agent debugging a build sees the RAW failure, not a heal. */
   readonly #debugRuns = new Set<string>();
+  /** Run ids whose lifecycle stays on the run room instead of the workspace room. */
+  readonly #quietWorkspaceEventRuns = new Set<string>();
   /**
    * LAYER 1 (immersive-realtime): a capped, in-memory replayable activity tail per
    * run — every node step, agent thought, tool call, and status change as a
@@ -544,6 +552,7 @@ export class WorkflowEngine {
     // P1.2: mark a debug/test run so self-heal + fallback recovery are suppressed
     // and the agent observes the RAW per-node failure instead of a healed result.
     if (args.debugRun) this.#debugRuns.add(args.initialState.runId);
+    if (args.quietWorkspaceEvents) this.#quietWorkspaceEventRuns.add(args.initialState.runId);
     if (normalized.repairs.length > 0) {
       this.deps.logger.info('engine.graph.normalized', {
         runId: args.initialState.runId,
@@ -599,7 +608,9 @@ export class WorkflowEngine {
         error: error instanceof Error ? error.message : String(error),
       };
       this.deps.bus.publish(REALTIME_ROOMS.run(args.initialState.runId), REALTIME_EVENTS.RUN_FAILED, payload);
-      this.deps.bus.publish(REALTIME_ROOMS.workspace(args.workspaceId), REALTIME_EVENTS.RUN_FAILED, payload);
+      if (!args.quietWorkspaceEvents) {
+        this.deps.bus.publish(REALTIME_ROOMS.workspace(args.workspaceId), REALTIME_EVENTS.RUN_FAILED, payload);
+      }
       return { runId: args.initialState.runId, workflowId: args.workflowId };
     }
     const ctx: RunningContext = {
@@ -2020,6 +2031,7 @@ export class WorkflowEngine {
     this.#runs.delete(runId);
     this.#runActivity.delete(runId);
     this.#debugRuns.delete(runId);
+    this.#quietWorkspaceEventRuns.delete(runId);
   }
 
   /** Resolve an agent's display name for conversation/activity attribution. */
@@ -2925,6 +2937,16 @@ export class WorkflowEngine {
           content: '[outbound message redacted]',
           capturedAt: new Date().toISOString(),
         };
+        const missionId = this.deps.db.select({ missionId: schema.workflowRuns.missionId })
+          .from(schema.workflowRuns).where(eq(schema.workflowRuns.id, ctx.runId)).get()?.missionId;
+        if (missionId) this.deps.missions?.recordReceipt({
+          workspaceId: ctx.workspaceId, missionId, kind: 'channel_delivery',
+          requirementId: `workflow:${node.id}:channel_delivery`, planStepId: node.id,
+          actionId: `${ctx.runId}:${node.id}`, providerMessageId, providerStatus: String(provenDelivery.status ?? 'accepted'),
+          acknowledged: provenDelivery.verified === true,
+          idempotencyKey: `workflow-channel:${item.idempotencyKey ?? nodeIdempotencyKey(ctx.runId, node.id, 0)}`,
+          evidence: provenDelivery,
+        });
         await this.#completeNode(ctx, node.id, result);
         return;
       }
@@ -2935,6 +2957,17 @@ export class WorkflowEngine {
       }
       case 'data_mutate': {
         const result = this.#executors.executeDataMutate(ctx, resolvedConfig as DataMutateNodeConfig);
+        const missionId = this.deps.db.select({ missionId: schema.workflowRuns.missionId })
+          .from(schema.workflowRuns).where(eq(schema.workflowRuns.id, ctx.runId)).get()?.missionId;
+        const mutation = resolvedConfig as DataMutateNodeConfig;
+        if (missionId) this.deps.missions?.recordReceipt({
+          workspaceId: ctx.workspaceId, missionId, kind: 'data_mutation', actionId: `${ctx.runId}:${node.id}`,
+          requirementId: `workflow:${node.id}:data_mutation`, planStepId: node.id,
+          resourceType: `app_data:${mutation.collection}`,
+          resourceId: mutation.recordId ?? null, acknowledged: true,
+          idempotencyKey: `workflow-data:${ctx.runId}:${node.id}:${mutation.operation}`,
+          evidence: result,
+        });
         await this.#completeNode(ctx, node.id, result);
         return;
       }
@@ -3582,6 +3615,10 @@ export class WorkflowEngine {
       toolCalls: result.toolCalls,
       steps: result.steps.length,
       stoppedReason: result.stoppedReason,
+      _effectReceipts: collectAgentEffectReceipts(result.steps.map((step, index) => ({
+        id: `loop-${index}`, name: typeof step.tool === 'string' ? step.tool : String(step.tool ?? ''),
+        result: step.observation, error: step.error,
+      }))),
     };
     this.#recordNodeTokens(ctx, node.id, result.tokensIn, result.tokensOut);
     // Attribute to the RESOLVED agent (more precise than the node's config, which
@@ -3611,8 +3648,17 @@ export class WorkflowEngine {
   ): Promise<boolean> {
     const adapter = this.deps.adapters.get(agentId)?.adapter;
     if (!adapter?.chat || adapter.capabilities?.().interactiveChat === false) return false;
-    const tools = this.#agentChatTools();
+    const tools = this.#agentChatTools(config, node.title);
     if (!tools) return false;
+    const missingEffectPaths = missingAgentEffectToolPaths(requiredAgentTaskEffects(node), tools.map((tool) => tool.name));
+    if (missingEffectPaths.length > 0) {
+      await this.#pauseNodeBlocked(
+        ctx,
+        node.id,
+        `Agent action has no executable evidence path for ${missingEffectPaths.join(', ')}. Configure the required native Agentis tools/connection before retrying; no effect was attempted.`,
+      );
+      return true;
+    }
 
     // ── committed: from here this method OWNS the node completion. ──
     this.#recordSpecialistAssignment(ctx, node, agentId, config.prompt);
@@ -3622,11 +3668,13 @@ export class WorkflowEngine {
     const brief = `${config.prompt}${buildNodeProcessBriefing(ctx.graph, node, config)}${inputBlock}`;
     const systemAddendum = [
       rolePrompt,
-      'You are executing a workflow step. Use your OWN native tools AND the Agentis platform tools below — search, browser, the workspace/app/agent brain, app data, cooperation, and channels — whichever the task needs. Work autonomously; do not ask the operator to confirm. Finish with your result as your final message.',
+      'You are executing a workflow step. Agentis platform tools are the authoritative path for workspace data, Brain, channel delivery, and other external effects. Use those tools directly and work autonomously; do not inspect the Agentis source tree, secrets, auth files, or local database, and do not ask the operator to confirm. A send/update is complete only when its tool result proves the provider acknowledgement or persisted mutation. Finish with a concise verified result.',
     ].filter(Boolean).join('\n\n');
     const appId = this.deps.resolveAppIdForWorkflow?.(ctx.workspaceId, ctx.workflowId);
     const attempt = ctx.state.nodeStates[node.id]?.attempt ?? this.#nodeDispatchCounts(ctx).get(node.id) ?? 1;
     const sessionKey = `agent-task:${ctx.runId}:${node.id}:attempt:${attempt}`;
+    const missionId = this.deps.db.select({ missionId: schema.workflowRuns.missionId })
+      .from(schema.workflowRuns).where(eq(schema.workflowRuns.id, ctx.runId)).get()?.missionId ?? null;
     const clip = (s: string, n: number) => (s.length > n ? `${s.slice(0, n)}…` : s);
 
     ctx.state.activeExecutions[node.id] = {
@@ -3641,6 +3689,7 @@ export class WorkflowEngine {
     let text = '';
     let finishReason: Extract<ChatDelta, { type: 'done' }>['finishReason'] | undefined;
     let adapterFailure: string | undefined;
+    const effectResults: Array<{ id: string; name: string; result: unknown; error?: string }> = [];
     const executionStartedAt = Date.now();
     try {
       for await (const delta of ChatSessionExecutor.turn(adapter, [], brief, {
@@ -3649,6 +3698,8 @@ export class WorkflowEngine {
         userId: ctx.userId,
         conversationId: sessionKey,
         clientTurnId: sessionKey,
+        durableTurnId: sessionKey,
+        ...(config.taskMode === 'act' && missionId ? { missionId } : {}),
         executionMode: 'chat',
         permissionMode: 'auto',
         runId: ctx.runId,
@@ -3686,7 +3737,10 @@ export class WorkflowEngine {
       })) {
         if (ctx.abortController?.signal.aborted || ctx.state.status === 'CANCELLED') break;
         if (delta.type === 'text') text += delta.delta;
-        if (delta.type === 'tool_result' && delta.error) adapterFailure = delta.error;
+        if (delta.type === 'tool_result') {
+          effectResults.push({ id: delta.id, name: delta.name, result: delta.result, ...(delta.error ? { error: delta.error } : {}) });
+          if (delta.error) adapterFailure = delta.error;
+        }
         if (delta.type === 'done') finishReason = delta.finishReason;
         this.#selfHeal.relayChatDelta(ctx, node, agentId, delta, clip);
       }
@@ -3730,6 +3784,7 @@ export class WorkflowEngine {
     const output: Record<string, unknown> = structured && typeof structured === 'object' && !Array.isArray(structured)
       ? (structured as Record<string, unknown>)
       : { output: trimmed };
+    output._effectReceipts = collectAgentEffectReceipts(effectResults);
     this.#audit(ctx, { nodeId: node.id, action: 'agent.harness_tool_loop', actorType: 'agent', actorId: agentId, outputSummary: clip(trimmed, 200) });
     this.#recordSpecialistResult(ctx, node, agentId, output);
     const completedOutput = await this.#completeNode(ctx, node.id, output);
@@ -3748,11 +3803,22 @@ export class WorkflowEngine {
   /** The `agentis.*` platform tools a workflow harness agent may call (E1) — the
    *  mcp-exposed catalog (vetted for autonomous harnesses) minus the recursion /
    *  run-control blocklist. Same safe set the in-engine loop gets (E2). */
-  #agentChatTools(): ToolDefinition[] | undefined {
+  #agentChatTools(config?: AgentTaskNodeConfig, title?: string): ToolDefinition[] | undefined {
     const registry = this.deps.toolRegistry;
     if (!registry) return undefined;
+    const actionEffects = config ? requiredAgentTaskEffects({
+      id: 'tool-surface',
+      title: title ?? 'Agent Task',
+      position: { x: 0, y: 0 },
+      config,
+    } as WorkflowNode) : [];
+    const platformAction = config?.taskMode === 'act' || actionEffects.length > 0;
     const tools = registry.catalog({ mcpOnly: true }).tools
       .filter((tool) => !WORKFLOW_AGENT_TOOL_BLOCKLIST.has(tool.id))
+      // Action tasks must use the evidence-bearing platform primitives directly.
+      // Letting them hide channel/data calls inside code.execute made the runtime
+      // inspect source/auth files, obscured receipts, and multiplied token use.
+      .filter((tool) => !(platformAction && tool.id === 'agentis.code.execute'))
       .map((tool) => ({
         name: tool.id,
         description: tool.longDescription ?? tool.description,
@@ -7532,6 +7598,9 @@ export class WorkflowEngine {
         }
       }
     }
+    if (completedNode?.config.kind === 'agent_task') {
+      assertAgentTaskEffectContract(completedNode, normalizedOutput);
+    }
     const deviation = normalization.missingKeys.length > 0
       ? buildContractDeviation(completedNode, normalization)
       : undefined;
@@ -8817,12 +8886,17 @@ export class WorkflowEngine {
         summary: 'Execution completed mechanically without a definition-of-done verdict.',
       } : {}),
     };
+    const quietWorkspaceEvents = this.#quietWorkspaceEventRuns.has(ctx.runId);
     this.deps.bus.publish(REALTIME_ROOMS.run(ctx.runId), eventName, runStatusPayload);
-    this.deps.bus.publish(REALTIME_ROOMS.workspace(ctx.workspaceId), eventName, runStatusPayload);
+    if (!quietWorkspaceEvents) {
+      this.deps.bus.publish(REALTIME_ROOMS.workspace(ctx.workspaceId), eventName, runStatusPayload);
+    }
     this.#appendActivityTail(ctx.runId, eventName, runStatusPayload);
     if (finishing) {
       this.deps.bus.publish(REALTIME_ROOMS.run(ctx.runId), REALTIME_EVENTS.RUN_SETTLED, runStatusPayload);
-      this.deps.bus.publish(REALTIME_ROOMS.workspace(ctx.workspaceId), REALTIME_EVENTS.RUN_SETTLED, runStatusPayload);
+      if (!quietWorkspaceEvents) {
+        this.deps.bus.publish(REALTIME_ROOMS.workspace(ctx.workspaceId), REALTIME_EVENTS.RUN_SETTLED, runStatusPayload);
+      }
       this.#appendActivityTail(ctx.runId, REALTIME_EVENTS.RUN_SETTLED, runStatusPayload);
     }
     // Business progression gets its own strong event. `run.completed` remains
@@ -8831,7 +8905,9 @@ export class WorkflowEngine {
     if (status === 'COMPLETED' && runVerdict?.outcome === 'accomplished') {
       const accomplishedPayload = { ...runStatusPayload, verdict: runVerdict.outcome };
       this.deps.bus.publish(REALTIME_ROOMS.run(ctx.runId), REALTIME_EVENTS.RUN_ACCOMPLISHED, accomplishedPayload);
-      this.deps.bus.publish(REALTIME_ROOMS.workspace(ctx.workspaceId), REALTIME_EVENTS.RUN_ACCOMPLISHED, accomplishedPayload);
+      if (!quietWorkspaceEvents) {
+        this.deps.bus.publish(REALTIME_ROOMS.workspace(ctx.workspaceId), REALTIME_EVENTS.RUN_ACCOMPLISHED, accomplishedPayload);
+      }
       this.#appendActivityTail(ctx.runId, REALTIME_EVENTS.RUN_ACCOMPLISHED, accomplishedPayload);
     }
   }
@@ -9482,7 +9558,7 @@ function hydrateSelfHealAttempts(state: WorkflowRunState): Map<string, number> {
 
 
 function isSelfHealTerminalError(error: string): boolean {
-  return /Self-healing stopped:|self-healing patch could not be applied|self-healing fix was rejected/i.test(error);
+  return /Self-healing stopped:|self-healing patch could not be applied|self-healing fix was rejected|ACTION_(?:COMPLETION_CONTRACT_MISSING|NOT_ACCOMPLISHED)|UNCONSUMED_TOOL_PROTOCOL/i.test(error);
 }
 
 
@@ -10940,6 +11016,142 @@ function stableComponentIdentity(value: unknown): string {
     .sort(([a], [b]) => a.localeCompare(b))
     .map(([key, item]) => `${key}:${stableComponentIdentity(item)}`)
     .join(',')}}`;
+}
+
+type AgentEffectReceipt = { kind: string; toolCallId: string; toolId: string; observedAt: string; evidence: unknown };
+
+/** Build receipts only from results returned by the platform tool executor. */
+function collectAgentEffectReceipts(results: Array<{ id: string; name: string; result: unknown; error?: string }>): AgentEffectReceipt[] {
+  const receipts: AgentEffectReceipt[] = [];
+  for (const item of results) {
+    if (item.error || !item.name) continue;
+    let kind: string | null = null;
+    if (item.name === 'agentis.channel.send' || item.name === 'agentis.channel.action.create') {
+      if (!hasAcknowledgedDelivery(item.result)) continue;
+      kind = 'channel_delivery';
+    } else if (['agentis.data.insert', 'agentis.data.update', 'agentis.data.upsert', 'agentis.data.batch'].includes(item.name)) {
+      if (!hasVerifiedDataMutation(item.result)) continue;
+      kind = 'data_mutation';
+    } else if (item.name === 'agentis.subject.update_relationship' || item.name === 'agentis.subject.enroll') {
+      kind = 'subject_update';
+    }
+    if (kind) receipts.push({ kind, toolCallId: item.id, toolId: item.name, observedAt: new Date().toISOString(), evidence: item.result });
+    if ((item.name === 'agentis.subject.update_relationship' || item.name === 'agentis.subject.enroll') && hasScheduledNextAction(item.result)) {
+      receipts.push({ kind: 'schedule', toolCallId: item.id, toolId: item.name, observedAt: new Date().toISOString(), evidence: item.result });
+    }
+  }
+  return receipts;
+}
+
+function assertAgentTaskEffectContract(node: WorkflowNode, output: Record<string, unknown>): void {
+  if (node.config.kind !== 'agent_task') return;
+  if (containsUnconsumedToolProtocol(output)) {
+    throw new Error(`UNCONSUMED_TOOL_PROTOCOL: Agent task "${node.title}" returned tool syntax instead of executing it. No external success was recorded.`);
+  }
+  const required = requiredAgentTaskEffects(node);
+  if (node.config.taskMode === 'answer') return;
+  if (node.config.taskMode !== 'act' && required.length === 0) return;
+  if (required.length === 0) {
+    throw new Error(`ACTION_COMPLETION_CONTRACT_MISSING: Agent task "${node.title}" is configured to act but declares no required effects.`);
+  }
+  const receipts = Array.isArray(output._effectReceipts) ? output._effectReceipts : [];
+  const observed = new Set(receipts.flatMap((receipt) => receipt && typeof receipt === 'object' && typeof (receipt as { kind?: unknown }).kind === 'string'
+    ? [(receipt as { kind: string }).kind] : []));
+  const missing = required.filter((effect) => !observed.has(effect));
+  if (missing.length) {
+    throw new Error(`ACTION_NOT_ACCOMPLISHED: Agent task "${node.title}" completed without platform receipts for ${missing.join(', ')}. No external success was recorded.`);
+  }
+  if (required.includes('channel_delivery') && required.includes('data_mutation')) {
+    const deliveryIndex = receipts.findIndex((receipt) => receipt && typeof receipt === 'object' && (receipt as { kind?: unknown }).kind === 'channel_delivery');
+    const mutationIndex = receipts.findIndex((receipt) => receipt && typeof receipt === 'object' && (receipt as { kind?: unknown }).kind === 'data_mutation');
+    if (deliveryIndex < 0 || mutationIndex < 0 || mutationIndex < deliveryIndex) {
+      throw new Error(`ACTION_NOT_ACCOMPLISHED: Agent task "${node.title}" must persist provider acknowledgement before mutating lead state.`);
+    }
+  }
+}
+
+/** Preserve action semantics for legacy/user-authored nodes that predate taskMode. */
+function requiredAgentTaskEffects(node: WorkflowNode): Array<'channel_delivery' | 'data_mutation' | 'schedule' | 'subject_update'> {
+  if (node.config.kind !== 'agent_task') return [];
+  const declared = node.config.completionContract?.requiredEffects ?? [];
+  if (declared.length > 0) return [...new Set(declared)];
+  if (node.config.taskMode === 'answer') return [];
+  const text = normalizeActionPrompt(`${node.title}\n${node.config.prompt}`);
+  const effects: Array<'channel_delivery' | 'data_mutation' | 'schedule' | 'subject_update'> = [];
+  if (/\b(?:send|deliver|envie|enviar|manda(?:r)?|entregue|envia(?:r|do)?|envio|enviarle)\b/.test(text)
+    || /\b(?:message|mensagem|mensaje)\s+(?:the\s+)?(?:lead|contact|customer|him|her|cliente|contato)\b/.test(text)) {
+    effects.push('channel_delivery');
+  }
+  if (/\b(?:update|move|mark|change|persist|save|insert|upsert|delete|atualiz|mova|mover|marque|alter|salv)\w*\b/.test(text)) {
+    effects.push('data_mutation');
+  }
+  if (/\b(?:follow[ -]?up|schedule|next action|remind|reconcile|agend|lembre|proxima acao|seguimento)\w*\b/.test(text)) {
+    effects.push('schedule');
+  }
+  if (/\b(?:enroll|update|record|create|cancel|set|inscrev|atualiz|registre|crie|cancele)\w*\b.{0,60}\b(?:subject|relationship|relacionamento|relacion|handoff|opt[ -]?out|suppression)\w*\b/.test(text)) {
+    effects.push('subject_update');
+  }
+  return effects;
+}
+
+function missingAgentEffectToolPaths(required: string[], availableTools: string[]): string[] {
+  const available = new Set(availableTools);
+  const hasAny = (names: string[]) => names.some((name) => available.has(name));
+  return required.filter((effect) => {
+    if (effect === 'channel_delivery') return !hasAny(['agentis.channel.send', 'agentis.channel.action.create']);
+    if (effect === 'data_mutation') return !hasAny(['agentis.data.insert', 'agentis.data.update', 'agentis.data.upsert', 'agentis.data.batch']);
+    if (effect === 'schedule' || effect === 'subject_update') {
+      return !hasAny(['agentis.subject.update_relationship', 'agentis.subject.enroll']);
+    }
+    return true;
+  });
+}
+
+function normalizeActionPrompt(value: string): string {
+  return value.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+}
+
+function containsUnconsumedToolProtocol(value: unknown, depth = 0): boolean {
+  if (depth > 5 || value == null) return false;
+  if (typeof value === 'string') {
+    return /AGENTIS_TOOL_CALL|REQUESTED\s+TOOLS|<tool_call>|<\/tool_call>|tool_calls_begin|tool_calls_end|｜tool[▁_ ]calls/i.test(value);
+  }
+  if (Array.isArray(value)) return value.some((entry) => containsUnconsumedToolProtocol(entry, depth + 1));
+  if (typeof value === 'object') return Object.entries(value as Record<string, unknown>)
+    .some(([key, entry]) => key !== '_effectReceipts' && containsUnconsumedToolProtocol(entry, depth + 1));
+  return false;
+}
+
+function hasVerifiedDataMutation(value: unknown): boolean {
+  if (!value || typeof value !== 'object') return false;
+  if (Array.isArray(value)) return value.some(hasVerifiedDataMutation);
+  const row = value as Record<string, unknown>;
+  const receipt = row.mutationReceipt;
+  if (receipt && typeof receipt === 'object') {
+    const mutation = receipt as Record<string, unknown>;
+    const verification = mutation.verification;
+    if (mutation.failed === 0 && typeof verification === 'object'
+      && (verification as Record<string, unknown>).performed === true
+      && (verification as Record<string, unknown>).passed === true) return true;
+  }
+  return Object.values(row).some((nested) => nested !== value && hasVerifiedDataMutation(nested));
+}
+
+function hasAcknowledgedDelivery(value: unknown): boolean {
+  if (!value || typeof value !== 'object') return false;
+  if (Array.isArray(value)) return value.some(hasAcknowledgedDelivery);
+  const row = value as Record<string, unknown>;
+  if (row.status === 'delivered' && (row.providerReceipt != null || row.providerReceiptJson != null || row.deliveredAt != null)) return true;
+  if (row.sent === true && (row.providerAcknowledged === true || hasAcknowledgedDelivery(row.receipt))) return true;
+  return Object.values(row).some((nested) => nested !== value && hasAcknowledgedDelivery(nested));
+}
+
+function hasScheduledNextAction(value: unknown): boolean {
+  if (!value || typeof value !== 'object') return false;
+  if (Array.isArray(value)) return value.some(hasScheduledNextAction);
+  const row = value as Record<string, unknown>;
+  if (row.nextAction && typeof row.nextAction === 'object' && (row.nextAction as { dueAt?: unknown }).dueAt) return true;
+  return Object.values(row).some((nested) => nested !== value && hasScheduledNextAction(nested));
 }
 
 

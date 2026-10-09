@@ -258,7 +258,7 @@ export class AgentisToolRegistry {
  * also act on providers, browsers, host code, or already-running executions.
  */
 function inferMutationBehavior(toolId: string): NonNullable<AgentisToolDefinition['mutationBehavior']> {
-  if (/^agentis\.(?:channel\.(?:send|typing|react)|integration\.call|mcp\.call)$/.test(toolId)) return 'external';
+  if (/^agentis\.(?:channel\.(?:reply|send|typing|react)|integration\.call|mcp\.call)$/.test(toolId)) return 'external';
   if (/^agentis\.(?:browser\.|media\.generate|code\.execute|run\.(?:start|cancel|replay|regrade))/.test(toolId)) return 'mixed';
   return 'local';
 }

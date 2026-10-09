@@ -75,7 +75,7 @@ describe('<ContextInspector /> agent requirements', () => {
         return json({
           agents: [{
             id: 'agent-offline',
-            name: 'Bia Outreacher',
+            name: 'Ava Outreacher',
             status: 'offline',
             adapterType: 'hermes_agent',
             adapterCapabilities: { affordances: { browser: true, terminal: true } },
@@ -106,7 +106,7 @@ describe('<ContextInspector /> agent requirements', () => {
     );
 
     expect(await screen.findByText('Setup required')).toBeInTheDocument();
-    expect(screen.getByText(/Bia Outreacher has no connected runtime/)).toBeInTheDocument();
+    expect(screen.getByText(/Ava Outreacher has no connected runtime/)).toBeInTheDocument();
     expect(screen.queryByText('Ready to run')).not.toBeInTheDocument();
   });
 });

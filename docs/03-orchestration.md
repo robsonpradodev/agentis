@@ -1,7 +1,10 @@
 # 03 · Self-Healing Orchestration
 
 The workflow engine executes directed graphs of typed nodes, recovers from failures without
-fabricating results, and judges runs against declared outcomes. Source: `apps/api/src/engine/`.
+fabricating results, and judges runs against declared outcomes. Workflows are typed execution
+plans inside the broader [Agent Mission](./08-agent-missions.md) model: the mission owns the
+requested outcome, while a workflow run is one compatible execution mechanism. Source:
+`apps/api/src/engine/`.
 
 ## Execution model
 
@@ -19,12 +22,17 @@ fabricating results, and judges runs against declared outcomes. Source: `apps/ap
 State stores: `RunStateStore.ts`, `ReadyQueue.ts`, `WaitingInputBuffer.ts`,
 `ActiveWorkflowRegistry.ts`. Crash recovery re-hydrates interrupted runs on boot.
 
-## Node kinds (48)
+Action-oriented workflow starts create or reuse a mission and persist its id on
+`workflow_runs.mission_id`. Run lifecycle completion is never authoritative over an unfinished
+mission. The mission's outcome contract and normalized effect receipts decide whether the
+requested work is accomplished, blocked, failed, or still waiting.
+
+## Node kinds (50)
 
 `WorkflowNodeType` (`packages/core/src/types/workflow.ts`):
 
 - **Control flow** — `trigger`, `router`, `merge`, `parallel`, `loop`, `wait`, `subflow`,
-  `checkpoint`, `stop_error`, `error_trigger`, `return_output`.
+  `checkpoint`, `stop_error`, `error_trigger`, `return_output`, `converge`, `pursue`.
 - **Deterministic data & logic (zero LLM tokens)** — `transform`, `filter`, `code`,
   `data_query`, `data_mutate`, `aggregate_window`, `http_request`, `graphql`,
   `workflow_store`, `workspace_store`, `scratchpad`.
@@ -33,8 +41,8 @@ State stores: `RunStateStore.ts`, `ReadyQueue.ts`, `WaitingInputBuffer.ts`,
 - **Knowledge** — `knowledge` (semantic search), `knowledge_ingest`.
 - **Utility** — `datetime`, `crypto_util`, `xml_parse`, `markdown`, `spreadsheet` (csv/xlsx),
   `html_extract`, `json_schema_validate`.
-- **I/O & artifacts** — `browser` (headless render / screenshot / PDF / form-fill),
-  `artifact_collect`, `artifact_save`.
+- **I/O, integrations & artifacts** — `browser` (headless render / screenshot / PDF / form-fill),
+  `channel`, `integration`, `mcp`, `artifact_collect`, `artifact_save`.
 - **Human / annotation** — `human_input`, `sticky_note`.
 
 Executors live in `engine/executors/` and `engine/handlers/` (deterministic/IO controller,
@@ -60,18 +68,36 @@ Every native task session is isolated as
 attempt instead of loading an ACP session from a previous run. The final value must still satisfy
 the node's declared `outputKeys`; runtime lifecycle text is never accepted as output.
 
+Substantive Agent Tasks also use the shared `AgentExecutionController`. The assigned model decides
+whether work is an answer, clarification, action plan, external wait, or verified completion. An
+action plan can contain ordered, parallel, observational, conditional, and verification steps.
+Natural progress prose is streamed immediately but cannot terminate an unresolved plan.
+
 The rule is runtime-agnostic: exactly one layer owns each Agentis platform tool call. Native
 function-calling adapters forward calls into the shared executor; text-only adapters use the marker
 protocol; Claude Code does not also mount the Agentis MCP server when the caller-managed loop is
 active; OpenClaw keeps its gateway-native tools while bridging Agentis calls through markers; and
-Hermes caller-managed tasks use script-oriented one-shot mode with the valid zero-tool
-`context_engine` toolset. Hermes therefore performs one model request while Agentis owns the visible
-platform tool loop; it cannot enter a hidden native-tool loop or contend with a second ACP process.
+Hermes caller-managed tasks use script-oriented turns with the valid zero-tool
+`context_engine` toolset. Agentis owns the visible platform tool loop; Hermes cannot enter a hidden
+native-tool loop or contend with a second ACP process.
 Interactive/direct runtime use keeps its normal native tool behavior.
-The configured `maxTurns` is an enforced workflow boundary. `error`, `max_turns`, `length`, an
+The configured `maxTurns` is a per-run execution budget, not proof that the Mission ended. `error`, `max_turns`, `length`, an
 unfinished `tool_calls` boundary, an absent terminal event, or an empty result pauses the node with
 runtime, stage, elapsed time, attempt, session key, and retry guidance; none can be promoted into a
 successful business result merely because the runtime emitted explanatory prose.
+
+Every Agent Task can declare `taskMode: "answer" | "act"`. An `act` task must also declare
+`completionContract.requiredEffects`. Preflight flags action-like legacy tasks without an
+explicit contract. A task requiring channel delivery, data mutation, scheduling, or Subject
+updates cannot complete from empty output, prose, or tool syntax; the shared effect ledger must
+contain the required receipts. Multi-node workflows use native channel nodes for delivery and
+gate downstream mutations on provider acknowledgement. Minimal one-Agent plans use the same
+native services and evidence contract internally.
+
+Each requirement has a stable id and each plan step has a lifecycle state. Two ordered channel
+items therefore create two commitments and two receipts. A retry resumes only missing steps;
+provider-acknowledged effects are never replayed. Schema repair and receipt reconciliation are
+deterministic and do not spend model turns.
 
 For Hermes `agent_task` calls with `chatTransport: auto`, the capability-preserving caller-managed
 path goes directly to Hermes's model-only one-shot CLI. This is the same fast execution shape used by
@@ -143,7 +169,8 @@ normalization that infers missing fields.
 ## API surface
 
 - HTTP: `/v1/workflows`, `/v1/runs` (status, stream, activity, ledger, scratchpad,
-  blackboard, replay), `/v1/triggers`, `/v1/listeners`, `/v1/scheduler`, `/v1/ephemeral`.
+  blackboard, replay), `/v1/missions`, `/v1/triggers`, `/v1/listeners`, `/v1/scheduler`,
+  `/v1/ephemeral`.
 - Tools: `agentis.build_workflow`, `agentis.workflow.{create,validate,dry_run,scope,test,harden,restore_blueprint,bless,deliver}`,
   `agentis.run.{await,status,diagnose,cancel,replay,inspect}`, `agentis.plan_workflow`.
 

@@ -13,6 +13,7 @@
  * skills; the whole procedure loads only when the agent commits to applying it.
  */
 
+import { createHash } from 'node:crypto';
 import { AgentisError, type AgentisToolContext, type KnowledgeAtomKind } from '@agentis/core';
 import { and, eq } from 'drizzle-orm';
 import { schema } from '@agentis/db/sqlite';
@@ -66,6 +67,9 @@ function inspectAgentBrain(deps: ToolHandlerDeps, ctx: AgentisToolContext, agent
   const memories = deps.memory?.list({ workspaceId: ctx.workspaceId, scopeId: agentId, limit: 500 }) ?? [];
   const skills = deps.skills?.listForScopes(ctx.workspaceId, [agentId]) ?? [];
   const examples = (deps.skills?.listExamples(ctx.workspaceId) ?? []).filter((item) => item.scopeId === agentId);
+  const categorizedIds = new Set([...memories, ...skills, ...examples].map((item) => item.id));
+  const episodes = (deps.episodes?.list({ workspaceId: ctx.workspaceId, scopeId: agentId, limit: 500 }) ?? [])
+    .filter((item) => !categorizedIds.has(item.id));
   const knowledgeBases = deps.knowledgeBases?.listKnowledgeBases(ctx.workspaceId, { scopeId: agentId }) ?? [];
   const knowledge = knowledgeBases.flatMap((base) =>
     (deps.knowledgeBases?.listDocuments(ctx.workspaceId, base.id) ?? []).map((doc) => ({
@@ -76,12 +80,110 @@ function inspectAgentBrain(deps: ToolHandlerDeps, ctx: AgentisToolContext, agent
     })));
   return {
     agentId,
-    counts: { memories: memories.length, knowledge: knowledge.length, skills: skills.length, examples: examples.length },
-    memories: memories.map((item) => ({ id: item.id, title: item.title, kind: item.kind })),
+    counts: {
+      memories: memories.length,
+      knowledge: knowledge.length,
+      skills: skills.length,
+      examples: examples.length,
+      episodes: episodes.length,
+    },
+    memories: memories.map((item) => ({ id: item.id, title: item.title, kind: item.kind, preview: snippet(item.content, 500) })),
     knowledge,
-    skills: skills.map((item) => ({ id: item.id, slug: item.slug, name: item.name, confidence: item.confidence })),
-    examples: examples.map((item) => ({ id: item.id, title: item.title })),
+    skills: skills.map((item) => ({
+      id: item.id,
+      slug: item.slug,
+      name: item.name,
+      confidence: item.confidence,
+      description: snippet(item.description, 500),
+    })),
+    examples: examples.map((item) => ({ id: item.id, title: item.title, preview: snippet(item.content, 500) })),
+    episodes: episodes.map((item) => ({
+      id: item.id,
+      title: item.title,
+      type: item.type,
+      source: item.source,
+      preview: snippet(`${item.summary}\n${item.details ?? ''}`, 500),
+    })),
   };
+}
+
+type BrainInventory = ReturnType<typeof inspectAgentBrain>;
+type BrainKeepSelection = {
+  memoryIds: string[];
+  knowledgeIds: string[];
+  skillIds: string[];
+  exampleIds: string[];
+  episodeIds: string[];
+};
+
+function stringArray(value: unknown, name: string): string[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.some((item) => typeof item !== 'string' || !item.trim())) {
+    throw new AgentisError('VALIDATION_FAILED', `'${name}' must be an array of non-empty ids`);
+  }
+  return [...new Set(value.map((item) => String(item).trim()))].sort();
+}
+
+function brainKeepSelection(value: unknown): BrainKeepSelection {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new AgentisError('VALIDATION_FAILED', "'keep' must identify the exact Brain atom ids to preserve");
+  }
+  const keep = value as Record<string, unknown>;
+  return {
+    memoryIds: stringArray(keep.memoryIds, 'keep.memoryIds'),
+    knowledgeIds: stringArray(keep.knowledgeIds, 'keep.knowledgeIds'),
+    skillIds: stringArray(keep.skillIds, 'keep.skillIds'),
+    exampleIds: stringArray(keep.exampleIds, 'keep.exampleIds'),
+    episodeIds: stringArray(keep.episodeIds, 'keep.episodeIds'),
+  };
+}
+
+function validateBrainKeepSelection(inventory: BrainInventory, keep: BrainKeepSelection): void {
+  const groups: Array<[keyof BrainKeepSelection, Array<{ id: string }>]> = [
+    ['memoryIds', inventory.memories],
+    ['knowledgeIds', inventory.knowledge],
+    ['skillIds', inventory.skills],
+    ['exampleIds', inventory.examples],
+    ['episodeIds', inventory.episodes],
+  ];
+  for (const [key, records] of groups) {
+    const available = new Set(records.map((item) => item.id));
+    const unknown = keep[key].filter((id) => !available.has(id));
+    if (unknown.length > 0) {
+      throw new AgentisError(
+        'VALIDATION_FAILED',
+        `${key} contains ids that are not active in this agent Brain: ${unknown.join(', ')}. Inspect again and use exact ids.`,
+      );
+    }
+  }
+}
+
+function brainPrunePlan(inventory: BrainInventory, keep: BrainKeepSelection) {
+  const memoryIds = new Set(keep.memoryIds);
+  const knowledgeIds = new Set(keep.knowledgeIds);
+  const skillIds = new Set(keep.skillIds);
+  const exampleIds = new Set(keep.exampleIds);
+  const episodeIds = new Set(keep.episodeIds);
+  return {
+    memories: inventory.memories.filter((item) => !memoryIds.has(item.id)),
+    knowledge: inventory.knowledge.filter((item) => !knowledgeIds.has(item.id)),
+    skills: inventory.skills.filter((item) => !skillIds.has(item.id)),
+    examples: inventory.examples.filter((item) => !exampleIds.has(item.id)),
+    episodes: inventory.episodes.filter((item) => !episodeIds.has(item.id)),
+  };
+}
+
+function brainPruneToken(agentId: string, keep: BrainKeepSelection, plan: ReturnType<typeof brainPrunePlan>): string {
+  const candidates = {
+    memories: plan.memories.map((item) => item.id).sort(),
+    knowledge: plan.knowledge.map((item) => item.id).sort(),
+    skills: plan.skills.map((item) => item.id).sort(),
+    examples: plan.examples.map((item) => item.id).sort(),
+    episodes: plan.episodes.map((item) => item.id).sort(),
+  };
+  return createHash('sha256')
+    .update(JSON.stringify({ operation: 'agent-brain-prune-v1', agentId, keep, candidates }))
+    .digest('hex');
 }
 
 export function registerBrainTools(registry: AgentisToolRegistry, deps: ToolHandlerDeps): void {
@@ -91,7 +193,7 @@ export function registerBrainTools(registry: AgentisToolRegistry, deps: ToolHand
         id: 'agentis.agent.brain.inspect',
         family: 'inspect',
         mcpExposed: true,
-        description: 'Inspect one specialist private Brain across Memory, Knowledge, Skills, and Examples. Use after configuring a specialist; do not claim completion until the requested content is visible here.',
+        description: 'Inspect one specialist private Brain across Memory, Knowledge, Skills, and Examples, including ids and safe content previews. Use after configuring a specialist and before selective cleanup with agentis.agent.brain.prune; do not claim completion until the requested state is visible here.',
         inputSchema: {
           type: 'object',
           properties: { agentId: { type: 'string' } },
@@ -100,6 +202,109 @@ export function registerBrainTools(registry: AgentisToolRegistry, deps: ToolHand
         mutating: false,
       },
       handler: (args, ctx) => inspectAgentBrain(deps, ctx, requireAgent(deps, ctx.workspaceId, args.agentId)),
+    },
+    {
+      definition: {
+        id: 'agentis.agent.brain.prune',
+        family: 'build',
+        mcpExposed: true,
+        description:
+          'Safely reset a target specialist private Brain without deleting the Agent or its Connections. Preserve exact atom ids in keep and archive every other private Memory, runtime Episode, Knowledge document, Skill, and Example. Call once without confirmationToken to receive a complete preview and token; then call again with that unchanged token to apply. Archived content is excluded from recall but remains recoverable. If the Brain changes, the token is rejected and a fresh preview is required.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            agentId: { type: 'string' },
+            keep: {
+              type: 'object',
+              properties: {
+                memoryIds: { type: 'array', items: { type: 'string' } },
+                knowledgeIds: { type: 'array', items: { type: 'string' } },
+                skillIds: { type: 'array', items: { type: 'string' } },
+                exampleIds: { type: 'array', items: { type: 'string' } },
+                episodeIds: { type: 'array', items: { type: 'string' } },
+              },
+            },
+            confirmationToken: {
+              type: 'string',
+              description: 'Exact token returned by the immediately preceding preview for the same keep selection.',
+            },
+          },
+          required: ['agentId', 'keep'],
+        },
+        mutating: true,
+        mutationBehavior: 'local',
+        approval: { riskLevel: 'medium', reversible: true, externalSideEffects: false },
+        autoExecute: true,
+      },
+      handler: (args, ctx) => {
+        const agentId = requireAgent(deps, ctx.workspaceId, args.agentId);
+        if (!deps.sharedIntelligence || !deps.knowledgeBases) {
+          throw new AgentisError('VALIDATION_FAILED', 'Brain archive services are not available');
+        }
+        const keep = brainKeepSelection(args.keep);
+        const before = inspectAgentBrain(deps, ctx, agentId);
+        validateBrainKeepSelection(before, keep);
+        const plan = brainPrunePlan(before, keep);
+        const confirmationToken = brainPruneToken(agentId, keep, plan);
+        const counts = {
+          memories: plan.memories.length,
+          knowledge: plan.knowledge.length,
+          skills: plan.skills.length,
+          examples: plan.examples.length,
+          episodes: plan.episodes.length,
+        };
+
+        if (args.confirmationToken === undefined) {
+          return {
+            applied: false,
+            agentId,
+            keep,
+            archive: plan,
+            counts,
+            confirmationToken,
+            nextAction: 'Review archive candidates, then call this tool again with the same keep selection and confirmationToken.',
+          };
+        }
+        if (typeof args.confirmationToken !== 'string' || args.confirmationToken !== confirmationToken) {
+          throw new AgentisError(
+            'VALIDATION_FAILED',
+            'The Brain changed or the confirmation token does not match this exact prune plan. Inspect and preview again; nothing was archived.',
+          );
+        }
+        if (plan.episodes.length > 0 && !deps.episodes) {
+          throw new AgentisError('VALIDATION_FAILED', 'Runtime episode archive service is not available; nothing was archived');
+        }
+
+        const archived = {
+          memories: [] as string[], knowledge: [] as string[], skills: [] as string[],
+          examples: [] as string[], episodes: [] as string[],
+        };
+        for (const item of plan.examples) {
+          if (deps.sharedIntelligence.archiveAtom(ctx.workspaceId, 'example', item.id, { scopeId: agentId })) archived.examples.push(item.id);
+        }
+        for (const item of plan.skills) {
+          if (deps.sharedIntelligence.archiveAtom(ctx.workspaceId, 'skill', item.id, { scopeId: agentId })) archived.skills.push(item.id);
+        }
+        for (const item of plan.memories) {
+          if (deps.sharedIntelligence.archiveAtom(ctx.workspaceId, 'memory', item.id, { scopeId: agentId })) archived.memories.push(item.id);
+        }
+        for (const item of plan.episodes) {
+          if (deps.episodes?.archive(ctx.workspaceId, item.id)) archived.episodes.push(item.id);
+        }
+        for (const item of plan.knowledge) {
+          deps.knowledgeBases.archiveDocument(ctx.workspaceId, item.knowledgeBaseId, item.id);
+          archived.knowledge.push(item.id);
+        }
+        const materialized = deps.skillMaterializer?.materializeForAgent(ctx.workspaceId, agentId).materialized.length ?? null;
+        const verification = inspectAgentBrain(deps, ctx, agentId);
+        return {
+          applied: true,
+          agentId,
+          archived,
+          materializedSkills: materialized,
+          verification,
+        };
+      },
     },
     {
       definition: {

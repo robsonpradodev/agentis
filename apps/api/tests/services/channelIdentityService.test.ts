@@ -153,11 +153,11 @@ describe('ChannelIdentityService', () => {
     seedConnection(ctx, 'wa-aliases', 'whatsapp');
     const pn = svc.record({
       workspaceId: ctx.workspace.id, connectionId: 'wa-aliases', channelKind: 'whatsapp',
-      handle: '553171443148@s.whatsapp.net', displayName: 'Robson',
+      handle: '15559876543@s.whatsapp.net', displayName: 'Jordan',
     });
     const lid = svc.record({
       workspaceId: ctx.workspace.id, connectionId: 'wa-aliases', channelKind: 'whatsapp',
-      handle: '18919191919@lid', displayName: 'Robson',
+      handle: '18919191919@lid', displayName: 'Jordan',
     });
     expect(pn.id).not.toBe(lid.id);
 
@@ -165,9 +165,9 @@ describe('ChannelIdentityService', () => {
       workspaceId: ctx.workspace.id,
       connectionId: 'wa-aliases',
       channelKind: 'whatsapp',
-      primaryHandle: '553171443148@s.whatsapp.net',
+      primaryHandle: '15559876543@s.whatsapp.net',
       aliases: ['18919191919@lid', '+55 31 7144-3148'],
-      displayName: 'Robson',
+      displayName: 'Jordan',
       source: 'baileys_lid_mapping',
       verified: true,
       countMessage: false,
@@ -177,7 +177,7 @@ describe('ChannelIdentityService', () => {
     expect(svc.resolve(ctx.workspace.id, 'whatsapp', '+55 31 7144-3148', 'wa-aliases')?.id).toBe(canonical.id);
     expect(svc.list(ctx.workspace.id).filter((identity) => identity.connectionId === 'wa-aliases')).toHaveLength(1);
     expect(svc.aliases(canonical.id).map((alias) => alias.value)).toEqual(expect.arrayContaining([
-      '553171443148@s.whatsapp.net', '18919191919@lid', '+55 31 7144-3148',
+      '15559876543@s.whatsapp.net', '18919191919@lid', '+55 31 7144-3148',
     ]));
   });
 
@@ -189,14 +189,14 @@ describe('ChannelIdentityService', () => {
       channelKind: 'whatsapp',
       handle: '+55 31 7144-3148',
       userId: ctx.user.id,
-      displayName: 'Robson',
+      displayName: 'Jordan',
     });
     expect(owner).toMatchObject({ authorityRole: 'owner', messageCount: 0, userId: ctx.user.id });
     svc.observeAliases({
       workspaceId: ctx.workspace.id,
       connectionId: 'wa-owner-sync',
       channelKind: 'whatsapp',
-      primaryHandle: '553171443148@s.whatsapp.net',
+      primaryHandle: '15559876543@s.whatsapp.net',
       aliases: ['18919191919@lid', '+55 31 7144-3148'],
       source: 'provider',
       verified: true,

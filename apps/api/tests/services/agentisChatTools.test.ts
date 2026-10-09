@@ -18,6 +18,7 @@ import { ConversationStore } from '../../src/services/conversation/conversationS
 import { ApprovalInboxService } from '../../src/services/approvalInbox.js';
 import { WorkflowRevisionService } from '../../src/services/workflow/workflowRevisionService.js';
 import { bindWorkflowRevisionApproval } from '../../src/services/workflow/workflowRevisionApproval.js';
+import { ArtifactService } from '../../src/services/artifactService.js';
 import type { ChannelAdapter, ParsedInboundMessage } from '../../src/adapters/channels/types.js';
 import { createTestContext, type TestContext } from '../_helpers/createTestContext.js';
 
@@ -522,6 +523,182 @@ describe('agent-facing native channel tools', () => {
       targetSource: 'explicit',
     }));
     expect(sent).toEqual([{ connectionId: connection.id, chatId: '5511999999999@s.whatsapp.net', body: 'hello wa' }]);
+  });
+
+  it('sends files and native contacts through a typed reply to the current WhatsApp conversation', async () => {
+    const conversations = new ConversationStore({ db: ctx.db, bus: ctx.bus });
+    const bridge = new ChannelBridge({
+      db: ctx.db,
+      vault: ctx.vault,
+      conversations,
+      bus: ctx.bus,
+      logger: ctx.logger,
+      artifacts: new ArtifactService(ctx.db, ctx.logger, ctx.bus),
+    });
+    const delivered: Array<{
+      connectionId: string;
+      chatId: string;
+      body: string;
+      attachments?: Array<{ kind: string; filename: string; mimeType: string; data: Buffer }>;
+      native?: { kind: string; displayName?: string; phone?: string };
+      quotedMessageId?: string;
+    }> = [];
+    const readReceipts: string[] = [];
+    bridge.setPersistentTransport({
+      handles: (connection) => connection.kind === 'whatsapp',
+      requiresNoToken: (kind) => kind === 'whatsapp',
+      status: () => ({ status: 'open' }),
+      send: async (connectionId, chatId, body, attachments, _humanize, native, authority) => {
+        delivered.push({
+          connectionId,
+          chatId,
+          body,
+          attachments,
+          native,
+          quotedMessageId: authority?.quotedMessage?.providerMessageId,
+        });
+        return {
+          provider: 'whatsapp' as const,
+          providerMessageId: `wamid-${delivered.length}`,
+          status: 'accepted' as const,
+          acceptedAt: new Date().toISOString(),
+          recipient: chatId,
+          providerAcknowledged: true,
+        };
+      },
+      markRead: async (_connectionId, _chatId, messageId) => { readReceipts.push(messageId); },
+    });
+    const agentId = seedAgent();
+    const { connection } = bridge.create({
+      workspaceId: ctx.workspace.id,
+      ambientId: null,
+      userId: ctx.user.id,
+      agentId,
+      kind: 'whatsapp',
+      name: 'WhatsApp rich reply',
+    });
+    ctx.db.update(schema.channelConnections).set({ status: 'active' }).run();
+    const conversation = conversations.getOrCreateByChannel({
+      workspaceId: ctx.workspace.id,
+      ambientId: ctx.ambient.id,
+      userId: ctx.user.id,
+      agentId,
+      channelConnectionId: connection.id,
+      channelChatId: '5511999999999@s.whatsapp.net',
+    });
+    const inbound = conversations.appendMirrored({
+      workspaceId: ctx.workspace.id,
+      conversationId: conversation.id,
+      sessionMessageId: 'whatsapp:provider-inbound-1',
+      authorType: 'system',
+      participantSide: 'customer',
+      body: 'Can you send me the document?',
+      metadata: { channelInbound: true },
+    });
+
+    const registry = new AgentisToolRegistry({ logger: ctx.logger });
+    const toolDeps = deps();
+    toolDeps.channels = bridge;
+    registerChannelTools(registry, toolDeps);
+    const origin = {
+      kind: 'whatsapp',
+      connectionId: connection.id,
+      chatId: '5511999999999@s.whatsapp.net',
+      conversationId: conversation.id,
+      inboundMessageId: inbound.id,
+      durableTurnId: 'turn-rich',
+      ownerVerified: true,
+    };
+    const richContext = {
+      ...toolContext(agentId),
+      conversationId: origin.conversationId,
+      durableTurnId: origin.durableTurnId,
+      channelOrigin: origin,
+      executionMode: 'chat' as const,
+    };
+
+    const file = await registry.execute({
+      toolId: 'agentis.channel.reply',
+      arguments: {
+        body: 'Requested file',
+        attachments: [{
+          url: 'data:text/plain;base64,aGVsbG8=',
+          kind: 'file',
+          filename: 'hello.txt',
+          mimeType: 'text/plain',
+        }],
+      },
+    }, richContext);
+    const contact = await registry.execute({
+      toolId: 'agentis.channel.reply',
+      arguments: { native: { kind: 'contact', displayName: 'Jordan Lee', phone: '+15557654321' } },
+    }, { ...richContext, durableTurnId: 'turn-contact' });
+    const markedRead = await registry.execute({
+      toolId: 'agentis.channel.read',
+      arguments: {},
+    }, richContext);
+    const quoted = await registry.execute({
+      toolId: 'agentis.channel.reply',
+      arguments: {
+        body: 'Here is the document you requested.',
+        quotedMessage: { messageId: inbound.id },
+      },
+    }, { ...richContext, durableTurnId: 'turn-quoted' });
+
+    expect(file.ok).toBe(true);
+    expect(file.output).toEqual(expect.objectContaining({ sent: true, verified: true, to: origin.chatId, deliveryRole: 'final' }));
+    expect(contact.ok).toBe(true);
+    expect(contact.output).toEqual(expect.objectContaining({ sent: true, verified: true, to: origin.chatId, deliveryRole: 'final' }));
+    expect(markedRead.ok).toBe(true);
+    expect(readReceipts).toEqual(['provider-inbound-1']);
+    expect(quoted.ok).toBe(true);
+    expect(delivered[0]).toMatchObject({
+      connectionId: connection.id,
+      chatId: origin.chatId,
+      body: 'Requested file',
+      attachments: [{ kind: 'file', filename: 'hello.txt', mimeType: 'text/plain' }],
+    });
+    expect(delivered[0]?.attachments?.[0]?.data.toString('utf8')).toBe('hello');
+    expect(delivered[1]).toMatchObject({
+      connectionId: connection.id,
+      chatId: origin.chatId,
+      body: '',
+      native: { kind: 'contact', displayName: 'Jordan Lee', phone: '+15557654321' },
+    });
+    expect(delivered[2]).toMatchObject({
+      body: 'Here is the document you requested.',
+      quotedMessageId: 'provider-inbound-1',
+    });
+  });
+
+  it('does not expose Cloud templates on a WhatsApp QR connection', async () => {
+    const bridge = new ChannelBridge({
+      db: ctx.db,
+      vault: ctx.vault,
+      conversations: new ConversationStore({ db: ctx.db, bus: ctx.bus }),
+      bus: ctx.bus,
+      logger: ctx.logger,
+    });
+    bridge.setPersistentTransport(stubPersistentTransport([]));
+    const { connection } = bridge.create({
+      workspaceId: ctx.workspace.id,
+      ambientId: null,
+      userId: ctx.user.id,
+      kind: 'whatsapp',
+      name: 'WhatsApp QR templates guard',
+    });
+    const registry = new AgentisToolRegistry({ logger: ctx.logger });
+    const toolDeps = deps();
+    toolDeps.channels = bridge;
+    registerChannelTools(registry, toolDeps);
+
+    const result = await registry.execute({
+      toolId: 'agentis.channel.templates',
+      arguments: { connectionId: connection.id },
+    }, toolContext());
+
+    expect(result.ok).toBe(false);
+    expect(result.errorMessage).toContain('does not support templates');
   });
 });
 

@@ -3671,6 +3671,401 @@ CREATE INDEX IF NOT EXISTS idx_channel_action_requester
   ON channel_action_intents(workspace_id, requester_identity_id, status, created_at);
 `,
   },
+  {
+    version: 139,
+    name: 'agent_standing_goals_and_resumable_channel_targets',
+    sql: `
+CREATE TABLE IF NOT EXISTS agent_standing_goals (
+  id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  title TEXT NOT NULL,
+  objective TEXT NOT NULL,
+  source_instructions TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'draft',
+  version INTEGER NOT NULL DEFAULT 1,
+  policy_json TEXT NOT NULL DEFAULT '{}',
+  activated_at TEXT,
+  paused_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_agent_standing_goals_agent
+  ON agent_standing_goals(workspace_id, agent_id, status, updated_at);
+
+ALTER TABLE channel_action_intents RENAME TO channel_action_intents_v138;
+CREATE TABLE channel_action_intents (
+  id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  app_id TEXT REFERENCES apps(id) ON DELETE SET NULL,
+  agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
+  requester_identity_id TEXT REFERENCES channel_peer_identities(id) ON DELETE SET NULL,
+  connection_id TEXT NOT NULL REFERENCES channel_connections(id) ON DELETE CASCADE,
+  peer_identity_id TEXT REFERENCES channel_peer_identities(id) ON DELETE SET NULL,
+  recipient_query TEXT,
+  required_slots_json TEXT NOT NULL DEFAULT '[]',
+  conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
+  subject_id TEXT REFERENCES durable_entities(id) ON DELETE SET NULL,
+  goal_ref TEXT,
+  goal TEXT NOT NULL,
+  body TEXT NOT NULL DEFAULT '',
+  messages_json TEXT NOT NULL DEFAULT '[]',
+  authorization_basis TEXT NOT NULL,
+  risk_category TEXT NOT NULL DEFAULT 'ordinary',
+  status TEXT NOT NULL DEFAULT 'planned',
+  approval_id TEXT REFERENCES approval_requests(id) ON DELETE SET NULL,
+  idempotency_key TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  scheduled_for TEXT,
+  provider_receipt_json TEXT,
+  effect_receipts_json TEXT NOT NULL DEFAULT '[]',
+  last_error TEXT,
+  authorized_at TEXT,
+  executed_at TEXT,
+  delivered_at TEXT,
+  cancelled_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+INSERT INTO channel_action_intents (
+  id, workspace_id, app_id, agent_id, requester_identity_id, connection_id, peer_identity_id,
+  conversation_id, subject_id, goal_ref, goal, body, messages_json, authorization_basis,
+  risk_category, status, approval_id, idempotency_key, attempts, scheduled_for,
+  provider_receipt_json, last_error, authorized_at, executed_at, delivered_at, cancelled_at,
+  created_at, updated_at
+)
+SELECT id, workspace_id, app_id, agent_id, requester_identity_id, connection_id, peer_identity_id,
+  conversation_id, subject_id, goal_ref, goal, body, messages_json, authorization_basis,
+  risk_category, status, approval_id, idempotency_key, attempts, scheduled_for,
+  provider_receipt_json, last_error, authorized_at, executed_at, delivered_at, cancelled_at,
+  created_at, updated_at
+FROM channel_action_intents_v138;
+DROP TABLE channel_action_intents_v138;
+CREATE UNIQUE INDEX uq_channel_action_idempotency ON channel_action_intents(workspace_id, idempotency_key);
+CREATE INDEX idx_channel_action_due ON channel_action_intents(status, scheduled_for);
+CREATE INDEX idx_channel_action_peer ON channel_action_intents(workspace_id, peer_identity_id, created_at);
+CREATE INDEX idx_channel_action_requester ON channel_action_intents(workspace_id, requester_identity_id, status, created_at);
+`,
+  },
+  {
+    version: 140,
+    name: 'durable_agent_missions_and_effect_ledger',
+    sql: `
+CREATE TABLE IF NOT EXISTS agent_missions (
+  id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  owner_agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  app_id TEXT REFERENCES apps(id) ON DELETE SET NULL,
+  subject_id TEXT REFERENCES durable_entities(id) ON DELETE SET NULL,
+  standing_goal_id TEXT REFERENCES agent_standing_goals(id) ON DELETE SET NULL,
+  source_kind TEXT NOT NULL,
+  source_ref TEXT,
+  correlation_key TEXT NOT NULL,
+  objective TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'queued',
+  outcome_contract_json TEXT NOT NULL DEFAULT '{"requiredEffects":[]}',
+  execution_plan_json TEXT,
+  plan_version INTEGER NOT NULL DEFAULT 1,
+  current_step_id TEXT,
+  blocker_json TEXT,
+  next_wake_at TEXT,
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  max_attempts INTEGER NOT NULL DEFAULT 12,
+  token_budget INTEGER,
+  tokens_used INTEGER NOT NULL DEFAULT 0,
+  last_progress TEXT,
+  started_at TEXT,
+  settled_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_mission_correlation
+  ON agent_missions(workspace_id, correlation_key);
+CREATE INDEX IF NOT EXISTS idx_agent_missions_owner
+  ON agent_missions(workspace_id, owner_agent_id, status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_agent_missions_due
+  ON agent_missions(status, next_wake_at);
+CREATE INDEX IF NOT EXISTS idx_agent_missions_subject
+  ON agent_missions(workspace_id, subject_id, updated_at);
+
+CREATE TABLE IF NOT EXISTS effect_receipts (
+  id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  mission_id TEXT NOT NULL REFERENCES agent_missions(id) ON DELETE CASCADE,
+  effect_intent_id TEXT,
+  kind TEXT NOT NULL,
+  action_id TEXT,
+  tool_call_id TEXT,
+  provider_message_id TEXT,
+  provider_status TEXT,
+  acknowledged INTEGER NOT NULL DEFAULT 0,
+  resource_type TEXT,
+  resource_id TEXT,
+  resource_version INTEGER,
+  idempotency_key TEXT,
+  evidence_json TEXT NOT NULL DEFAULT '{}',
+  observed_at TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_effect_receipt_proof
+  ON effect_receipts(workspace_id, mission_id, kind, idempotency_key);
+CREATE INDEX IF NOT EXISTS idx_effect_receipts_mission
+  ON effect_receipts(workspace_id, mission_id, observed_at);
+CREATE INDEX IF NOT EXISTS idx_effect_receipts_provider
+  ON effect_receipts(workspace_id, provider_message_id);
+
+ALTER TABLE workflow_runs ADD COLUMN mission_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_workflow_runs_mission
+  ON workflow_runs(workspace_id, mission_id, created_at);
+ALTER TABLE channel_action_intents ADD COLUMN mission_id TEXT;
+ALTER TABLE channel_action_intents ADD COLUMN post_ack_mutations_json TEXT NOT NULL DEFAULT '[]';
+CREATE INDEX IF NOT EXISTS idx_channel_action_mission
+  ON channel_action_intents(workspace_id, mission_id, created_at);
+`,
+  },
+  {
+    version: 141,
+    name: 'repair_partial_agent_mission_effect_columns',
+    sql: `
+-- Migration 140 shipped while some databases already had one of these
+-- columns. Older migration runners stopped at the first duplicate column but
+-- could still leave the migration recorded, so repeat every additive step.
+-- The current runner treats an existing ADD COLUMN target as idempotent and
+-- continues to the statements that were previously skipped.
+ALTER TABLE workflow_runs ADD COLUMN mission_id TEXT;
+ALTER TABLE channel_action_intents ADD COLUMN mission_id TEXT;
+ALTER TABLE channel_action_intents ADD COLUMN post_ack_mutations_json TEXT NOT NULL DEFAULT '[]';
+CREATE INDEX IF NOT EXISTS idx_workflow_runs_mission
+  ON workflow_runs(workspace_id, mission_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_channel_action_mission
+  ON channel_action_intents(workspace_id, mission_id, created_at);
+`,
+  },
+  {
+    version: 142,
+    name: 'agent_execution_requirement_receipts',
+    sql: `
+ALTER TABLE effect_receipts ADD COLUMN requirement_id TEXT;
+ALTER TABLE effect_receipts ADD COLUMN plan_step_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_effect_receipts_requirement
+  ON effect_receipts(workspace_id, mission_id, requirement_id);
+`,
+  },
+  {
+    version: 143,
+    name: 'remove_legacy_two_turn_mission_budget',
+    sql: `
+-- Early Mission builds used two runtime turns as an implicit completion rule.
+-- Preserve explicit larger budgets and lift only that legacy default. Mission
+-- completion remains receipt-gated; this value is a configurable safety budget.
+UPDATE agent_missions SET max_attempts = 12 WHERE max_attempts = 2;
+`,
+  },
+  {
+    version: 144,
+    name: 'agentic_apps_v3_tasks_effects_and_definitions',
+    sql: `
+ALTER TABLE agent_missions ADD COLUMN operation_id TEXT;
+ALTER TABLE agent_missions ADD COLUMN root_mission_id TEXT;
+ALTER TABLE agent_missions ADD COLUMN parent_mission_id TEXT;
+ALTER TABLE agent_missions ADD COLUMN delegation_id TEXT;
+ALTER TABLE agent_missions ADD COLUMN authority_context_json TEXT;
+ALTER TABLE agent_missions ADD COLUMN input_requests_json TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE agent_missions ADD COLUMN approval_requests_json TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE agent_missions ADD COLUMN artifacts_json TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE agent_missions ADD COLUMN cost_budget_cents INTEGER;
+ALTER TABLE agent_missions ADD COLUMN cost_used_cents INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE agent_missions ADD COLUMN latency_budget_ms INTEGER;
+ALTER TABLE agent_missions ADD COLUMN deadline_at TEXT;
+CREATE INDEX IF NOT EXISTS idx_agent_missions_parent
+  ON agent_missions(workspace_id, parent_mission_id, updated_at);
+
+CREATE TABLE IF NOT EXISTS mission_events (
+  id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  mission_id TEXT NOT NULL REFERENCES agent_missions(id) ON DELETE CASCADE,
+  event_type TEXT NOT NULL,
+  actor_principal_id TEXT,
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_mission_events_mission
+  ON mission_events(workspace_id, mission_id, created_at);
+
+CREATE TABLE IF NOT EXISTS effect_plans (
+  id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  mission_id TEXT REFERENCES agent_missions(id) ON DELETE CASCADE,
+  app_id TEXT REFERENCES apps(id) ON DELETE SET NULL,
+  operation_id TEXT NOT NULL,
+  plan_hash TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'prepared',
+  input_json TEXT NOT NULL DEFAULT '{}',
+  targets_json TEXT NOT NULL DEFAULT '[]',
+  consequences_json TEXT NOT NULL DEFAULT '[]',
+  reversibility TEXT NOT NULL DEFAULT 'reversible',
+  compensation_operation_id TEXT,
+  estimated_cost_min_cents INTEGER,
+  estimated_cost_max_cents INTEGER,
+  estimated_latency_ms INTEGER,
+  idempotency_key TEXT NOT NULL,
+  authority_context_json TEXT NOT NULL,
+  authorization_grant_id TEXT,
+  result_json TEXT,
+  last_error TEXT,
+  expires_at TEXT,
+  authorized_at TEXT,
+  executed_at TEXT,
+  reconciled_at TEXT,
+  compensated_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_effect_plan_idempotency
+  ON effect_plans(workspace_id, operation_id, idempotency_key);
+CREATE INDEX IF NOT EXISTS idx_effect_plans_mission
+  ON effect_plans(workspace_id, mission_id, created_at);
+
+CREATE TABLE IF NOT EXISTS effect_authorization_grants (
+  id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  effect_plan_id TEXT NOT NULL REFERENCES effect_plans(id) ON DELETE CASCADE,
+  plan_hash TEXT NOT NULL,
+  authority_context_json TEXT NOT NULL,
+  scopes_json TEXT NOT NULL DEFAULT '[]',
+  max_effect_level TEXT NOT NULL DEFAULT 'read',
+  max_spend_cents INTEGER,
+  approved_by TEXT NOT NULL,
+  expires_at TEXT,
+  revoked_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_effect_authorizations_plan
+  ON effect_authorization_grants(workspace_id, effect_plan_id, created_at);
+
+CREATE TABLE IF NOT EXISTS app_definitions (
+  app_id TEXT PRIMARY KEY REFERENCES apps(id) ON DELETE CASCADE,
+  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  revision INTEGER NOT NULL DEFAULT 1,
+  contract_json TEXT NOT NULL DEFAULT '{"operations":[],"resources":[],"events":[]}',
+  frontend_json TEXT,
+  components_json TEXT,
+  storage_json TEXT,
+  orchestration_json TEXT,
+  brain_policy_json TEXT,
+  permissions_json TEXT,
+  quality_json TEXT,
+  artifacts_json TEXT,
+  projections_json TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_app_definitions_workspace
+  ON app_definitions(workspace_id, updated_at);
+`,
+  },
+  {
+    version: 145,
+    name: 'managed_agentic_app_git_projects',
+    sql: `
+CREATE TABLE IF NOT EXISTS app_projects (
+  app_id TEXT PRIMARY KEY REFERENCES apps(id) ON DELETE CASCADE,
+  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  repo_path TEXT NOT NULL,
+  default_branch TEXT NOT NULL DEFAULT 'main',
+  head_commit TEXT,
+  framework TEXT NOT NULL DEFAULT 'react',
+  package_manager TEXT NOT NULL DEFAULT 'pnpm',
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_app_projects_workspace ON app_projects(workspace_id, updated_at);
+
+CREATE TABLE IF NOT EXISTS app_builds (
+  id TEXT PRIMARY KEY,
+  app_id TEXT NOT NULL REFERENCES apps(id) ON DELETE CASCADE,
+  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  source_commit TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'queued',
+  worktree_path TEXT,
+  artifact_path TEXT,
+  artifact_sha256 TEXT,
+  sbom_path TEXT,
+  log TEXT NOT NULL DEFAULT '',
+  started_at TEXT,
+  completed_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_app_builds_app ON app_builds(workspace_id, app_id, created_at);
+`,
+  },
+  {
+    // Version 146 was already shipped as `durable_operator_questions` in an
+    // earlier development build. Reusing that number caused upgraded databases
+    // to skip this migration while fresh test databases appeared healthy.
+    version: 147,
+    name: 'runtime_neutral_durable_suspensions',
+    sql: `
+CREATE TABLE IF NOT EXISTS durable_suspensions (
+  id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  owner_agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
+  requester_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+  origin_type TEXT NOT NULL,
+  origin_id TEXT NOT NULL,
+  origin_metadata_json TEXT NOT NULL DEFAULT '{}',
+  condition_type TEXT NOT NULL,
+  condition_json TEXT NOT NULL DEFAULT '{}',
+  audience_type TEXT NOT NULL,
+  audience_target TEXT,
+  audience_metadata_json TEXT NOT NULL DEFAULT '{}',
+  state TEXT NOT NULL DEFAULT 'presenting',
+  reason TEXT NOT NULL,
+  public_receipt TEXT,
+  correlation_key TEXT NOT NULL,
+  presentation_ref TEXT,
+  resolution_json TEXT,
+  continuation_json TEXT,
+  expires_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  resolved_at TEXT,
+  resumed_at TEXT,
+  error TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_durable_suspensions_origin_correlation
+  ON durable_suspensions(workspace_id, origin_type, origin_id, correlation_key);
+CREATE INDEX IF NOT EXISTS idx_durable_suspensions_state
+  ON durable_suspensions(workspace_id, state, updated_at);
+CREATE INDEX IF NOT EXISTS idx_durable_suspensions_origin
+  ON durable_suspensions(workspace_id, origin_type, origin_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_durable_suspensions_expiry
+  ON durable_suspensions(state, expires_at);
+`,
+  },
+  {
+    version: 148,
+    name: 'knowledge_link_lookup_indexes',
+    sql: `
+CREATE INDEX IF NOT EXISTS idx_knowledge_links_source_lookup
+  ON knowledge_links(workspace_id, source_id, source_kind, invalid_at);
+CREATE INDEX IF NOT EXISTS idx_knowledge_links_target_lookup
+  ON knowledge_links(workspace_id, target_id, target_kind, invalid_at);
+CREATE INDEX IF NOT EXISTS idx_knowledge_links_exact_lookup
+  ON knowledge_links(workspace_id, source_id, source_kind, target_id, target_kind, relation, invalid_at);
+`,
+  },
+  {
+    version: 149,
+    name: 'channel_provider_receipt_reconciliation',
+    sql: `
+ALTER TABLE channel_outbound_deliveries ADD COLUMN conversation_id TEXT;
+ALTER TABLE channel_outbound_deliveries ADD COLUMN conversation_message_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_channel_outbound_provider_message
+  ON channel_outbound_deliveries(connection_id, provider_message_id);
+`,
+  },
 ] satisfies Migration[]).sort((a, b) => a.version - b.version);
 
 

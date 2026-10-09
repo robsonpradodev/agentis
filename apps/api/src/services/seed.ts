@@ -41,6 +41,11 @@ export async function seedIfEmpty(args: {
   }
 
   const username = env.AGENTIS_SEED_USERNAME;
+  if (env.NODE_ENV === 'production' && !env.AGENTIS_SEED_PASSWORD) {
+    throw new Error(
+      'AGENTIS_SEED_PASSWORD is required for the first production boot. Set a unique long password in your secret manager before starting Agentis.',
+    );
+  }
   // Test mode: deterministic password if none was provided, so Playwright
   // specs can sign in without scraping stdout.
   const testDefault = env.AGENTIS_TEST_MODE ? 'test-password-1234' : undefined;

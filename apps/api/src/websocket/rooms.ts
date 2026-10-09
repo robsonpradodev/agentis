@@ -109,6 +109,19 @@ export function createRealtimeServer(deps: {
         socket.on('unsubscribe:run', (args: { runId: string }) => {
           if (args?.runId) socket.leave(REALTIME_ROOMS.run(args.runId));
         });
+        socket.on('subscribe:mission', (args: { workspaceId: string; missionId: string }) => {
+          if (!ownsWorkspace(deps.db, userId, args.workspaceId)) return;
+          const mission = deps.db
+            .select({ workspaceId: schema.agentMissions.workspaceId })
+            .from(schema.agentMissions)
+            .where(eq(schema.agentMissions.id, args.missionId))
+            .get();
+          if (!mission || mission.workspaceId !== args.workspaceId) return;
+          socket.join(REALTIME_ROOMS.mission(args.missionId));
+        });
+        socket.on('unsubscribe:mission', (args: { missionId: string }) => {
+          if (args?.missionId) socket.leave(REALTIME_ROOMS.mission(args.missionId));
+        });
         socket.on('subscribe:workflow', (args: { workspaceId: string; workflowId: string }) => {
           if (!ownsWorkspace(deps.db, userId, args.workspaceId)) return;
           if (!resourceInWorkspace(deps.db, 'workflow', args.workflowId, args.workspaceId)) return;

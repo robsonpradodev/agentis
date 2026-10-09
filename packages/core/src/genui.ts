@@ -165,6 +165,7 @@ function pipelineView(ctx: Ctx): BuiltSurface {
       children: [
         { type: 'Hero', eyebrow: 'Pipeline', title: humanize(ctx.name), subtitle: 'Move work forward with a live stage view.' },
         { type: 'Toolbar', title: humanize(ctx.name), children: [{ type: 'Badge', value: 'Live pipeline', tone: 'success' }] },
+        { type: 'OrchestrationPanel' },
         flow,
         kanban,
         { type: 'ActivityStream', title: 'Recent movement', limit: 12 },

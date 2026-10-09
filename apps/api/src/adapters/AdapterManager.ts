@@ -146,6 +146,10 @@ export class AdapterManager {
 
   async unregister(agentId: string): Promise<void> {
     const reg = this.#adapters.get(agentId);
+    const releasedInteractiveLease = this.#interactiveLeases.delete(agentId);
+    if (releasedInteractiveLease) {
+      this.logger.info('adapter.interactive_lease_released_on_unregister', { agentId });
+    }
     if (!reg) return;
     try {
       await reg.adapter.disconnect();

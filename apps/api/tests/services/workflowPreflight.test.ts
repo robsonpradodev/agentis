@@ -488,4 +488,22 @@ describe('preflightWorkflow', () => {
     expect(cached.cacheHit).toBe(true);
     expect(cached.durationMs).toBeLessThan(10);
   });
+
+  it('blocks an action Agent Task without an effect contract', async () => {
+    const ctx = await createTestContext();
+    const graph = agentGraph();
+    const task = graph.nodes.find((node) => node.id === 'draft')!;
+    task.config = { ...task.config, kind: 'agent_task', prompt: 'Send a WhatsApp message and update the lead', taskMode: 'act', completionContract: undefined } as never;
+    const report = preflightWorkflow({ db: ctx.db, workspaceId: ctx.workspace.id, workflowId: 'wf-action-contract', graph });
+    expect(report.issues.some((issue) => issue.code === 'ACTION_COMPLETION_CONTRACT_MISSING' && issue.severity === 'error')).toBe(true);
+  });
+
+  it('allows a minimal action Agent Task with declared native effects', async () => {
+    const ctx = await createTestContext();
+    const graph = agentGraph();
+    const task = graph.nodes.find((node) => node.id === 'draft')!;
+    task.config = { ...task.config, kind: 'agent_task', prompt: 'Send a WhatsApp message and update the lead', taskMode: 'act', completionContract: { requiredEffects: ['channel_delivery', 'data_mutation'] } } as never;
+    const report = preflightWorkflow({ db: ctx.db, workspaceId: ctx.workspace.id, workflowId: 'wf-minimal-action', graph });
+    expect(report.issues.some((issue) => issue.code === 'ACTION_COMPLETION_CONTRACT_MISSING' || issue.code === 'AGENT_SELF_REPORTED_DELIVERY')).toBe(false);
+  });
 });

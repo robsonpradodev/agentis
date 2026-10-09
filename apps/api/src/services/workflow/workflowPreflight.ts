@@ -142,6 +142,7 @@ export function preflightWorkflow(args: {
   }
   validateContractInput(args.graph.inputContract, scenario.input, issues);
   checkAgentBindings(args.graph, { db: args.db, workspaceId: args.workspaceId }, issues);
+  checkAgentActionContracts(args.graph, issues);
 
   if (!issues.some((issue) => issue.severity === 'error')) {
     simulateGraph(args.graph, scenario.input, nodes, issues, { db: args.db, workspaceId: args.workspaceId });
@@ -649,6 +650,31 @@ function mockOutput(
     };
   }
   return { ...input, _preflight: { nodeId: node.id, kind: node.config.kind, mocked: true } };
+}
+
+function checkAgentActionContracts(graph: WorkflowGraph, issues: WorkflowHealthIssue[]): void {
+  const agentTasks = graph.nodes.filter((node) => node.config.kind === 'agent_task');
+  const hasNativeChannel = graph.nodes.some((node) => node.config.kind === 'channel');
+  for (const node of agentTasks) {
+    if (node.config.kind !== 'agent_task') continue;
+    const actionLanguage = /\b(send|message|whats\s*app|contact|outreach|update|move|schedule|follow[ -]?up|envi|mensagem|contat|mova|atualiz)\b/i.test(node.config.prompt);
+    if (actionLanguage && !node.config.taskMode) {
+      issues.push({ code: 'AGENT_ACTION_MODE_AMBIGUOUS', severity: 'warning', nodeId: node.id, nodeTitle: node.title,
+        message: 'This Agent Task appears to perform external actions but has no taskMode/effect contract.',
+        remediation: 'Set taskMode="act" and declare the native effects that must be verified.', autoRepairable: true });
+    }
+    if (node.config.taskMode === 'act' && !node.config.completionContract?.requiredEffects?.length) {
+      issues.push({ code: 'ACTION_COMPLETION_CONTRACT_MISSING', severity: 'error', nodeId: node.id, nodeTitle: node.title,
+        message: 'Action Agent Tasks must declare at least one required platform effect.',
+        remediation: 'Add completionContract.requiredEffects, such as channel_delivery and data_mutation.', autoRepairable: true });
+    }
+    if (graph.nodes.length > 2 && node.config.taskMode === 'act'
+      && node.config.completionContract?.requiredEffects.includes('channel_delivery') && !hasNativeChannel) {
+      issues.push({ code: 'AGENT_SELF_REPORTED_DELIVERY', severity: 'error', nodeId: node.id, nodeTitle: node.title,
+        message: 'A multi-node workflow cannot delegate delivery to an Agent Task.',
+        remediation: 'Have the Agent compose/select upstream, then use a native channel node and gate state updates on its receipt.', autoRepairable: true });
+    }
+  }
 }
 
 function sampleFromJsonSchema(schema: unknown, key = 'value'): unknown {

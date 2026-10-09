@@ -1,5 +1,6 @@
 import { beforeEach, afterEach, describe, expect, it } from 'vitest';
 import { randomUUID } from 'node:crypto';
+import { eq } from 'drizzle-orm';
 import { schema } from '@agentis/db/sqlite';
 import type { AgentisToolContext } from '@agentis/core';
 import { AgentisToolRegistry } from '../../src/services/agentisToolRegistry.js';
@@ -9,12 +10,16 @@ import { SharedIntelligenceService } from '../../src/services/sharedIntelligence
 import { MemoryStore } from '../../src/services/memory/memoryStore.js';
 import { EpisodicMemoryStore } from '../../src/services/episodicMemoryStore.js';
 import { SkillService } from '../../src/services/skillService.js';
+import { KnowledgeBaseService } from '../../src/services/knowledge/knowledgeBase.js';
 import { StubEmbeddingProvider } from '../_helpers/stubEmbeddingProvider.js';
 import { createTestContext, type TestContext } from '../_helpers/createTestContext.js';
 
 let ctx: TestContext;
 let registry: AgentisToolRegistry;
 let skills: SkillService;
+let memory: MemoryStore;
+let knowledge: KnowledgeBaseService;
+let episodes: EpisodicMemoryStore;
 
 function toolCtx(agentId: string | null = null): AgentisToolContext {
   return { workspaceId: ctx.workspace.id, agentId, caller: 'agent' } as unknown as AgentisToolContext;
@@ -22,11 +27,12 @@ function toolCtx(agentId: string | null = null): AgentisToolContext {
 
 beforeEach(async () => {
   ctx = await createTestContext();
-  const episodes = new EpisodicMemoryStore(ctx.db, ctx.logger, new StubEmbeddingProvider());
+  episodes = new EpisodicMemoryStore(ctx.db, ctx.logger, new StubEmbeddingProvider());
   const brain = new SharedIntelligenceService(ctx.db, ctx.bus, episodes, ctx.logger);
-  const memory = new MemoryStore(ctx.db, ctx.logger);
+  memory = new MemoryStore(ctx.db, ctx.logger);
   memory.setEpisodicStore(episodes);
   skills = new SkillService(ctx.db, memory, brain, ctx.logger);
+  knowledge = new KnowledgeBaseService(ctx.db);
   registry = new AgentisToolRegistry({ logger: ctx.logger });
   registerBrainTools(registry, {
     db: ctx.db,
@@ -34,6 +40,8 @@ beforeEach(async () => {
     sharedIntelligence: brain,
     skills,
     memory,
+    episodes,
+    knowledgeBases: knowledge,
   } as unknown as ToolHandlerDeps);
 });
 
@@ -223,5 +231,146 @@ describe('specialist private Brain administration', () => {
     }, toolCtx());
     expect(result.ok).toBe(false);
     expect(result.errorCode).toBe('RESOURCE_NOT_FOUND');
+  });
+
+  it('previews and selectively archives a legacy Brain without deleting the agent', async () => {
+    const agentId = randomUUID();
+    ctx.db.insert(schema.agents).values({
+      id: agentId,
+      workspaceId: ctx.workspace.id,
+      ambientId: ctx.ambient.id,
+      userId: ctx.user.id,
+      name: 'Ava Attendant',
+      adapterType: 'hermes_agent',
+      capabilityTags: ['whatsapp'],
+      config: {},
+      status: 'online',
+      role: 'attendant',
+    }).run();
+
+    const canonicalMemoryId = memory.write({
+      workspaceId: ctx.workspace.id,
+      scopeId: agentId,
+      kind: 'rule',
+      source: 'operator',
+      title: 'Canonical commercial precedence',
+      content: 'The Acme master prompt is authoritative.',
+    });
+    memory.write({
+      workspaceId: ctx.workspace.id,
+      scopeId: agentId,
+      kind: 'rule',
+      source: 'operator',
+      title: 'Core v5 legacy pricing',
+      content: 'Offer the old R$397 plan.',
+    });
+    const legacySkill = skills.upsertSkill({
+      workspaceId: ctx.workspace.id,
+      scopeId: agentId,
+      name: 'Legacy sales script',
+      description: 'Old opening and pricing.',
+      body: 'Quote R$397.',
+    });
+    skills.promoteExample({
+      workspaceId: ctx.workspace.id,
+      skillId: legacySkill.id,
+      inputText: 'Quanto custa?',
+      outputText: 'R$397.',
+      source: 'operator',
+    });
+    const base = knowledge.createKnowledgeBase({ workspaceId: ctx.workspace.id, scopeId: agentId, name: 'Ava private knowledge' });
+    const master = await knowledge.addDocument({
+      workspaceId: ctx.workspace.id,
+      knowledgeBaseId: base.id,
+      name: 'ACME COMMERCIAL — MASTER SYSTEM PROMPT.md',
+      content: 'Canonical Acme commercial policy.',
+    });
+    await knowledge.addDocument({
+      workspaceId: ctx.workspace.id,
+      knowledgeBaseId: base.id,
+      name: 'Legacy commercial notes.md',
+      content: 'Conflicting old prices.',
+    });
+    episodes.write({
+      workspaceId: ctx.workspace.id,
+      scopeId: agentId,
+      agentId,
+      type: 'failure',
+      source: 'system_write',
+      title: 'Failure lessons',
+      summary: 'Legacy runtime lesson that should not survive a keep-only reset.',
+    });
+
+    const keep = {
+      memoryIds: [canonicalMemoryId],
+      knowledgeIds: [master.id],
+      skillIds: [],
+      exampleIds: [],
+      episodeIds: [],
+    };
+    const preview = await registry.execute({
+      toolId: 'agentis.agent.brain.prune',
+      arguments: { agentId, keep },
+    }, toolCtx());
+    expect(preview.ok).toBe(true);
+    const previewOutput = preview.output as {
+      applied: boolean;
+      confirmationToken: string;
+      counts: Record<string, number>;
+    };
+    expect(previewOutput.applied).toBe(false);
+    expect(previewOutput.counts).toMatchObject({ memories: 1, knowledge: 1, skills: 1, examples: 1, episodes: 1 });
+
+    const stillIntact = await registry.execute({
+      toolId: 'agentis.agent.brain.inspect',
+      arguments: { agentId },
+    }, toolCtx());
+    expect((stillIntact.output as { counts: Record<string, number> }).counts)
+      .toMatchObject({ memories: 2, knowledge: 2, skills: 1, examples: 1, episodes: 1 });
+
+    const applied = await registry.execute({
+      toolId: 'agentis.agent.brain.prune',
+      arguments: { agentId, keep, confirmationToken: previewOutput.confirmationToken },
+    }, toolCtx());
+    expect(applied.ok).toBe(true);
+    const output = applied.output as {
+      applied: boolean;
+      verification: { counts: Record<string, number>; memories: Array<{ id: string }>; knowledge: Array<{ id: string }> };
+    };
+    expect(output.applied).toBe(true);
+    expect(output.verification.counts).toMatchObject({ memories: 1, knowledge: 1, skills: 0, examples: 0, episodes: 0 });
+    expect(output.verification.memories.map((item) => item.id)).toEqual([canonicalMemoryId]);
+    expect(output.verification.knowledge.map((item) => item.id)).toEqual([master.id]);
+    expect(ctx.db.select({ id: schema.agents.id }).from(schema.agents).where(eq(schema.agents.id, agentId)).get()?.id).toBe(agentId);
+  });
+
+  it('rejects a stale prune token before changing the Brain', async () => {
+    const agentId = randomUUID();
+    ctx.db.insert(schema.agents).values({
+      id: agentId,
+      workspaceId: ctx.workspace.id,
+      ambientId: ctx.ambient.id,
+      userId: ctx.user.id,
+      name: 'Mutable Brain',
+      adapterType: 'codex',
+      capabilityTags: [],
+      config: {},
+      status: 'online',
+      role: 'specialist',
+    }).run();
+    memory.write({ workspaceId: ctx.workspace.id, scopeId: agentId, kind: 'rule', source: 'operator', title: 'Old', content: 'old' });
+    const keep = { memoryIds: [], knowledgeIds: [], skillIds: [], exampleIds: [], episodeIds: [] };
+    const preview = await registry.execute({ toolId: 'agentis.agent.brain.prune', arguments: { agentId, keep } }, toolCtx());
+    const token = (preview.output as { confirmationToken: string }).confirmationToken;
+    memory.write({ workspaceId: ctx.workspace.id, scopeId: agentId, kind: 'rule', source: 'operator', title: 'New', content: 'new' });
+
+    const apply = await registry.execute({
+      toolId: 'agentis.agent.brain.prune',
+      arguments: { agentId, keep, confirmationToken: token },
+    }, toolCtx());
+    expect(apply.ok).toBe(false);
+    expect(apply.errorCode).toBe('VALIDATION_FAILED');
+    const inspect = await registry.execute({ toolId: 'agentis.agent.brain.inspect', arguments: { agentId } }, toolCtx());
+    expect((inspect.output as { counts: { memories: number } }).counts.memories).toBe(2);
   });
 });

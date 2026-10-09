@@ -6,7 +6,7 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
   buildAutostartTarget,
@@ -74,6 +74,7 @@ describe('autostartService', () => {
       expect(runCmd).toContain('"C:\\Program Files\\nodejs\\node.exe"');
       expect(runCmd).toContain(`"${join(home, 'a space dir', 'cli', 'dist', 'index.cjs')}"`);
       expect(runCmd).toContain('up');
+      expect(runCmd).toContain('--background');
       expect(runCmd).toContain(`set "AGENTIS_DATA_DIR=${dataDir}"`);
 
       await disableAutostart(target);
@@ -106,6 +107,7 @@ describe('autostartService', () => {
       const plist = readFileSync(target.markerPath, 'utf8');
       expect(plist).toContain('<key>RunAtLoad</key>');
       expect(plist).toContain('<true/>');
+      expect(plist).toContain('<string>--background</string>');
       expect(plist).toContain('C:\\Program Files\\nodejs\\node.exe');
       expect(plist).toContain('AGENTIS_DATA_DIR');
 
@@ -125,10 +127,32 @@ describe('autostartService', () => {
       expect(desktop).toContain('[Desktop Entry]');
       expect(desktop).toContain('X-GNOME-Autostart-enabled=true');
       expect(desktop).toContain('"C:\\Program Files\\nodejs\\node.exe"');
+      expect(desktop).toContain(`"AGENTIS_DATA_DIR=${dataDir}"`);
+      expect(desktop).toContain('--background');
 
       await disableAutostart(target);
       expect(getAutostartStatus(target)).toBe(false);
     });
+  });
+
+  it('resolves a relative data directory before writing an unattended launcher', () => {
+    const target = buildAutostartTarget({
+      ...baseOpts('win32', { home, appData, data: '.agentis' }),
+      scriptPath: join(home, 'cli', 'dist', 'index.cjs'),
+    });
+
+    expect(target.dataDir).toBe(resolve('.agentis'));
+    expect(target.writes[0]?.contents).toContain(`set "AGENTIS_DATA_DIR=${resolve('.agentis')}"`);
+  });
+
+  it('reports Windows autostart as unsupported when APPDATA is unavailable', () => {
+    const target = buildAutostartTarget({
+      ...baseOpts('win32', { home, appData, data: dataDir }),
+      appDataDir: undefined,
+    });
+
+    expect(target.supported).toBe(false);
+    expect(target.reason).toMatch(/APPDATA/i);
   });
 
   it('enableAutostart throws with the reason when unsupported', async () => {

@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { assertProtectedInstructions, instructionProtection } from '../agent/agentInstructionProtection.js';
 import {
   existsSync,
   mkdirSync,
@@ -271,6 +272,9 @@ export class RuntimeProfileService {
     }
     const now = new Date().toISOString();
     if (id === 'agentis:overlay') {
+      const latest = this.loadAgent(agent.workspaceId, agent.id);
+      assertProtectedInstructions(latest, content);
+      if (latest.instructions !== agent.instructions) throw new AgentisError('RESOURCE_CONFLICT', 'Instructions changed; reload the runtime resource before saving.');
       this.db
         .update(schema.agents)
         .set({ instructions: content, updatedAt: now })
@@ -280,6 +284,7 @@ export class RuntimeProfileService {
       const updated = { ...descriptor, checksum: checksum(content), sizeBytes: Buffer.byteLength(content), updatedAt: now };
       return { resource: updated, content };
     }
+    if (descriptor.kind === 'instructions' && instructionProtection(agent.config)) throw new AgentisError('AUTH_FORBIDDEN', 'Edit protected platform instructions instead of a separate harness instruction file.');
     if (!descriptor.path) throw new AgentisError('VALIDATION_FAILED', 'Runtime resource has no writable path.');
     mkdirSync(path.dirname(descriptor.path), { recursive: true });
     const temporary = `${descriptor.path}.agentis-${process.pid}.tmp`;

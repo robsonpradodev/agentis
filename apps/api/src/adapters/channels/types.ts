@@ -113,7 +113,10 @@ export interface OutboundAttachmentRef {
 export type OutboundNativeContent =
   | { kind: 'location'; latitude: number; longitude: number; name?: string; address?: string }
   | { kind: 'contact'; displayName: string; phone: string; vcard?: string }
-  | { kind: 'poll'; question: string; options: string[]; selectableCount?: number };
+  | { kind: 'poll'; question: string; options: string[]; selectableCount?: number }
+  | { kind: 'interactive_buttons'; buttons: Array<{ id: string; title: string }>; header?: string; footer?: string }
+  | { kind: 'interactive_list'; buttonText: string; sections: Array<{ title: string; rows: Array<{ id: string; title: string; description?: string }> }>; header?: string; footer?: string }
+  | { kind: 'template'; name: string; language: string; bodyParameters: string[] };
 
 /**
  * Provider-issued proof that an outbound message was accepted by the channel.
@@ -159,6 +162,16 @@ export class ChannelDeliveryRejectedError extends Error {
   ) {
     super(message);
     this.name = 'ChannelDeliveryRejectedError';
+  }
+}
+
+/** The provider boundary was crossed but no definitive receipt was observed. */
+export class ChannelDeliveryUncertainError extends Error {
+  readonly code = 'CHANNEL_DELIVERY_UNCERTAIN';
+
+  constructor(message: string, readonly idempotencyKey?: string) {
+    super(message);
+    this.name = 'ChannelDeliveryUncertainError';
   }
 }
 
@@ -230,3 +243,7 @@ export interface ChannelAdapter {
     headers: Record<string, string | undefined>;
   }): ParsedInboundMessage | null;
 }
+
+/** A local message reference is resolved and scoped by ChannelBridge before use. */
+export interface ChannelQuote { messageId: string }
+export interface ResolvedChannelQuote { providerMessageId: string; body: string; fromMe: boolean }

@@ -7,6 +7,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { assertProtectedInstructions, preserveInstructionProtection } from '../services/agent/agentInstructionProtection.js';
 import { Hono } from 'hono';
 import { and, eq, ne } from 'drizzle-orm';
 import { z } from 'zod';
@@ -299,7 +300,8 @@ export function buildAgentMutationRoutes(deps: AgentRouteDeps) {
       reportsTo: nextReportsTo,
       fallbackSpaceTag: body.spaceTag === undefined ? existing.spaceTag ?? null : body.spaceTag ?? null,
     });
-    const rawNextConfig = body.config ?? (existing.config as Record<string, unknown>);
+    assertProtectedInstructions(existing, nextInstructions ?? null);
+    const rawNextConfig = preserveInstructionProtection(existing.config, body.config ?? (existing.config as Record<string, unknown>));
     const repairedConfig = await repairCliHarnessConfig(existing.adapterType as V1HarnessAdapterType, rawNextConfig);
     const nextConfig = existing.adapterType === 'antigravity'
       ? { ...repairedConfig.config, ...(normalizeAntigravityModel(String(repairedConfig.config.model ?? body.runtimeModel ?? '')) ? { model: normalizeAntigravityModel(String(repairedConfig.config.model ?? body.runtimeModel ?? '')) } : {}) }
@@ -310,6 +312,10 @@ export function buildAgentMutationRoutes(deps: AgentRouteDeps) {
         ? normalizeAntigravityModel(body.runtimeModel)
         : body.runtimeModel;
     ensureOrEstablishSingleOrchestrator(deps.db, ws.workspaceId, nextRole, id, body.replaceExistingOrchestrator === true);
+    const latest = loadAgent(deps.db, ws.workspaceId, id);
+    if (JSON.stringify(latest.config) !== JSON.stringify(existing.config) || latest.instructions !== existing.instructions) {
+      throw new AgentisError('RESOURCE_CONFLICT', 'Agent configuration changed while preparing this update. Reload before saving.');
+    }
     deps.db.transaction(() => {
       deps.db
         .update(schema.agents)

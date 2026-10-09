@@ -1,3 +1,4 @@
+import type { ChannelQuote } from '../../adapters/channels/types.js';
 /**
  * channelSend — the single resolve-authorize-deliver flow for sending a message
  * on a native channel connection.
@@ -12,15 +13,35 @@
  */
 import type { ChannelBridge } from './channelBridge.js';
 import type { ConnectionGrantService } from '../connectionGrants.js';
-import { ChannelDeliveryRejectedError, isAcknowledgedChannelDelivery, type ChannelDeliveryReceipt, type ChannelKind, type OutboundAttachmentRef, type OutboundNativeContent } from '../../adapters/channels/types.js';
+import { ChannelDeliveryRejectedError, ChannelDeliveryUncertainError, isAcknowledgedChannelDelivery, type ChannelDeliveryReceipt, type ChannelKind, type OutboundAttachmentRef, type OutboundNativeContent } from '../../adapters/channels/types.js';
 
 const CHANNEL_KINDS = new Set<ChannelKind>(['telegram', 'discord', 'slack', 'whatsapp', 'voice']);
 
 /** One message in a burst — its own body and/or attachments. */
 export interface ChannelSendMessage {
+  id?: string;
+  requirementId?: string;
   body?: string;
   attachments?: OutboundAttachmentRef[];
   native?: OutboundNativeContent;
+  quotedMessage?: ChannelQuote;
+}
+
+export interface ChannelSendItemReceipt {
+  itemId: string;
+  requirementId: string | null;
+  idempotencyKey: string;
+  providerMessageId: string;
+  providerStatus: string;
+  acknowledged: boolean;
+  observedAt: string;
+  receipt: ChannelDeliveryReceipt;
+}
+
+/** One audited owner-directed effect may cross an existing human handoff. */
+export interface ChannelHandoffOverride {
+  basis: 'verified_owner_command';
+  effectIntentId: string;
 }
 
 export interface ChannelSendArgs {
@@ -39,6 +60,7 @@ export interface ChannelSendArgs {
   attachments?: OutboundAttachmentRef[];
   /** A provider-native location, contact card, or poll. */
   native?: OutboundNativeContent;
+  quotedMessage?: ChannelQuote;
   /**
    * Send a natural BURST of messages in order to the same destination (§3). When
    * present, `body`/`attachments` are ignored. Each message is delivered as its
@@ -52,6 +74,8 @@ export interface ChannelSendArgs {
   actor?: 'automation' | 'human';
   conversationId?: string;
   expectedAutomationEpoch?: number;
+  /** Does not release handoff or authorize any later autonomous delivery. */
+  handoffOverride?: ChannelHandoffOverride;
   /**
    * Persist this programmatic delivery as business-side transcript context.
    * Used by deterministic workflows so a later inbound reply continues the
@@ -61,23 +85,28 @@ export interface ChannelSendArgs {
 }
 
 export type ChannelSendResult =
-  | { sent: true; verified: true; connectionId: string; kind: string; to: string; targetSource: string; status: string; attachments: number; messages: number; providerMessageId: string; providerMessageIds?: string[]; deliveryStatus: ChannelDeliveryReceipt['status']; acceptedAt: string; receipt: ChannelDeliveryReceipt; deliveryRole: 'progress' | 'final' | 'unspecified' }
-  | { sent: false; verified?: false; errorCode: string; error: string; remediation?: string; candidates?: unknown[]; connection?: unknown; receipt?: ChannelDeliveryReceipt };
+  | { sent: true; verified: true; connectionId: string; kind: string; to: string; targetSource: string; status: string; attachments: number; messages: number; providerMessageId: string; providerMessageIds?: string[]; itemReceipts: ChannelSendItemReceipt[]; deliveryStatus: ChannelDeliveryReceipt['status']; acceptedAt: string; receipt: ChannelDeliveryReceipt; deliveryRole: 'progress' | 'final' | 'unspecified' }
+  | { sent: false; verified?: false; errorCode: string; error: string; deliveryOutcome?: 'pending' | 'failed'; idempotencyKey?: string; remediation?: string; candidates?: unknown[]; connection?: unknown; receipt?: ChannelDeliveryReceipt; itemReceipts?: ChannelSendItemReceipt[] };
 
 /** Flatten the request into an ordered list of messages to deliver. */
-function normalizeDeliveries(args: ChannelSendArgs): Array<{ body: string; attachments: OutboundAttachmentRef[]; native?: OutboundNativeContent }> {
+function normalizeDeliveries(args: ChannelSendArgs): Array<{ id: string; requirementId: string | null; body: string; attachments: OutboundAttachmentRef[]; native?: OutboundNativeContent; quotedMessage?: ChannelQuote }> {
   if (Array.isArray(args.messages) && args.messages.length > 0) {
     return args.messages
-      .map((m) => ({
+      .map((m, index) => ({
+        id: m.id?.trim() || `message-${index + 1}`,
+        requirementId: m.requirementId?.trim() || null,
         body: typeof m.body === 'string' ? m.body.trim() : '',
         attachments: Array.isArray(m.attachments) ? m.attachments : [],
+        ...(m.quotedMessage ? { quotedMessage: m.quotedMessage } : {}),
         ...(m.native ? { native: m.native } : {}),
       }))
       .filter((d) => d.body || d.attachments.length > 0 || d.native);
   }
   const body = typeof args.body === 'string' ? args.body.trim() : '';
   const attachments = args.attachments ?? [];
-  return body || attachments.length > 0 || args.native ? [{ body, attachments, ...(args.native ? { native: args.native } : {}) }] : [];
+  return body || attachments.length > 0 || args.native
+    ? [{ id: 'message-1', requirementId: null, body, attachments, ...(args.quotedMessage ? {quotedMessage: args.quotedMessage} : {}), ...(args.native ? { native: args.native } : {}) }]
+    : [];
 }
 
 /** What the flow needs from the bridge — structural so tests can fake it. */
@@ -227,6 +256,7 @@ export async function resolveAndSend(deps: ChannelSendDeps, args: ChannelSendArg
   }
 
   const receipts: ChannelDeliveryReceipt[] = [];
+  const itemReceipts: ChannelSendItemReceipt[] = [];
   let totalAttachments = 0;
   for (let i = 0; i < deliveries.length; i += 1) {
     const d = deliveries[i]!;
@@ -234,7 +264,7 @@ export async function resolveAndSend(deps: ChannelSendDeps, args: ChannelSendArg
     // A burst derives a per-message idempotency sub-key so a retry re-sends only
     // the message that failed, never the ones already accepted.
     const idempotencyKey = args.idempotencyKey
-      ? (deliveries.length > 1 ? `${args.idempotencyKey}#${i}` : args.idempotencyKey)
+      ? (deliveries.length > 1 ? `${args.idempotencyKey}#${encodeURIComponent(d.id)}` : args.idempotencyKey)
       : undefined;
     let receipt: ChannelDeliveryReceipt;
     try {
@@ -243,12 +273,14 @@ export async function resolveAndSend(deps: ChannelSendDeps, args: ChannelSendArg
         chatId,
         body: d.body,
         ...(d.attachments.length ? { attachments: d.attachments } : {}),
+        ...(d.quotedMessage ? { quotedMessage: d.quotedMessage } : {}),
         ...(d.native ? { native: d.native } : {}),
         ...(idempotencyKey ? { idempotencyKey } : {}),
         ...(args.bypassGuards ? { bypassGuards: true } : {}),
         ...(args.actor ? { actor: args.actor } : {}),
         ...(args.conversationId ? { conversationId: args.conversationId } : {}),
         ...(args.expectedAutomationEpoch !== undefined ? { expectedAutomationEpoch: args.expectedAutomationEpoch } : {}),
+        ...(args.handoffOverride ? { handoffOverride: args.handoffOverride } : {}),
         ...(args.persistOutboundContext ? { persistOutboundContext: true } : {}),
       });
     } catch (err) {
@@ -258,6 +290,7 @@ export async function resolveAndSend(deps: ChannelSendDeps, args: ChannelSendArg
           verified: false,
           errorCode: 'CHANNEL_PROVIDER_REJECTED',
           error: err.message,
+          deliveryOutcome: 'failed',
           ...(err.remediation ? { remediation: err.remediation } : {}),
           connection: {
             id: candidate.id,
@@ -266,9 +299,27 @@ export async function resolveAndSend(deps: ChannelSendDeps, args: ChannelSendArg
             providerMessageId: err.providerMessageId,
             providerErrorCode: err.providerErrorCode,
           },
+          itemReceipts,
         };
       }
-      throw err;
+      const error = err instanceof Error ? err.message : String(err);
+      const errorCode = err instanceof ChannelDeliveryUncertainError
+        ? err.code
+        : typeof err === 'object' && err !== null && 'code' in err && typeof err.code === 'string'
+        ? err.code
+        : 'CHANNEL_SEND_FAILED';
+      return {
+        sent: false,
+        verified: false,
+        errorCode,
+        error,
+        ...(err instanceof ChannelDeliveryUncertainError ? {
+          deliveryOutcome: 'pending' as const,
+          ...(err.idempotencyKey ? { idempotencyKey: err.idempotencyKey } : {}),
+        } : {}),
+        itemReceipts,
+        connection: { id: candidate.id, kind: candidate.kind, name: candidate.name },
+      };
     }
     const providerMessageId = receipt?.providerMessageId?.trim() ?? '';
     if (!providerMessageId) {
@@ -280,6 +331,7 @@ export async function resolveAndSend(deps: ChannelSendDeps, args: ChannelSendArg
         remediation: 'Inspect the channel/provider before retrying; an unverified attempt may still have reached the recipient.',
         connection: { id: candidate.id, kind: candidate.kind, name: candidate.name },
         ...(receipt ? { receipt } : {}),
+        itemReceipts,
       };
     }
     if (!isAcknowledgedChannelDelivery(receipt)) {
@@ -291,9 +343,20 @@ export async function resolveAndSend(deps: ChannelSendDeps, args: ChannelSendArg
         remediation: 'Wait for a provider acknowledgement and inspect the durable delivery receipt before retrying. Do not resend blindly: the original attempt may still be accepted later.',
         connection: { id: candidate.id, kind: candidate.kind, name: candidate.name },
         receipt,
+        itemReceipts,
       };
     }
     receipts.push(receipt);
+    itemReceipts.push({
+      itemId: d.id,
+      requirementId: d.requirementId,
+      idempotencyKey: idempotencyKey ?? `unkeyed:${d.id}:${receipt.providerMessageId}`,
+      providerMessageId,
+      providerStatus: receipt.status,
+      acknowledged: true,
+      observedAt: new Date().toISOString(),
+      receipt,
+    });
   }
 
   const primary = receipts[0]!;
@@ -313,6 +376,7 @@ export async function resolveAndSend(deps: ChannelSendDeps, args: ChannelSendArg
     deliveryStatus: primary.status,
     acceptedAt: primary.acceptedAt,
     receipt: primary,
+    itemReceipts,
     deliveryRole: args.deliveryRole ?? 'unspecified',
   };
 }

@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { preserveInstructionProtection } from './agentInstructionProtection.js';
 import { mkdirSync } from 'node:fs';
 import { and, eq, ne } from 'drizzle-orm';
 import { AgentisError, CONSTANTS, REALTIME_EVENTS, REALTIME_ROOMS } from '@agentis/core';
@@ -264,6 +265,7 @@ export async function registerAdapter(
       healthUrl: httpUrlFromConfig(config, 'healthPath', 'healthUrl') ?? undefined,
       chatUrl: httpUrlFromConfig(config, 'chatPath', 'chatUrl') ?? undefined,
       supportsTools: booleanOf(config.supportsTools) === true,
+      chatProtocol: stringOf(config.chatProtocol) === 'openai' ? 'openai' : 'agentis',
       capabilityManifest: runtimeCapabilityDeclarationsOf(config.capabilityManifest),
       model: stringOf(config.model) ?? undefined,
       method: httpMethodOf(config.method),
@@ -465,7 +467,7 @@ export async function switchRuntime(
   // discovered/new config takes precedence per-key.
   const priorConfig = (existing.config ?? {}) as Record<string, unknown>;
   const sameAdapter = existing.adapterType === input.adapterType;
-  const mergedConfig = sameAdapter ? { ...priorConfig, ...(input.config ?? {}) } : { ...(input.config ?? {}) };
+  const mergedConfig = preserveInstructionProtection(priorConfig, sameAdapter ? { ...priorConfig, ...(input.config ?? {}) } : { ...(input.config ?? {}) });
   const repaired = await repairCliHarnessConfig(input.adapterType, mergedConfig);
   const rawModel = input.runtimeModel ?? runtimeModelFromConfig(input.adapterType, repaired.config) ?? null;
   const runtimeModel = input.adapterType === 'antigravity' ? normalizeAntigravityModel(rawModel) : rawModel;

@@ -120,12 +120,27 @@ modes: contextual / strict / exploratory. Routes: `/v1/knowledge-bases`.
 `skill_library` plane, with linked example atoms. Scope-affine (agent/workflow/app/workspace).
 Routes: `/v1/skills`.
 
+### Private Agent Brain maintenance
+
+`agentis.agent.brain.inspect` returns the active private Memory, runtime Episode, Knowledge, Skill, and Example
+inventory for one Agent with canonical ids and safe previews. `agentis.agent.brain.prune` then
+performs a two-call, concurrency-safe selective reset: the first call previews every archive
+candidate and returns a hash token; the second applies only if both the keep selection and Brain
+inventory remain unchanged. Content is archived rather than destroyed, and managed skill files
+are refreshed. The Agent record, runtime, Apps, and Connections are never part of this operation.
+
+Operator clients use that same implementation through `GET /v1/agents/:agentId/brain` and the
+two-phase `POST /v1/agents/:agentId/brain/prune`. The administrative API and Agent/MCP tools
+therefore expose identical cleanup powers and confirmation semantics.
+
 ## API surface
 
-- HTTP: `/v1/brain` (graph, health, ask, rebuild-memory), `/v1/memory`, `/v1/knowledge-bases`,
+- HTTP: `/v1/brain` (graph, health, ask, rebuild-memory), `/v1/agents/:agentId/brain`,
+  `/v1/agents/:agentId/brain/prune`, `/v1/memory`, `/v1/knowledge-bases`,
   `/v1/skills`, `/v1/grounding`, `/v1/personal-brain`, `/v1/runtime/embedding`.
 - Tools: `agentis.brain.search`, `agentis.memory.{write,read,delete}`,
-  `agentis.knowledge.{write,search,archive}`, `agentis.skill.{load,promote_example}`.
+  `agentis.knowledge.{write,search,archive}`, `agentis.skill.{load,promote_example}`,
+  `agentis.agent.brain.{configure,inspect,prune}`.
 
 ---
 

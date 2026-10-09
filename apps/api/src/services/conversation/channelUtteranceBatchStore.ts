@@ -60,16 +60,16 @@ export class ChannelUtteranceBatchStore {
 
   claim(id: string): DurableUtteranceBatch | null {
     const row = this.db.select().from(schema.channelUtteranceBatches).where(eq(schema.channelUtteranceBatches.id, id)).get();
-    if (!row || row.status !== 'collecting') return null;
+    if (!row || !['collecting', 'recovering'].includes(row.status)) return null;
     const changed = this.db.update(schema.channelUtteranceBatches).set({ status: 'processing', updatedAt: new Date().toISOString() })
-      .where(and(eq(schema.channelUtteranceBatches.id, id), eq(schema.channelUtteranceBatches.status, 'collecting'))).run();
+      .where(and(eq(schema.channelUtteranceBatches.id, id), eq(schema.channelUtteranceBatches.status, row.status))).run();
     return changed.changes ? present(row) : null;
   }
 
   claimDue(now = new Date().toISOString(), limit = 50): DurableUtteranceBatch[] {
     const stale = new Date(Date.parse(now) - 5 * 60_000).toISOString();
     const rows = this.db.select().from(schema.channelUtteranceBatches).where(or(
-      and(eq(schema.channelUtteranceBatches.status, 'collecting'), lt(schema.channelUtteranceBatches.softDeadlineAt, now)),
+      and(or(eq(schema.channelUtteranceBatches.status, 'collecting'), eq(schema.channelUtteranceBatches.status, 'recovering')), lt(schema.channelUtteranceBatches.softDeadlineAt, now)),
       and(eq(schema.channelUtteranceBatches.status, 'processing'), lt(schema.channelUtteranceBatches.updatedAt, stale)),
     )).orderBy(asc(schema.channelUtteranceBatches.softDeadlineAt)).limit(limit).all();
     const claimed: DurableUtteranceBatch[] = [];
@@ -81,6 +81,17 @@ export class ChannelUtteranceBatchStore {
       if (hit) claimed.push(hit);
     }
     return claimed;
+  }
+
+  finish(id: string, result: { replied: boolean; reason?: string }): void {
+    if (result.reason === 'delivery_failed') {
+      this.db.update(schema.channelUtteranceBatches).set({status: 'failed', updatedAt: new Date().toISOString()})
+        .where(eq(schema.channelUtteranceBatches.id, id)).run();
+    } else if (result.reason === 'delivery_pending' || result.reason === 'delivery_retry') {
+      this.retry(id, result.reason === 'delivery_pending' ? 60_000 : 5_000);
+      this.db.update(schema.channelUtteranceBatches).set({status: 'recovering'})
+        .where(eq(schema.channelUtteranceBatches.id, id)).run();
+    } else this.complete(id);
   }
 
   complete(id: string): void {

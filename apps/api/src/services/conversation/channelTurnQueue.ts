@@ -271,7 +271,7 @@ export class ChannelTurnQueue {
       // Policy silence and supersession are terminal by design. An empty model
       // result or unavailable adapter is not: marking either "done" loses the
       // customer's message with no visible outcome.
-      if (!result.replied && (result.reason === 'empty_reply' || result.reason === 'no_chat_adapter')) {
+      if (!result.replied && (['empty_reply', 'no_chat_adapter', 'delivery_retry', 'delivery_pending', 'delivery_failed'].includes(result.reason ?? ''))) {
         throw new Error(`retryable channel turn outcome: ${result.reason}`);
       }
       // Success — the turn (incl. its own error→user-notify path) ran exactly once.

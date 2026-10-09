@@ -1,5 +1,14 @@
 import type { OutboundAttachment, OutboundNativeContent } from './types.js';
 
+export interface WhatsAppMediaContext {
+  kind: 'image' | 'video' | 'audio' | 'voice' | 'sticker' | 'file';
+  originalArtifactRef: string | null;
+  mimeType: string;
+  caption?: string;
+  transcription?: {text: string | null; status: 'complete' | 'failed' | 'unavailable'};
+  interpretation?: {text: string | null; status: 'complete' | 'failed' | 'unavailable'};
+}
+
 export interface InboundChannelMedia {
   kind: 'image' | 'video' | 'audio' | 'voice' | 'sticker' | 'file';
   bytes: Buffer;
@@ -7,6 +16,36 @@ export interface InboundChannelMedia {
   filename: string;
   caption?: string;
   gifPlayback?: boolean;
+}
+
+export interface WhatsAppQuotedContext { providerMessageId: string; body: string }
+
+/** Read the provider's quoted message without conflating it with the new text. */
+export function extractWhatsAppQuotedContext(message: unknown): WhatsAppQuotedContext | undefined {
+  let value = message && typeof message === 'object' && 'message' in message
+    ? (message as {message?: unknown}).message : message;
+  for (let depth = 0; depth < 5 && value && typeof value === 'object'; depth++) {
+    const record = value as Record<string, unknown>;
+    for (const key of ['extendedTextMessage', 'imageMessage', 'videoMessage', 'documentMessage', 'buttonsResponseMessage', 'templateButtonReplyMessage']) {
+      const part = record[key];
+      if (!part || typeof part !== 'object') continue;
+      const context = (part as Record<string, unknown>).contextInfo;
+      if (!context || typeof context !== 'object') continue;
+      const c = context as Record<string, unknown>;
+      const providerMessageId = typeof c.stanzaId === 'string' ? c.stanzaId.trim() : '';
+      const quoted = c.quotedMessage && typeof c.quotedMessage === 'object' ? c.quotedMessage as Record<string, unknown> : {};
+      const body = typeof quoted.conversation === 'string' ? quoted.conversation
+        : typeof (quoted.extendedTextMessage as {text?: unknown} | undefined)?.text === 'string' ? (quoted.extendedTextMessage as {text: string}).text
+          : typeof (quoted.imageMessage as {caption?: unknown} | undefined)?.caption === 'string' ? (quoted.imageMessage as {caption: string}).caption
+            : typeof (quoted.videoMessage as {caption?: unknown} | undefined)?.caption === 'string' ? (quoted.videoMessage as {caption: string}).caption
+              : '[quoted media]';
+      if (providerMessageId) return {providerMessageId, body: body.slice(0, 2_000)};
+    }
+    value = record.ephemeralMessage && typeof record.ephemeralMessage === 'object' ? (record.ephemeralMessage as {message?: unknown}).message
+      : record.viewOnceMessage && typeof record.viewOnceMessage === 'object' ? (record.viewOnceMessage as {message?: unknown}).message
+        : record.viewOnceMessageV2 && typeof record.viewOnceMessageV2 === 'object' ? (record.viewOnceMessageV2 as {message?: unknown}).message : undefined;
+  }
+  return undefined;
 }
 
 /** Normalize supported text, binary media and provider-native events into truthful model context. */
@@ -18,6 +57,7 @@ export async function resolveWhatsAppInboundBody(
     describeImage?: (bytes: Buffer, mimeType: string, caption?: string) => Promise<string | null>;
     extractDocument?: (bytes: Buffer, mimeType: string, fileName?: string) => Promise<string | null>;
     persistMedia?: (media: InboundChannelMedia) => Promise<string | null>;
+    onMediaContext?: (context: WhatsAppMediaContext) => void;
     onFailure?: (kind: 'download_media' | 'persist_media' | 'transcribe' | 'describe_image' | 'extract_document', error: Error) => void;
   } = {},
 ): Promise<string | undefined> {
@@ -53,16 +93,25 @@ export async function resolveWhatsAppInboundBody(
   if (audio) {
     const mimeType = String(audio.mimetype ?? 'audio/ogg');
     const ref = await persist({ kind: 'voice', mimeType, filename: mediaFilename('voice-note', mimeType) });
+    let transcript: string | null = null;
+    let transcriptionStatus: 'complete' | 'failed' | 'unavailable' = 'unavailable';
     if (options.downloadMedia && options.transcribeAudio) {
       try {
         const bytes = await mediaBytes();
-        const transcript = bytes ? await options.transcribeAudio(bytes, mimeType) : null;
-        if (transcript?.trim()) return ['[Voice note transcript]', transcript.trim(), attachmentLine(ref)].filter(Boolean).join('\n');
+        const rawTranscript = bytes ? await options.transcribeAudio(bytes, mimeType) : null;
+        transcript = rawTranscript?.trim() || null;
+        if (transcript) transcriptionStatus = 'complete';
+        else transcriptionStatus = bytes ? 'failed' : 'unavailable';
       } catch (error) {
+        transcriptionStatus = 'failed';
         options.onFailure?.('transcribe', error instanceof Error ? error : new Error(String(error)));
       }
     }
-    return ['[Voice note received. Transcription is unavailable.]', attachmentLine(ref)].filter(Boolean).join('\n');
+    options.onMediaContext?.({kind: 'voice', originalArtifactRef: ref, mimeType,
+      transcription: {text: transcript, status: transcriptionStatus}});
+    return transcript
+      ? ['[Voice note transcript]', transcript, attachmentLine(ref)].filter(Boolean).join('\n')
+      : ['[Voice note received. Transcription is unavailable.]', attachmentLine(ref)].filter(Boolean).join('\n');
   }
 
   const image = unwrapImageMessage(content);
@@ -79,6 +128,8 @@ export async function resolveWhatsAppInboundBody(
         options.onFailure?.('describe_image', error instanceof Error ? error : new Error(String(error)));
       }
     }
+    options.onMediaContext?.({kind: 'image', originalArtifactRef: ref, mimeType, ...(caption ? {caption} : {}),
+      interpretation: {text: description?.trim() || null, status: description?.trim() ? 'complete' : options.describeImage ? 'failed' : 'unavailable'}});
     return [
       '[Image received]',
       ...(caption ? [`Caption: ${caption}`] : []),
@@ -104,6 +155,8 @@ export async function resolveWhatsAppInboundBody(
         options.onFailure?.('describe_image', error instanceof Error ? error : new Error(String(error)));
       }
     }
+    options.onMediaContext?.({kind: 'video', originalArtifactRef: ref, mimeType, ...(caption ? {caption} : {}),
+      interpretation: {text: previewDescription?.trim() || null, status: previewDescription?.trim() ? 'complete' : options.describeImage ? 'failed' : 'unavailable'}});
     return [
       gifPlayback ? '[Animated GIF received]' : '[Video received]',
       ...(caption ? [`Caption: ${caption}`] : []),
@@ -125,6 +178,7 @@ export async function resolveWhatsAppInboundBody(
         options.onFailure?.('describe_image', error instanceof Error ? error : new Error(String(error)));
       }
     }
+    options.onMediaContext?.({kind: 'sticker', originalArtifactRef: ref, mimeType, interpretation: {text: description?.trim() || null, status: description?.trim() ? 'complete' : options.describeImage ? 'failed' : 'unavailable'}});
     return ['[Sticker received]', attachmentLine(ref), ...(description?.trim() ? [`Visual analysis: ${description.trim()}`] : [])].filter(Boolean).join('\n');
   }
 
@@ -142,6 +196,8 @@ export async function resolveWhatsAppInboundBody(
         options.onFailure?.('extract_document', error instanceof Error ? error : new Error(String(error)));
       }
     }
+    options.onMediaContext?.({kind: 'file', originalArtifactRef: ref, mimeType, ...(caption ? {caption} : {}),
+      interpretation: {text: text?.trim() || null, status: text?.trim() ? 'complete' : options.extractDocument ? 'failed' : 'unavailable'}});
     return [
       `[Document received${fileName ? `: ${fileName}` : ''}]`,
       ...(caption ? [`Caption: ${caption}`] : []),
@@ -241,6 +297,10 @@ export function whatsappMediaContent(att: OutboundAttachment, caption?: string):
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export function whatsappNativeContent(native: OutboundNativeContent): any {
+  if (native.kind !== 'location' && native.kind !== 'contact') {
+    if (native.kind !== 'poll') throw new Error('This transport does not support Cloud interactive content or templates');
+    return { poll: { name: native.question, values: native.options, selectableCount: native.selectableCount ?? 1 } };
+  }
   if (native.kind === 'location') {
     return { location: { degreesLatitude: native.latitude, degreesLongitude: native.longitude, ...(native.name ? { name: native.name } : {}), ...(native.address ? { address: native.address } : {}) } };
   }
@@ -249,7 +309,7 @@ export function whatsappNativeContent(native: OutboundNativeContent): any {
     const vcard = native.vcard ?? ['BEGIN:VCARD', 'VERSION:3.0', `FN:${native.displayName}`, `TEL;TYPE=CELL:${digits}`, 'END:VCARD'].join('\n');
     return { contacts: { displayName: native.displayName, contacts: [{ displayName: native.displayName, vcard }] } };
   }
-  return { poll: { name: native.question, values: native.options, selectableCount: native.selectableCount ?? 1 } };
+  throw new Error('Unsupported native WhatsApp content');
 }
 
 export function observedWhatsAppChatJids(key: { remoteJid?: unknown; remoteJidAlt?: unknown }): string[] {

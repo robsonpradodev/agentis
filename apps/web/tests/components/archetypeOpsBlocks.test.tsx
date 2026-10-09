@@ -290,11 +290,11 @@ describe('RecordMaster', () => {
         titleField: 'name',
         sections: [{ title: 'Contact', fields: ['whatsapp_link'] }],
       },
-      [{ id: 'c1', name: 'Boutique Flor da Moda', whatsapp_link: 'https://wa.me/5567991632091' }],
+      [{ id: 'c1', name: 'Example Boutique', whatsapp_link: 'https://wa.me/15551234567' }],
     );
 
-    const link = await screen.findByRole('link', { name: /wa\.me\/5567991632091/i });
-    expect(link).toHaveAttribute('href', 'https://wa.me/5567991632091');
+    const link = await screen.findByRole('link', { name: /wa\.me\/15551234567/i });
+    expect(link).toHaveAttribute('href', 'https://wa.me/15551234567');
   });
 });
 

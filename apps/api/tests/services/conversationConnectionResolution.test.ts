@@ -23,7 +23,7 @@ describe('conversation connection resolution', () => {
     id: 'outreacher-whatsapp',
     status: 'active',
     kind: 'whatsapp',
-    agentId: 'bia-outreacher',
+    agentId: 'sample-outreacher',
     appId: null,
     isDefault: false,
   };
@@ -31,7 +31,7 @@ describe('conversation connection resolution', () => {
     id: 'attendant-whatsapp',
     status: 'active',
     kind: 'whatsapp',
-    agentId: 'bia-attendant',
+    agentId: 'sample-attendant',
     appId: null,
     isDefault: false,
   };
@@ -40,7 +40,7 @@ describe('conversation connection resolution', () => {
     const resolved = resolveConversationConnectionId(
       { kind: 'whatsapp' },
       depsWithConnections([outreacher, attendant]),
-      context({ agentId: 'bia-outreacher', appId: 'bia-outbound' }),
+      context({ agentId: 'sample-outreacher', appId: 'sample-outbound' }),
     );
 
     expect(resolved).toBe('outreacher-whatsapp');
@@ -51,7 +51,7 @@ describe('conversation connection resolution', () => {
       {},
       depsWithConnections([outreacher, attendant]),
       context({
-        agentId: 'bia-outreacher',
+        agentId: 'sample-outreacher',
         channelOrigin: {
           kind: 'whatsapp',
           connectionId: 'attendant-whatsapp',

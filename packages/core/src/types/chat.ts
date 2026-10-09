@@ -279,6 +279,16 @@ export type ChatDelta =
       createdAt: string;
     }
   | {
+      type: 'suspension';
+      suspensionId: string;
+      phase: 'waiting' | 'resolved' | 'cancelled' | 'expired' | 'failed';
+      conditionType?: string;
+      audienceType?: string;
+      summary: string;
+      status: 'running' | 'success' | 'error';
+      createdAt: string;
+    }
+  | {
       type: 'activity';
       id: string;
       label: string;
@@ -358,6 +368,8 @@ export interface ChatTurnContext {
   agentId: string;
   userId: string;
   conversationId: string;
+  /** Durable mission whose outcome this turn is advancing. */
+  missionId?: string;
   /**
    * When set, the turn runs in an Agentic App's context (Living Apps Phase 0):
    * datastore tools (`agentis.appData.*` / `data_insert`) resolve to this App, so
@@ -524,6 +536,8 @@ export interface AgentisToolContext {
   agentId?: string;
   runId?: string;
   conversationId?: string;
+  /** Durable mission whose outcome this tool call advances. */
+  missionId?: string;
   durableTurnId?: string;
   consultationId?: string;
   consultationDepth?: number;
@@ -606,6 +620,8 @@ export interface ChannelToolOrigin {
   chatId: string;
   /** Durable channel conversation whose ownership fences this tool-capable turn. */
   conversationId?: string;
+  /** Provider message id that started this turn, used as the default quote target. */
+  inboundMessageId?: string;
   durableTurnId?: string;
   consultationId?: string;
   consultationDepth?: number;

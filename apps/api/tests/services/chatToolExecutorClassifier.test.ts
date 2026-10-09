@@ -5,9 +5,14 @@
  * set), so they lock the classifier independently of the chat harness.
  */
 import { describe, it, expect } from 'vitest';
-import { ChatToolExecutor } from '../../src/services/chat/chatToolExecutor.js';
+import { ChatToolExecutor, canonicalAgentisToolName } from '../../src/services/chat/chatToolExecutor.js';
 
 describe('ChatToolExecutor.isHighImpact', () => {
+  it('normalizes model-native aliases before policy and execution', () => {
+    expect(canonicalAgentisToolName('image.generate')).toBe('agentis.media.generate');
+    expect(canonicalAgentisToolName('channel.send')).toBe('agentis.channel.send');
+    expect(ChatToolExecutor.isHighImpact('channel.send')).toBe(true);
+  });
   it('flags dynamic workflow + command tools by prefix', () => {
     expect(ChatToolExecutor.isHighImpact('workflow.abc123')).toBe(true);
     expect(ChatToolExecutor.isHighImpact('agentis.command.run')).toBe(true);

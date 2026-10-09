@@ -10,5 +10,5 @@ export * from './brainPort.js';
 export * from './appSurfaceStore.js';
 export * from './appInterfaceRevisionStore.js';
 export * from './appTestHarness.js';
-
+export * from './appDefinitionStore.js';
 

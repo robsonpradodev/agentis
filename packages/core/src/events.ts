@@ -30,6 +30,12 @@ export const REALTIME_EVENTS = {
   AGENT_WORK_STEP: 'agent.work.step',
   AGENT_WAKE_REQUESTED: 'agent.wake.requested',
   AGENT_PROACTIVE_PUSH: 'agent.proactive.push',
+
+  // Durable Agent Missions
+  MISSION_CREATED: 'mission.created',
+  MISSION_UPDATED: 'mission.updated',
+  MISSION_PROGRESS: 'mission.progress',
+  MISSION_SETTLED: 'mission.settled',
   
   HARNESS_IMPORT_UPDATES: 'harness.import.updates',
 
@@ -278,6 +284,7 @@ export const REALTIME_ROOMS = {
   run: (runId: string) => `run:${runId}`,
   gateway: (gatewayId: string) => `gateway:${gatewayId}`,
   agent: (agentId: string) => `agent:${agentId}`,
+  mission: (missionId: string) => `mission:${missionId}`,
   conversation: (agentId: string) => `conversation:${agentId}`,
   room: (roomId: string) => `room:${roomId}`,
 } as const;

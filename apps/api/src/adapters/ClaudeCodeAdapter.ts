@@ -504,12 +504,14 @@ export class ClaudeCodeAdapter implements AgentAdapter {
           messagesForRuntimeSession(messages, Boolean(storedSession)),
           tools,
           this.#mcpNative() && !callerOwnsToolLoop,
+          callerOwnsToolLoop,
         ),
         options?.inputAttachments,
       ),
       displayName: 'Claude Code',
       logTag: 'claude_code.chat',
       logger: this.opts.logger,
+      tools,
       signal: options?.signal,
       idleTimeoutMs,
       hardCeilingMs: chatHardCeilingMs(idleTimeoutMs, 'AGENTIS_CLAUDE_CHAT_HARD_CEILING_MS'),
@@ -868,13 +870,13 @@ function claudeToolActivity(b: Record<string, unknown>): Extract<ChatDelta, { ty
   return { type: 'activity', id, phase: 'tool', status: 'running', label: toolActivityLabel('Using', firstString(b.name, b.tool), input), startedAt: new Date().toISOString() };
 }
 
-function buildClaudeCodeChatPrompt(messages: ChatMessage[], tools: ToolDefinition[], mcpNative = false): string {
+function buildClaudeCodeChatPrompt(messages: ChatMessage[], tools: ToolDefinition[], mcpNative = false, callerManagedTools = false): string {
   // MCP-native: Claude Code mounts the `agentis` MCP server and calls those tools
   // in its own loop, so we drop the marker-protocol instructions and hand it the
   // conversation directly.
   const toolPreamble = mcpNative
     ? 'You have the Agentis platform tools available via the "agentis" MCP server (build workflows, run them, inspect the workspace, dispatch agents, etc.). Use them directly to fulfill the request, then reply with a concise final answer.'
-    : buildMarkerToolPrompt(tools);
+    : buildMarkerToolPrompt(tools, { nativeTools: !callerManagedTools });
   return [
     toolPreamble,
     '',

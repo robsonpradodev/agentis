@@ -89,6 +89,7 @@ export function clearDraft(key: string): void {
 
 interface Props {
   onSend: (text: string, options?: { useViewportContext?: boolean; attachments?: SendAttachment[] }) => Promise<void> | void;
+  onPermissionModeChange?: (mode: 'ask' | 'plan' | 'auto') => Promise<void> | void;
   awareness?: {
     label: string;
     active: boolean;
@@ -150,7 +151,7 @@ export interface SendAttachment {
   name: string;
 }
 
-export function Composer({ onSend, awareness, initialText, placeholder, footer, draftKey, agentId, isRunning = false, onStop }: Props) {
+export function Composer({ onSend, onPermissionModeChange, awareness, initialText, placeholder, footer, draftKey, agentId, isRunning = false, onStop }: Props) {
   const [isFocused, setIsFocused] = useState(false);
   const [text, setText] = useState<string>(() => {
     if (draftKey) {
@@ -497,6 +498,16 @@ export function Composer({ onSend, awareness, initialText, placeholder, footer, 
     setText(next);
     if (draftKey) writeDraft(draftKey, next);
     setActive(null);
+    if (active.trigger === '/' && onPermissionModeChange) {
+      const mode = s.insert === 'plan'
+        ? 'plan'
+        : s.insert === 'auto'
+          ? 'auto'
+          : s.insert === 'act'
+            ? 'ask'
+            : null;
+      if (mode) void onPermissionModeChange(mode);
+    }
     requestAnimationFrame(() => {
       ta.focus();
       const pos = tokenStart + 1 + s.insert.length + 1;

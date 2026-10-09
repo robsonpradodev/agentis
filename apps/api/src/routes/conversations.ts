@@ -145,6 +145,7 @@ type ConversationRouteDeps = {
   runtimeProfiles?: RuntimeProfileService;
   handoffs?: ConversationHandoffService;
   consultations?: AgentConsultationService;
+  suspensions?: import('../services/suspension/durableSuspensionService.js').DurableSuspensionService;
   turnChanges?: TurnChangeJournal;
   memoryCapture?: {
     captureImmediateCorrection?(args: {
@@ -225,6 +226,7 @@ export function buildConversationRoutes(deps: ConversationRouteDeps) {
       // reaches the active model loop even after the browser has disconnected.
       activeConversationTurns.get(turn.conversationId)?.abort(new Error('operator_cancel'));
       deps.consultations?.cancelByParentTurn(turn.workspaceId, turn.id);
+      await deps.suspensions?.cancelOrigin(turn.workspaceId, { type: 'conversation_turn', id: turn.id }, 'conversation turn cancelled');
       await ChatSessionExecutor.chatSwarms()?.stopForConversation(turn.workspaceId, turn.conversationId);
       deps.turnLeases?.revoke(turn.workspaceId, turn.conversationId);
       if (!deps.engine) return;
@@ -238,6 +240,9 @@ export function buildConversationRoutes(deps: ConversationRouteDeps) {
     onSettled: (turn) => { deps.turnChanges?.seal(turn.workspaceId, turn.id); },
   });
   deps.consultations?.bindParentTurnResume((turnId) => durableTurns.resumeAfterApproval(turnId));
+  deps.suspensions?.registerResumer('conversation_turn', {
+    resume: async (suspension) => durableTurns.resumeAfterApproval(suspension.origin.id),
+  });
 
   // Chat-native temporary-team recovery and controls. The state comes from the
   // same durable records that stream into the turn ledger, so refresh does not
@@ -614,6 +619,52 @@ export function buildConversationRoutes(deps: ConversationRouteDeps) {
     return c.json({ turn: serializeDurableTurn(turn, deps.turnChanges) });
   });
 
+  // A queued turn has not started provider work yet, so its operator text and
+  // compiled prompt can be safely replaced in place.
+  app.patch('/:agentId/turns/:turnId', async (c) => {
+    const ws = getWorkspace(c);
+    const turn = durableTurns.require(ws.workspaceId, c.req.param('turnId'));
+    if (turn.agentId !== c.req.param('agentId')) throw new AgentisError('RESOURCE_NOT_FOUND', 'conversation turn not found');
+    const body = editSchema.parse(await c.req.json());
+    if (turn.status !== 'queued') throw new AgentisError('VALIDATION_FAILED', 'Only queued turns can be edited.');
+    const conversation = deps.conversations.getById(ws.workspaceId, turn.conversationId);
+    const attachmentIds = Array.isArray(turn.attachments)
+      ? turn.attachments.filter((id): id is string => typeof id === 'string')
+      : [];
+    const compiled = await attachmentContext.compile({
+      workspaceId: ws.workspaceId,
+      body: body.text,
+      attachmentIds,
+      historyMessages: turn.messageId ? conversationHistoryForTurn(deps, turn.conversationId, turn.messageId).length : undefined,
+    });
+    const message = turn.messageId
+      ? deps.conversations.updateMessage({
+          workspaceId: ws.workspaceId,
+          conversationId: turn.conversationId,
+          messageId: turn.messageId,
+          body: body.text,
+        })
+      : null;
+    const updated = durableTurns.updateQueuedPrompt(ws.workspaceId, turn.id, compiled.prompt);
+    return c.json({ turn: serializeDurableTurn(updated, deps.turnChanges), message });
+  });
+
+  // "Send now" intentionally interrupts only the currently running turn in
+  // this conversation, then starts the selected queued turn ahead of the rest.
+  app.post('/:agentId/turns/:turnId/send-now', async (c) => {
+    const ws = getWorkspace(c);
+    const before = durableTurns.require(ws.workspaceId, c.req.param('turnId'));
+    if (before.agentId !== c.req.param('agentId')) throw new AgentisError('RESOURCE_NOT_FOUND', 'conversation turn not found');
+    if (before.status === 'queued') {
+      const running = durableTurns.listActive(ws.workspaceId, before.conversationId)
+        .filter((turn) => turn.id !== before.id && turn.status === 'running');
+      await Promise.all(running.map((turn) => durableTurns.cancel(ws.workspaceId, turn.id)));
+      queueMicrotask(() => void durableTurns.start(before.id));
+    }
+    const turn = durableTurns.require(ws.workspaceId, before.id);
+    return c.json({ turn: serializeDurableTurn(turn, deps.turnChanges) });
+  });
+
   app.get('/:agentId/turns/:turnId/changes', (c) => {
     const ws = getWorkspace(c);
     const turn = durableTurns.require(ws.workspaceId, c.req.param('turnId'));
@@ -762,6 +813,52 @@ export function buildConversationRoutes(deps: ConversationRouteDeps) {
       workspaceId: ws.workspaceId,
       conversationId: conversation.id,
       queueId,
+    });
+    return c.json({ ok: true, item: serializeQueueItem(item) });
+  });
+
+  app.patch('/:agentId/queue/:queueId', async (c) => {
+    const ws = getWorkspace(c);
+    const agentId = c.req.param('agentId');
+    const agent = deps.db.select().from(schema.agents).where(eq(schema.agents.id, agentId)).get();
+    if (!agent || agent.workspaceId !== ws.workspaceId) throw new AgentisError('RESOURCE_NOT_FOUND', 'agent not found');
+    const body = editSchema.parse(await c.req.json());
+    const conversationId = c.req.query('conversationId') || null;
+    const conversation = conversationId
+      ? deps.conversations.getById(ws.workspaceId, conversationId)
+      : deps.conversations.getOrCreateByAgent({
+          workspaceId: ws.workspaceId,
+          ambientId: ws.ambientId,
+          userId: ws.user.id,
+          agentId,
+        });
+    const item = deps.conversations.updateQueuedMessage({
+      workspaceId: ws.workspaceId,
+      conversationId: conversation.id,
+      queueId: c.req.param('queueId'),
+      text: body.text,
+    });
+    return c.json({ ok: true, item: serializeQueueItem(item) });
+  });
+
+  app.post('/:agentId/queue/:queueId/promote', (c) => {
+    const ws = getWorkspace(c);
+    const agentId = c.req.param('agentId');
+    const agent = deps.db.select().from(schema.agents).where(eq(schema.agents.id, agentId)).get();
+    if (!agent || agent.workspaceId !== ws.workspaceId) throw new AgentisError('RESOURCE_NOT_FOUND', 'agent not found');
+    const conversationId = c.req.query('conversationId') || null;
+    const conversation = conversationId
+      ? deps.conversations.getById(ws.workspaceId, conversationId)
+      : deps.conversations.getOrCreateByAgent({
+          workspaceId: ws.workspaceId,
+          ambientId: ws.ambientId,
+          userId: ws.user.id,
+          agentId,
+        });
+    const item = deps.conversations.promoteQueuedMessage({
+      workspaceId: ws.workspaceId,
+      conversationId: conversation.id,
+      queueId: c.req.param('queueId'),
     });
     return c.json({ ok: true, item: serializeQueueItem(item) });
   });
@@ -1305,6 +1402,7 @@ async function executeDurableConversationTurn(
           const delta = JSON.parse(event.data) as ChatDelta;
           if (delta.type === 'confirmation_required') awaitingApproval = true;
           if (delta.type === 'agent_consultation' && delta.phase === 'awaiting_approval') awaitingApproval = true;
+          if (delta.type === 'suspension' && delta.phase === 'waiting') awaitingApproval = true;
           if (delta.type === 'done') finishReason = delta.finishReason;
         } catch { /* persisted transport still receives the original event */ }
       } else if (event.event === 'done') {
@@ -1353,6 +1451,9 @@ async function executeDurableConversationTurn(
       deps.conversations.dispatchNextQueued({ workspaceId: turn.workspaceId, conversationId: turn.conversationId });
     }
   }
+  if (deps.suspensions?.waitingForOrigin(turn.workspaceId, { type: 'conversation_turn', id: turn.id })) {
+    awaitingApproval = true;
+  }
   if (awaitingApproval) {
     if (turn.planId && deps.plans) deps.plans.setStatus(turn.workspaceId, turn.userId, turn.planId, 'blocked');
     return { status: 'awaiting_approval' as const };
@@ -1360,7 +1461,7 @@ async function executeDurableConversationTurn(
   const terminalReason = finishReason as ChatFinishReason;
   if (controller.signal.aborted || terminalReason === 'interrupted') return { status: 'interrupted' as const };
   if (sawError || terminalReason === 'error') {
-    const blocked = /\b(?:capacity|overloaded|rate.?limit|quota|credits?|billing|payment required|temporarily unavailable|try again|no healthy runtime)\b/i.test(runtimeError || finalMessageText);
+    const blocked = /\b(?:capacity|overloaded|rate.?limit|quota|credits?|billing|payment required|temporarily unavailable|no healthy runtime)\b/i.test(runtimeError || finalMessageText);
     if (turn.planId && deps.plans) deps.plans.setStatus(turn.workspaceId, turn.userId, turn.planId, blocked ? 'blocked' : 'failed');
     return {
       status: blocked ? 'blocked' as const : 'failed' as const,
@@ -1714,6 +1815,9 @@ async function runConversationTurn(
           if (delta.type === 'agent_consultation' && delta.phase === 'awaiting_approval') {
             consultationAwaitingApproval = true;
           }
+          if (delta.type === 'suspension' && delta.phase === 'waiting') {
+            consultationAwaitingApproval = true;
+          }
           await writeChatDelta(stream, deps, ws, args.agentId, args.conversation.id, args.clientTurnId, delta, streamedMetadata);
           if (delta.type === 'text') finalText += delta.delta;
         }
@@ -1756,6 +1860,17 @@ async function runConversationTurn(
     // failed answer while the request is unwinding.
     operatorStopped ||= args.turnSignal.aborted || hardStoppedConversations.has(args.conversation.id);
     if (operatorStopped) finishReason = 'max_turns';
+
+    // Adapter-native MCP calls may not emit a suspension delta. The broker's
+    // persisted state is the authority: a parked turn may publish only its safe
+    // receipt as the durable assistant message, never a post-suspension claim.
+    const durableSuspension = args.durableTurnId
+      ? deps.suspensions?.waitingForOrigin(ws.workspaceId, { type: 'conversation_turn', id: args.durableTurnId })
+      : null;
+    if (durableSuspension) {
+      finalText = durableSuspension.publicReceipt
+        || 'I am waiting for an external condition and will continue automatically when it is resolved.';
+    }
 
     if (!finalText.trim() && !streamedMetadata.confirmation && !consultationAwaitingApproval) {
       if (finishReason === 'interrupted' || operatorStopped) {

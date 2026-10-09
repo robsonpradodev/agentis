@@ -41,6 +41,11 @@ const createSchema = z
     mode: z.enum(['qr_local', 'cloud']).optional(),
     signingSecret: z.string().min(8).max(4096).optional(),
     phoneNumberId: z.string().min(1).max(120).optional(),
+    whatsappBusinessAccountId: z.string().min(1).max(120).optional(),
+    graphApiVersion: z
+      .string()
+      .regex(/^v\d{1,2}\.0$/u)
+      .optional(),
     appSecret: z.string().min(8).max(4096).optional(),
     verifyToken: z.string().min(4).max(512).optional(),
     runInitialTest: z.boolean().optional(),
@@ -49,14 +54,23 @@ const createSchema = z
     transport: z.enum(['polling', 'webhook', 'gateway']).optional(),
     ambientId: z.string().nullish(),
   })
-  .refine((v) => (v.kind === 'whatsapp' && v.mode !== 'cloud') || v.kind === 'voice' || Boolean(v.token), {
-    message: 'token is required for this channel kind',
-    path: ['token'],
-  })
-  .refine((v) => v.kind !== 'whatsapp' || v.mode !== 'cloud' || Boolean(v.phoneNumberId && v.appSecret && v.verifyToken), {
-    message: 'WhatsApp Cloud requires phoneNumberId, appSecret, and verifyToken',
-    path: ['mode'],
-  });
+  .refine(
+    (v) => (v.kind === 'whatsapp' && v.mode !== 'cloud') || v.kind === 'voice' || Boolean(v.token),
+    {
+      message: 'token is required for this channel kind',
+      path: ['token'],
+    },
+  )
+  .refine(
+    (v) =>
+      v.kind !== 'whatsapp' ||
+      v.mode !== 'cloud' ||
+      Boolean(v.phoneNumberId && v.appSecret && v.verifyToken),
+    {
+      message: 'WhatsApp Cloud requires phoneNumberId, appSecret, and verifyToken',
+      path: ['mode'],
+    },
+  );
 
 const linkSchema = z.object({
   connectionId: z.string().min(1).nullish(),
@@ -78,7 +92,10 @@ const defaultSchema = z.object({ default: z.boolean().optional() });
 const behaviorSchema = z.object({
   persona: z.enum(['instant', 'human', 'warm']).optional(),
   rateLimit: z
-    .object({ perMinute: z.number().nullable().optional(), perDay: z.number().nullable().optional() })
+    .object({
+      perMinute: z.number().nullable().optional(),
+      perDay: z.number().nullable().optional(),
+    })
     .nullable()
     .optional(),
   requireOptIn: z.boolean().optional(),
@@ -87,6 +104,7 @@ const behaviorSchema = z.object({
   manualOutboundTakeover: z.enum(['until_handback', 'off']).optional(),
   ownerManualOutboundTakeover: z.enum(['until_handback', 'off']).optional(),
   historyReconciliation: z.enum(['recent', 'off']).optional(),
+  inboundReadReceipts: z.enum(['automatic', 'manual', 'off']).optional(),
 });
 
 const authoritySchema = z.object({
@@ -109,7 +127,14 @@ const operatorSendSchema = z.object({
   to: z.string().optional(),
   body: z.string().optional(),
   attachments: z.array(sendAttachmentSchema).optional(),
-  messages: z.array(z.object({ body: z.string().optional(), attachments: z.array(sendAttachmentSchema).optional() })).optional(),
+  messages: z
+    .array(
+      z.object({
+        body: z.string().optional(),
+        attachments: z.array(sendAttachmentSchema).optional(),
+      }),
+    )
+    .optional(),
 });
 
 const grantSchema = z.object({
@@ -146,9 +171,12 @@ const targetSchema = z.object({
   defaultChatId: z.string().min(1).max(120).nullable().optional(),
   ownerChatId: z.string().min(1).max(120).nullable().optional(),
   ownerName: z.string().min(1).max(120).nullable().optional(),
-  targetAliases: z.record(z.string().min(1).max(80), z.string().min(1).max(120).nullable()).optional(),
+  targetAliases: z
+    .record(z.string().min(1).max(80), z.string().min(1).max(120).nullable())
+    .optional(),
   access: accessSchema,
 });
+const markReadSchema = z.object({ providerMessageId: z.string().min(1).max(512) });
 
 const actionCreateSchema = z.object({
   agentId: z.string().min(1),
@@ -194,7 +222,8 @@ export function buildChannelRoutes(deps: {
 
   app.post('/identities/link', async (c) => {
     const ws = getWorkspace(c);
-    if (!deps.identity) throw new AgentisError('RESOURCE_NOT_FOUND', 'identity service not available');
+    if (!deps.identity)
+      throw new AgentisError('RESOURCE_NOT_FOUND', 'identity service not available');
     const body = linkSchema.parse(await c.req.json());
     const linked = deps.identity.link({
       workspaceId: ws.workspaceId,
@@ -209,7 +238,8 @@ export function buildChannelRoutes(deps: {
 
   app.post('/identities/authority', async (c) => {
     const ws = getWorkspace(c);
-    if (!deps.identity) throw new AgentisError('RESOURCE_NOT_FOUND', 'identity service not available');
+    if (!deps.identity)
+      throw new AgentisError('RESOURCE_NOT_FOUND', 'identity service not available');
     const body = authoritySchema.parse(await c.req.json());
     deps.bridge.get(ws.workspaceId, body.connectionId);
     const identity = deps.identity.grantAuthority({
@@ -227,15 +257,20 @@ export function buildChannelRoutes(deps: {
 
   app.delete('/identities/:identityId/authority', (c) => {
     const ws = getWorkspace(c);
-    if (!deps.identity) throw new AgentisError('RESOURCE_NOT_FOUND', 'identity service not available');
-    const identity = deps.identity.revokeAuthority({ workspaceId: ws.workspaceId, identityId: c.req.param('identityId') });
+    if (!deps.identity)
+      throw new AgentisError('RESOURCE_NOT_FOUND', 'identity service not available');
+    const identity = deps.identity.revokeAuthority({
+      workspaceId: ws.workspaceId,
+      identityId: c.req.param('identityId'),
+    });
     if (!identity) throw new AgentisError('RESOURCE_NOT_FOUND', 'peer identity not found');
     return c.json({ identity });
   });
 
   app.post('/identities/block', async (c) => {
     const ws = getWorkspace(c);
-    if (!deps.identity) throw new AgentisError('RESOURCE_NOT_FOUND', 'identity service not available');
+    if (!deps.identity)
+      throw new AgentisError('RESOURCE_NOT_FOUND', 'identity service not available');
     const body = blockSchema.parse(await c.req.json());
     const identity = deps.identity.setBlocked({
       workspaceId: ws.workspaceId,
@@ -251,14 +286,16 @@ export function buildChannelRoutes(deps: {
     const ws = getWorkspace(c);
     if (!deps.inbox) throw new AgentisError('RESOURCE_NOT_FOUND', 'channel inbox is not available');
     const limit = Number(c.req.query('limit') ?? 20);
-    return c.json(deps.inbox.list({
-      workspaceId: ws.workspaceId,
-      connectionId: c.req.query('connectionId') ?? null,
-      query: c.req.query('query') ?? null,
-      excludeOwner: c.req.query('includeOwner') !== 'true',
-      limit: Number.isFinite(limit) ? limit : 20,
-      cursor: c.req.query('cursor') ?? null,
-    }));
+    return c.json(
+      deps.inbox.list({
+        workspaceId: ws.workspaceId,
+        connectionId: c.req.query('connectionId') ?? null,
+        query: c.req.query('query') ?? null,
+        excludeOwner: c.req.query('includeOwner') !== 'true',
+        limit: Number.isFinite(limit) ? limit : 20,
+        cursor: c.req.query('cursor') ?? null,
+      }),
+    );
   });
 
   app.get('/inbox/resolve', (c) => {
@@ -283,22 +320,29 @@ export function buildChannelRoutes(deps: {
     const peer = deps.inbox.get(ws.workspaceId, ref);
     if (!peer) throw new AgentisError('RESOURCE_NOT_FOUND', 'channel recipient not found');
     const limit = Number(c.req.query('limit') ?? 30);
-    return c.json({ peer, messages: deps.inbox.history(ws.workspaceId, ref, Number.isFinite(limit) ? limit : 30) });
+    return c.json({
+      peer,
+      messages: deps.inbox.history(ws.workspaceId, ref, Number.isFinite(limit) ? limit : 30),
+    });
   });
 
   app.get('/actions', (c) => {
     const ws = getWorkspace(c);
-    if (!deps.actions) throw new AgentisError('RESOURCE_NOT_FOUND', 'channel action engine is not available');
-    return c.json({ actions: deps.actions.list(ws.workspaceId, {
-      ...(c.req.query('connectionId') ? { connectionId: c.req.query('connectionId') } : {}),
-      ...(c.req.query('status') ? { status: c.req.query('status') as never } : {}),
-      limit: Number(c.req.query('limit') ?? 30),
-    }) });
+    if (!deps.actions)
+      throw new AgentisError('RESOURCE_NOT_FOUND', 'channel action engine is not available');
+    return c.json({
+      actions: deps.actions.list(ws.workspaceId, {
+        ...(c.req.query('connectionId') ? { connectionId: c.req.query('connectionId') } : {}),
+        ...(c.req.query('status') ? { status: c.req.query('status') as never } : {}),
+        limit: Number(c.req.query('limit') ?? 30),
+      }),
+    });
   });
 
   app.post('/actions', async (c) => {
     const ws = getWorkspace(c);
-    if (!deps.actions) throw new AgentisError('RESOURCE_NOT_FOUND', 'channel action engine is not available');
+    if (!deps.actions)
+      throw new AgentisError('RESOURCE_NOT_FOUND', 'channel action engine is not available');
     const body = actionCreateSchema.parse(await c.req.json());
     const result = await deps.actions.createAndExecute({
       workspaceId: ws.workspaceId,
@@ -323,9 +367,16 @@ export function buildChannelRoutes(deps: {
 
   app.post('/actions/:actionId/cancel', async (c) => {
     const ws = getWorkspace(c);
-    if (!deps.actions) throw new AgentisError('RESOURCE_NOT_FOUND', 'channel action engine is not available');
-    const payload = await c.req.json().catch(() => ({})) as { reason?: unknown };
-    return c.json({ action: deps.actions.cancel(ws.workspaceId, c.req.param('actionId'), typeof payload.reason === 'string' ? payload.reason : 'cancelled by operator') });
+    if (!deps.actions)
+      throw new AgentisError('RESOURCE_NOT_FOUND', 'channel action engine is not available');
+    const payload = (await c.req.json().catch(() => ({}))) as { reason?: unknown };
+    return c.json({
+      action: deps.actions.cancel(
+        ws.workspaceId,
+        c.req.param('actionId'),
+        typeof payload.reason === 'string' ? payload.reason : 'cancelled by operator',
+      ),
+    });
   });
 
   app.post('/', async (c) => {
@@ -348,15 +399,21 @@ export function buildChannelRoutes(deps: {
     if (body.mode) input.mode = body.mode;
     if (body.signingSecret) input.signingSecret = body.signingSecret;
     if (body.phoneNumberId) input.phoneNumberId = body.phoneNumberId;
+    if (body.whatsappBusinessAccountId)
+      input.whatsappBusinessAccountId = body.whatsappBusinessAccountId;
+    if (body.graphApiVersion) input.graphApiVersion = body.graphApiVersion;
     if (body.appSecret) input.appSecret = body.appSecret;
     if (body.verifyToken) input.verifyToken = body.verifyToken;
     const { connection, webhookSecret } = deps.bridge.create(input);
-    const shouldRunInitialTest = body.runInitialTest ?? !(body.kind === 'whatsapp' && body.mode !== 'cloud');
+    const shouldRunInitialTest =
+      body.runInitialTest ?? !(body.kind === 'whatsapp' && body.mode !== 'cloud');
     const health = shouldRunInitialTest
       ? await deps.bridge.test({
           workspaceId: ws.workspaceId,
           id: connection.id,
-          ...(body.defaultChatId || body.defaultRecipient ? { chatId: body.defaultChatId ?? body.defaultRecipient } : {}),
+          ...(body.defaultChatId || body.defaultRecipient
+            ? { chatId: body.defaultChatId ?? body.defaultRecipient }
+            : {}),
         })
       : deps.bridge.health(ws.workspaceId, connection.id);
     const refreshed = deps.bridge.get(ws.workspaceId, connection.id);
@@ -368,7 +425,12 @@ export function buildChannelRoutes(deps: {
         // WhatsApp links via QR (POST /:id/login); the others ingest via webhook.
         ...(refreshed.kind === 'whatsapp' && refreshed.mode !== 'cloud'
           ? { loginUrl: `/v1/channels/${connection.id}/login` }
-          : { webhookUrl: `/v1/webhooks/channel/${connection.id}` }),
+          : {
+              webhookUrl:
+                refreshed.kind === 'whatsapp' && refreshed.mode === 'cloud'
+                  ? '/v1/webhooks/whatsapp'
+                  : `/v1/webhooks/channel/${connection.id}`,
+            }),
       },
       201,
     );
@@ -386,10 +448,16 @@ export function buildChannelRoutes(deps: {
     const ws = getWorkspace(c);
     const conn = deps.bridge.get(ws.workspaceId, c.req.param('id')); // 404s if missing
     if (conn.kind !== 'whatsapp') {
-      throw new AgentisError('VALIDATION_FAILED', `channel kind '${conn.kind}' does not use QR login`);
+      throw new AgentisError(
+        'VALIDATION_FAILED',
+        `channel kind '${conn.kind}' does not use QR login`,
+      );
     }
     if (!deps.supervisor) {
-      throw new AgentisError('CHANNEL_KIND_UNAVAILABLE', 'WhatsApp transport is not available on this server');
+      throw new AgentisError(
+        'CHANNEL_KIND_UNAVAILABLE',
+        'WhatsApp transport is not available on this server',
+      );
     }
     const state = await deps.supervisor.startLogin(conn.id);
     return c.json({ connectionId: conn.id, ...state });
@@ -399,10 +467,16 @@ export function buildChannelRoutes(deps: {
     const ws = getWorkspace(c);
     const conn = deps.bridge.get(ws.workspaceId, c.req.param('id')); // 404s if missing
     if (conn.kind !== 'whatsapp') {
-      throw new AgentisError('VALIDATION_FAILED', `channel kind '${conn.kind}' does not use QR login`);
+      throw new AgentisError(
+        'VALIDATION_FAILED',
+        `channel kind '${conn.kind}' does not use QR login`,
+      );
     }
     if (!deps.supervisor) {
-      throw new AgentisError('CHANNEL_KIND_UNAVAILABLE', 'WhatsApp transport is not available on this server');
+      throw new AgentisError(
+        'CHANNEL_KIND_UNAVAILABLE',
+        'WhatsApp transport is not available on this server',
+      );
     }
     return c.json({ connectionId: conn.id, ...deps.supervisor.loginState(conn.id) });
   });
@@ -438,7 +512,11 @@ export function buildChannelRoutes(deps: {
   app.post('/:id/default', async (c) => {
     const ws = getWorkspace(c);
     const body = defaultSchema.parse(await c.req.json().catch(() => ({})));
-    const connection = deps.bridge.setDefault(ws.workspaceId, c.req.param('id'), body.default ?? true);
+    const connection = deps.bridge.setDefault(
+      ws.workspaceId,
+      c.req.param('id'),
+      body.default ?? true,
+    );
     return c.json({ connection });
   });
 
@@ -457,7 +535,11 @@ export function buildChannelRoutes(deps: {
 
   app.post('/:id/grants', async (c) => {
     const ws = getWorkspace(c);
-    if (!deps.connectionGrants) throw new AgentisError('CONNECTION_GRANTS_UNAVAILABLE', 'connection grant service not configured');
+    if (!deps.connectionGrants)
+      throw new AgentisError(
+        'CONNECTION_GRANTS_UNAVAILABLE',
+        'connection grant service not configured',
+      );
     const id = c.req.param('id');
     deps.bridge.get(ws.workspaceId, id); // 404s if missing
     const body = grantSchema.parse(await c.req.json());
@@ -475,7 +557,11 @@ export function buildChannelRoutes(deps: {
 
   app.delete('/:id/grants/:grantId', (c) => {
     const ws = getWorkspace(c);
-    if (!deps.connectionGrants) throw new AgentisError('CONNECTION_GRANTS_UNAVAILABLE', 'connection grant service not configured');
+    if (!deps.connectionGrants)
+      throw new AgentisError(
+        'CONNECTION_GRANTS_UNAVAILABLE',
+        'connection grant service not configured',
+      );
     deps.connectionGrants.revoke(ws.workspaceId, c.req.param('grantId'));
     return c.json({ ok: true });
   });
@@ -487,6 +573,24 @@ export function buildChannelRoutes(deps: {
     return c.json({ connection, health: deps.bridge.health(ws.workspaceId, id) });
   });
 
+  app.get('/:id/templates', async (c) => {
+    const ws = getWorkspace(c);
+    deps.bridge.get(ws.workspaceId, c.req.param('id'));
+    return c.json(await deps.bridge.listWhatsAppCloudTemplates(ws.workspaceId, c.req.param('id')));
+  });
+
+  app.post('/:id/read', async (c) => {
+    const ws = getWorkspace(c);
+    const body = markReadSchema.parse(await c.req.json());
+    return c.json(
+      await deps.bridge.markWhatsAppCloudMessageRead(
+        ws.workspaceId,
+        c.req.param('id'),
+        body.providerMessageId,
+      ),
+    );
+  });
+
   // What this channel can send (media kinds, reactions, presence, …) — drives
   // the cockpit composer affordances and lets clients degrade gracefully.
   app.get('/:id/capabilities', (c) => {
@@ -494,7 +598,8 @@ export function buildChannelRoutes(deps: {
     const id = c.req.param('id');
     deps.bridge.get(ws.workspaceId, id); // 404s if missing
     const capabilities = deps.bridge.capabilitiesFor(id);
-    if (!capabilities) throw new AgentisError('RESOURCE_NOT_FOUND', `channel connection ${id} not found`);
+    if (!capabilities)
+      throw new AgentisError('RESOURCE_NOT_FOUND', `channel connection ${id} not found`);
     return c.json({ capabilities });
   });
 
@@ -514,7 +619,10 @@ export function buildChannelRoutes(deps: {
     deps.bridge.get(ws.workspaceId, id); // 404s if missing
     const body = operatorSendSchema.parse(await c.req.json());
     const result = await resolveAndSend(
-      { channels: deps.bridge, ...(deps.connectionGrants ? { connectionGrants: deps.connectionGrants } : {}) },
+      {
+        channels: deps.bridge,
+        ...(deps.connectionGrants ? { connectionGrants: deps.connectionGrants } : {}),
+      },
       {
         workspaceId: ws.workspaceId,
         connectionId: id,
@@ -536,7 +644,10 @@ export function buildChannelRoutes(deps: {
     const conn = deps.bridge.get(ws.workspaceId, id); // 404s if missing
     return c.json({
       connection: conn,
-      webhookUrl: `/v1/webhooks/channel/${id}`,
+      webhookUrl:
+        conn.kind === 'whatsapp' && conn.mode === 'cloud'
+          ? '/v1/webhooks/whatsapp'
+          : `/v1/webhooks/channel/${id}`,
     });
   });
 

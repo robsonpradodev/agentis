@@ -26,6 +26,7 @@ import { requireWorkspace, getWorkspace } from '../middleware/workspace.js';
 import { failedNodeCount, firstFailedNodeId, isFailedNodeId } from '../services/run/runStateFailures.js';
 import type { ColdArchiveStore } from '../services/storage/coldArchiveStore.js';
 import { normalizeRunOutcomeStatus } from '../services/workflow/runOutcome.js';
+import type { AgentMissionService } from '../services/agentMissions.js';
 
 export function buildRunRoutes(deps: {
   db: AgentisSqliteDb;
@@ -35,6 +36,7 @@ export function buildRunRoutes(deps: {
   scratchpad: ScratchpadService;
   bus: EventBus;
   archiveStore?: ColdArchiveStore;
+  missions?: AgentMissionService;
 }) {
   const app = new Hono();
   app.use('*', requireAuth(deps), requireWorkspace(deps));
@@ -146,7 +148,8 @@ export function buildRunRoutes(deps: {
     const hydrated = deps.archiveStore
       ? { ...run, runState: deps.archiveStore.hydrateRunState(run.runState) as object }
       : run;
-    return c.json({ run: presentRunDetail(hydrated, workflow ?? null, agentsById, tokenUsage) });
+    const mission = run.missionId && deps.missions ? deps.missions.inspect(ws.workspaceId, run.missionId) : null;
+    return c.json({ run: { ...presentRunDetail(hydrated, workflow ?? null, agentsById, tokenUsage), mission } });
   });
 
   app.post('/:id/cancel', async (c) => {

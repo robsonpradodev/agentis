@@ -5,7 +5,7 @@ import { AgentisError, REALTIME_EVENTS, REALTIME_ROOMS } from '@agentis/core';
 import type { EventBus } from '../../event-bus.js';
 import { normalizeHandle } from './channelAccess.js';
 
-export type ConversationHandoffSource = 'explicit' | 'provider_observed';
+export type ConversationHandoffSource = 'explicit' | 'provider_observed' | 'runtime_failure';
 
 export interface ConversationHandoffSnapshot {
   conversationId: string;
@@ -138,7 +138,9 @@ export class ConversationHandoffService {
       workspaceId: row.workspaceId,
       agentId: row.agentId,
       state: row.handoffState === 'human' ? 'human' : 'agent',
-      source: row.handoffSource === 'explicit' || row.handoffSource === 'provider_observed' ? row.handoffSource : null,
+      source: row.handoffSource === 'explicit' || row.handoffSource === 'provider_observed' || row.handoffSource === 'runtime_failure'
+        ? row.handoffSource
+        : null,
       claimedAt: row.handoffClaimedAt ?? null,
       automationEpoch: row.automationEpoch ?? 0,
       connectionId: row.channelConnectionId ?? null,

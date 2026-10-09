@@ -1,4 +1,6 @@
 ﻿import { useState } from 'react';
+import { useLayoutEffect, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import clsx from 'clsx';
 import { Check, ChevronDown, Plus, Settings as SettingsIcon } from 'lucide-react';
 
@@ -69,6 +71,8 @@ export function DomainToolbar<TDomain extends DomainToolbarDomain>({
   embedded = false,
 }: DomainToolbarProps<TDomain>) {
   const [open, setOpen] = useState(false);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const [menuPosition, setMenuPosition] = useState<{ top: number; left: number } | null>(null);
   // Nested rows: each top-level Domain followed by its indented Subdomains.
   const rows: DomainRow[] = [
     { kind: 'select', key: 'all', indent: 0, value: 'all', label: allLabel, count: totalCount },
@@ -89,11 +93,38 @@ export function DomainToolbar<TDomain extends DomainToolbarDomain>({
   };
   const isActive = selected !== 'all';
 
+  useLayoutEffect(() => {
+    if (!open) {
+      setMenuPosition(null);
+      return undefined;
+    }
+
+    const updateMenuPosition = () => {
+      const trigger = triggerRef.current;
+      if (!trigger) return;
+      const rect = trigger.getBoundingClientRect();
+      const width = 256;
+      setMenuPosition({
+        top: rect.bottom + 6,
+        left: Math.max(12, Math.min(rect.left, window.innerWidth - width - 12)),
+      });
+    };
+
+    updateMenuPosition();
+    window.addEventListener('resize', updateMenuPosition);
+    window.addEventListener('scroll', updateMenuPosition, true);
+    return () => {
+      window.removeEventListener('resize', updateMenuPosition);
+      window.removeEventListener('scroll', updateMenuPosition, true);
+    };
+  }, [open]);
+
   return (
     <div className={clsx('flex items-center', !embedded && 'gap-1.5')}>
       <div className="relative inline-block">
         <button
           type="button"
+          ref={triggerRef}
           onClick={() => setOpen((value) => !value)}
           className={clsx(
             'inline-flex items-center gap-1.5 text-[12px] font-medium transition-colors select-none',
@@ -108,10 +139,13 @@ export function DomainToolbar<TDomain extends DomainToolbarDomain>({
           <span className="rounded-full bg-surface-3 px-1.5 py-0.5 text-[9px] font-medium text-text-muted">{current.count}</span>
           <ChevronDown size={11} className={clsx('transition-transform text-text-muted', open && 'rotate-180')} />
         </button>
-        {open && (
+        {open && menuPosition && createPortal(
           <>
-            <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} />
-            <div className="absolute left-0 top-full z-50 mt-1.5 w-64 origin-top-left rounded-card border border-line bg-surface shadow-modal animate-in fade-in slide-in-from-top-1 duration-150">
+            <div className="fixed inset-0 z-[1000]" onClick={() => setOpen(false)} />
+            <div
+              className="fixed z-[1001] w-64 origin-top-left rounded-card border border-line bg-surface shadow-modal animate-in fade-in slide-in-from-top-1 duration-150"
+              style={{ top: menuPosition.top, left: menuPosition.left }}
+            >
               <div className="max-h-[280px] overflow-y-auto py-1">
                 {rows.map((row) => {
                   if (row.kind === 'add-sub') {
@@ -162,7 +196,8 @@ export function DomainToolbar<TDomain extends DomainToolbarDomain>({
                 </button>
               )}
             </div>
-          </>
+          </>,
+          document.body,
         )}
       </div>
       {selectedDomain && onEdit && (

@@ -1,5 +1,5 @@
 ﻿import { useEffect, useMemo, useRef, useState } from 'react';
-import { AlertTriangle, Check, Clock3, Copy, FileText, Loader2, Pencil, Plug, Redo2, ShieldCheck, Undo2, X } from 'lucide-react';
+import { AlertTriangle, Check, Clock3, Copy, FileText, Loader2, Pencil, Plug, Redo2, Send, ShieldCheck, Undo2, X } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import clsx from 'clsx';
 import { initialTurnActivityLabel, normalizeAgentPlanText, normalizeToolInvocation, parseChatPermissionDirective, REALTIME_EVENTS, type ChatCommentary, type ChatContextManifest, type ChatDelta, type ChatExecutionEnvelope, type ChatPermissionMode, type ChatPlan, type ChatSwarm, type ChatTurnTrace, type TurnChangeActionResult, type TurnChangeConflict, type TurnChangeSummary, type ViewportContext } from '@agentis/core';
@@ -100,6 +100,7 @@ interface MessageMeta {
   /** Server-confirmed ordering for a turn that has not begun provider work. */
   queued?: boolean;
   queuePosition?: number;
+  queueCancelled?: boolean;
   /** Concrete runtime failure preserved even when partial work already exists. */
   failureMessage?: string;
   /** Durable, redacted Undo/Redo state owned by this assistant turn. */
@@ -398,14 +399,13 @@ function normalizeInteractionMessage(event: InteractionEvent): ChatMessage {
   };
 }
 
-function blockedTurnNotice(error?: string | null): { title: string; body: string; action: string } {
+export function blockedTurnNotice(error?: string | null): { title: string; body: string; action: string } | null {
   const message = error?.trim() ?? '';
   if (/acceptance verification|completion.*verification|blocked by verification/i.test(message)) {
-    return {
-      title: 'Verification incomplete',
-      body: 'The agent produced its result, but Agentis could not prove every completion check. Nothing is still running.',
-      action: 'Verify remaining',
-    };
+    // Verification is execution metadata, not a user action. The result and its
+    // evidence remain inspectable in the turn timeline; never nag the person
+    // with an internal bookkeeping card after the agent has answered.
+    return null;
   }
   if (/capacity|overloaded|rate.?limit|quota|credits?|billing|payment required|temporarily unavailable|no healthy runtime/i.test(message)) {
     return {
@@ -1111,13 +1111,17 @@ export function ThreadView({
       agentId?: string;
       conversationId?: string | null;
       item?: QueuedItem;
-      action?: 'added' | 'dispatched' | 'discarded';
+      action?: 'added' | 'updated' | 'promoted' | 'dispatched' | 'discarded';
     };
     if (payload.agentId !== id || !payload.item) return;
     const expectedConversationId = loadedConversationId ?? conversationId ?? null;
     if (!payload.conversationId || !expectedConversationId || payload.conversationId !== expectedConversationId) return;
     if (payload.action === 'added') {
       setPendingQueue((prev) => (prev.some((q) => q.id === payload.item!.id) ? prev : [...prev, payload.item!]));
+    } else if (payload.action === 'updated') {
+      setPendingQueue((prev) => prev.map((q) => q.id === payload.item!.id ? payload.item! : q));
+    } else if (payload.action === 'promoted') {
+      setPendingQueue((prev) => [payload.item!, ...prev.filter((q) => q.id !== payload.item!.id)]);
     } else if (payload.action === 'discarded') {
       setPendingQueue((prev) => prev.filter((q) => q.id !== payload.item!.id));
     } else if (payload.action === 'dispatched') {
@@ -1353,6 +1357,82 @@ export function ThreadView({
     } catch (error) {
       toast.error('Failed to remove queued message', apiErrorMessage(error));
       void loadQueue();
+    }
+  }
+
+  async function editQueuedMessage(itemId: string, text: string) {
+    try {
+      const res = await api<{ item?: QueuedItem }>(`/v1/conversations/${id}/queue/${itemId}${querySuffix}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ text }),
+      });
+      if (res.item) setPendingQueue((prev) => prev.map((item) => item.id === itemId ? res.item! : item));
+    } catch (error) {
+      toast.error('Failed to edit queued message', apiErrorMessage(error));
+      void loadQueue();
+      throw error;
+    }
+  }
+
+  async function sendQueuedMessageNow(itemId: string) {
+    try {
+      const res = await api<{ item?: QueuedItem }>(`/v1/conversations/${id}/queue/${itemId}/promote${querySuffix}`, { method: 'POST' });
+      if (res.item) setPendingQueue((prev) => [res.item!, ...prev.filter((item) => item.id !== itemId)]);
+    } catch (error) {
+      toast.error('Failed to prioritize queued message', apiErrorMessage(error));
+      void loadQueue();
+      throw error;
+    }
+  }
+
+  async function editQueuedTurn(message: ChatMessage, text: string) {
+    const turnId = message.metadata?.durableTurnId;
+    if (!turnId) return;
+    try {
+      await api(`/v1/conversations/${id}/turns/${turnId}${querySuffix}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ text }),
+      });
+      setEditingId(null);
+      setMessages((prev) => prev.map((item) => item.metadata?.durableTurnId === turnId
+        ? { ...item, text }
+        : item));
+    } catch (error) {
+      toast.error('Failed to edit queued message', apiErrorMessage(error));
+      throw error;
+    }
+  }
+
+  async function cancelQueuedTurn(message: ChatMessage) {
+    const turnId = message.metadata?.durableTurnId;
+    if (!turnId) return;
+    try {
+      await api(`/v1/conversations/${id}/turns/${turnId}/cancel${querySuffix}`, { method: 'POST' });
+      clearQueuedTurnWatch(turnId);
+      queuedDurableTurnIdsRef.current.delete(turnId);
+      setEditingId((current) => current === message.id ? null : current);
+      setMessages((prev) => prev.map((item) => item.metadata?.durableTurnId === turnId
+        ? { ...item, metadata: { ...(item.metadata ?? {}), queued: false, queuePosition: undefined, queueCancelled: true } }
+        : item));
+    } catch (error) {
+      toast.error('Failed to cancel queued message', apiErrorMessage(error));
+      throw error;
+    }
+  }
+
+  async function sendQueuedTurnNow(message: ChatMessage) {
+    const turnId = message.metadata?.durableTurnId;
+    if (!turnId) return;
+    try {
+      const res = await api<{ turn: DurableConversationTurn }>(`/v1/conversations/${id}/turns/${turnId}/send-now${querySuffix}`, { method: 'POST' });
+      if (res.turn.status === 'running') {
+        clearQueuedTurnWatch(turnId);
+        queuedDurableTurnIdsRef.current.delete(turnId);
+        subscribeRecoveredTurn(res.turn);
+      }
+    } catch (error) {
+      toast.error('Failed to send queued message now', apiErrorMessage(error));
+      throw error;
     }
   }
 
@@ -2093,6 +2173,10 @@ export function ThreadView({
     const value = text.trim();
     if (!value) return;
     if (kind === 'agent' && message.authorKind === 'operator') {
+      if (message.metadata?.queued && message.metadata.durableTurnId) {
+        await editQueuedTurn(message, value);
+        return;
+      }
       await rerunFromEditedMessage(message, value);
       return;
     }
@@ -2185,6 +2269,8 @@ export function ThreadView({
                 turnChangeBusy={turnChangeBusyId === message.metadata?.durableTurnId}
                 turnChangePrompt={turnChangePrompt?.turnId === message.metadata?.durableTurnId ? turnChangePrompt : null}
                 chatAgentId={kind === 'agent' ? id : undefined}
+                onCancelQueued={readOnly || !message.metadata?.queued ? undefined : () => void cancelQueuedTurn(message)}
+                onSendQueuedNow={readOnly || !message.metadata?.queued ? undefined : () => void sendQueuedTurnNow(message)}
               />
             ))}
             {kind === 'agent' && pendingQueue.map((item) => (
@@ -2192,6 +2278,8 @@ export function ThreadView({
                 key={item.id}
                 item={item}
                 onCancel={readOnly ? undefined : () => void cancelQueuedMessage(item.id)}
+                onEdit={readOnly ? undefined : (text) => editQueuedMessage(item.id, text)}
+                onSendNow={readOnly ? undefined : () => sendQueuedMessageNow(item.id)}
               />
             ))}
           </ul>
@@ -2282,6 +2370,7 @@ export function ThreadView({
         <Composer
           key={`${kind}:${id}:${conversationId ?? 'active'}:${composerInitialText}`}
           onSend={handleSend}
+          onPermissionModeChange={setPermissionMode}
           awareness={{ label: awareness.label, active: awarenessActive }}
           initialText={composerInitialText}
           placeholder={composerPlaceholder}
@@ -2384,30 +2473,108 @@ function ImmersiveEmptyState({ name, body }: { name: string; body?: string }) {
   );
 }
 
-/** A queued follow-up stays in the conversation flow and differs from a sent
- * operator message only through its quiet delivery status. */
-function QueuedMessageBubble({ item, onCancel }: { item: QueuedItem; onCancel?: () => void }) {
+/** A queued follow-up stays in the conversation flow and exposes the actions
+ * needed to change its delivery without returning to the composer. */
+function QueuedMessageBubble({
+  item,
+  onCancel,
+  onEdit,
+  onSendNow,
+}: {
+  item: QueuedItem;
+  onCancel?: () => Promise<void> | void;
+  onEdit?: (text: string) => Promise<void> | void;
+  onSendNow?: () => Promise<void> | void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(item.text);
+  const [busy, setBusy] = useState(false);
+
+  async function run(action: () => Promise<void> | void) {
+    setBusy(true);
+    try {
+      await action();
+      setEditing(false);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <li className="group flex min-w-0 max-w-full flex-col items-end gap-0.5">
-      <div className="flex min-w-0 max-w-full items-start gap-1.5">
-        <div className="min-w-0 max-w-[85%] overflow-hidden rounded-[18px] border border-line/45 bg-surface-3/50 px-3.5 py-2.5 text-[13px] leading-relaxed text-text-primary opacity-75">
+      <div className="min-w-0 max-w-[85%] overflow-hidden rounded-[18px] border border-line/45 bg-surface-3/50 px-3.5 py-2.5 text-[13px] leading-relaxed text-text-primary">
+        {editing ? (
+          <textarea
+            autoFocus
+            value={draft}
+            onChange={(event) => setDraft(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === 'Escape') setEditing(false);
+              if (event.key === 'Enter' && !event.shiftKey) {
+                event.preventDefault();
+                if (draft.trim() && onEdit) void run(() => onEdit(draft.trim()));
+              }
+            }}
+            rows={3}
+            className="min-h-[60px] w-full resize-y rounded-lg border border-line bg-surface px-2.5 py-2 text-[13px] text-text-primary outline-none focus:border-accent"
+          />
+        ) : (
           <div className="whitespace-pre-wrap break-words [overflow-wrap:anywhere]">{item.text}</div>
-          <div className="mt-1 flex items-center justify-end gap-1 text-[10px] text-text-muted">
-            <Clock3 size={10} />
-            <span>Queued</span>
-          </div>
-        </div>
-        {onCancel && (
-          <button
-            type="button"
-            onClick={onCancel}
-            aria-label="Cancel queued message"
-            title="Remove from queue"
-            className="mt-0.5 grid h-5 w-5 shrink-0 place-items-center rounded-full text-text-muted opacity-0 transition-opacity hover:bg-surface-2 hover:text-danger group-hover:opacity-100"
-          >
-            <X size={12} />
-          </button>
         )}
+        <div className="mt-2 flex flex-wrap items-center justify-between gap-2 border-t border-line/45 pt-2 text-[10px] text-text-muted">
+          <div className="flex items-center gap-1">
+            <Clock3 size={10} />
+            <span>Queued{item.position > 0 ? ` · ${item.position} ahead` : ''}</span>
+          </div>
+          {!busy && (onEdit || onSendNow || onCancel) && (
+            <div className="flex items-center gap-1">
+              {editing ? (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => { if (draft.trim() && onEdit) void run(() => onEdit(draft.trim())); }}
+                    disabled={!draft.trim() || !onEdit}
+                    className="rounded px-1.5 py-1 font-medium text-accent hover:bg-accent/10 disabled:opacity-40"
+                  >
+                    Save
+                  </button>
+                  <button type="button" onClick={() => setEditing(false)} className="rounded px-1.5 py-1 hover:bg-surface-2">Close</button>
+                </>
+              ) : (
+                <>
+                  {onEdit && (
+                    <button
+                      type="button"
+                      onClick={() => { setDraft(item.text); setEditing(true); }}
+                      className="inline-flex items-center gap-1 rounded px-1.5 py-1 hover:bg-surface-2 hover:text-text-primary"
+                    >
+                      <Pencil size={10} /> Edit
+                    </button>
+                  )}
+                  {onSendNow && (
+                    <button
+                      type="button"
+                      onClick={() => void run(onSendNow)}
+                      className="inline-flex items-center gap-1 rounded px-1.5 py-1 text-accent hover:bg-accent/10"
+                    >
+                      <Send size={10} /> Send now
+                    </button>
+                  )}
+                  {onCancel && (
+                    <button
+                      type="button"
+                      onClick={() => void run(onCancel)}
+                      className="inline-flex items-center gap-1 rounded px-1.5 py-1 hover:bg-danger/10 hover:text-danger"
+                    >
+                      <X size={10} /> Cancel
+                    </button>
+                  )}
+                </>
+              )}
+            </div>
+          )}
+          {busy && <Loader2 size={11} className="animate-spin text-accent" />}
+        </div>
       </div>
     </li>
   );
@@ -2430,6 +2597,8 @@ function MessageBubble({
   turnChangePrompt,
   showAuthor,
   chatAgentId,
+  onCancelQueued,
+  onSendQueuedNow,
 }: {
   msg: ChatMessage;
   onCopy: () => void;
@@ -2447,6 +2616,8 @@ function MessageBubble({
   showAuthor?: boolean;
   agentData?: { name: string; role?: string | null; colorHex?: string | null };
   chatAgentId?: string;
+  onCancelQueued?: () => Promise<void> | void;
+  onSendQueuedNow?: () => Promise<void> | void;
 }) {
   const isOperator = msg.authorKind === 'operator';
   const [editDraft, setEditDraft] = useState(msg.text);
@@ -2479,7 +2650,7 @@ function MessageBubble({
         </span>
       )}
       <div className={clsx('flex min-w-0 max-w-full items-start gap-1.5', !isOperator && 'w-full')}>
-        {isOperator && !readOnly && (
+        {isOperator && !readOnly && !msg.metadata?.queued && (
           <MessageActions onCopy={onCopy} onEdit={onStartEdit} />
         )}
         <div
@@ -2525,14 +2696,41 @@ function MessageBubble({
               </div>
             )
           )}
-          {isOperator && !isEditing && (msg.metadata?.queued || streaming) && (
-            <div className="mt-1 flex items-center justify-end gap-1 text-[10px] text-text-muted">
-              {msg.metadata?.queued ? <Clock3 size={10} /> : <Loader2 size={10} className="animate-spin" />}
+          {isOperator && !isEditing && (msg.metadata?.queued || msg.metadata?.queueCancelled || streaming) && (
+            <div className={clsx('mt-1 flex flex-wrap items-center justify-end gap-2 text-[10px]', msg.metadata?.queueCancelled ? 'text-danger/80' : 'text-text-muted')}>
+              {msg.metadata?.queueCancelled ? <X size={10} /> : msg.metadata?.queued ? <Clock3 size={10} /> : <Loader2 size={10} className="animate-spin" />}
               <span>
-                {msg.metadata?.queued
+                {msg.metadata?.queueCancelled
+                  ? 'Cancelled'
+                  : msg.metadata?.queued
                   ? `Queued${(msg.metadata.queuePosition ?? 0) > 0 ? ` · ${msg.metadata.queuePosition} ahead` : ''}`
                   : 'Sending…'}
               </span>
+            </div>
+          )}
+          {isOperator && !isEditing && msg.metadata?.queued && !readOnly && (
+            <div className="mt-2 flex items-center justify-end gap-1 border-t border-line/45 pt-2 text-[10px]">
+              <button
+                type="button"
+                onClick={onStartEdit}
+                className="inline-flex items-center gap-1 rounded px-1.5 py-1 text-text-muted hover:bg-surface-2 hover:text-text-primary"
+              >
+                <Pencil size={10} /> Edit
+              </button>
+              <button
+                type="button"
+                onClick={() => { if (onSendQueuedNow) void onSendQueuedNow(); }}
+                className="inline-flex items-center gap-1 rounded px-1.5 py-1 text-accent hover:bg-accent/10"
+              >
+                <Send size={10} /> Send now
+              </button>
+              <button
+                type="button"
+                onClick={() => { if (onCancelQueued) void onCancelQueued(); }}
+                className="inline-flex items-center gap-1 rounded px-1.5 py-1 text-text-muted hover:bg-danger/10 hover:text-danger"
+              >
+                <X size={10} /> Cancel
+              </button>
             </div>
           )}
           {msg.metadata?.confirmation && (

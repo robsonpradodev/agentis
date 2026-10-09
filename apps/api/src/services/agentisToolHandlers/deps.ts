@@ -58,9 +58,14 @@ import type { AgentConsultationService } from '../agent/agentConsultationService
 import type { ChannelIdentityService } from '../conversation/channelIdentityService.js';
 import type { ChannelInboxService } from '../conversation/channelInboxService.js';
 import type { ChannelActionIntentService } from '../conversation/channelActionIntentService.js';
+import type { DurableSuspensionService } from '../suspension/durableSuspensionService.js';
+import type { FollowUpService } from '../followUpService.js';
+import type { RelationshipCohortService } from '../relationshipCohorts.js';
 
 export interface ToolHandlerDeps {
   db: AgentisSqliteDb;
+  /** Managed server data root; enables agent-native React App source/build tools. */
+  dataDir?: string;
   logger: Logger;
   bus: EventBus;
   engine: WorkflowEngine;
@@ -74,6 +79,7 @@ export interface ToolHandlerDeps {
   approvals: ApprovalInboxService;
   activity: ActivityFeedService;
   consultations?: AgentConsultationService;
+  suspensions?: DurableSuspensionService;
   replay: PartialReplayService;
   knowledgeBases?: KnowledgeBaseService;
   /** §B4 — typed workspace memory facade over the unified episode substrate. */
@@ -211,4 +217,8 @@ export interface ToolHandlerDeps {
   evolution?: StrategyEvolutionService;
   /** Durable Entity spine (§3.0/§3.2) — backs agentis.subject.* (per-subject durable actors). */
   durableEntities?: DurableEntityService;
+  /** Arms durable follow-ups on relationship Subjects (the "come back to this later" verb). */
+  followUps?: FollowUpService;
+  /** Selects cohorts from the message ledger (who actually went quiet), backs agentis.relationship.query. */
+  relationshipCohorts?: RelationshipCohortService;
 }

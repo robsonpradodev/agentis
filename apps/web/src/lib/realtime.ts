@@ -21,7 +21,7 @@ let socketConnected = false;
 let socketConnecting = true;
 let fallbackOpenCount = 0;
 
-type RealtimeRoomKind = 'workspace' | 'app' | 'run' | 'workflow' | 'gateway' | 'agent' | 'conversation' | 'room';
+type RealtimeRoomKind = 'workspace' | 'app' | 'run' | 'mission' | 'workflow' | 'gateway' | 'agent' | 'conversation' | 'room';
 
 interface ActiveSubscription {
   kind: RealtimeRoomKind;
@@ -61,6 +61,7 @@ const statusListeners = new Set<(s: RealtimeStatus) => void>();
 const localListeners = new Map<string, Set<(env: RealtimeEnvelope) => void>>();
 const workspaceStreams = new Map<string, WorkspaceStreamRecord>();
 const runStreams = new Map<string, WorkspaceStreamRecord>();
+const missionStreams = new Map<string, WorkspaceStreamRecord>();
 // Socket.IO rooms belong to one physical socket, not to the logical client.
 // A reconnect therefore drops every room even though the React subscriptions
 // are still mounted. Keep the desired room set client-side and replay it for
@@ -175,6 +176,8 @@ export function disconnectRealtime() {
   workspaceStreams.clear();
   for (const record of runStreams.values()) record.controller.abort();
   runStreams.clear();
+  for (const record of missionStreams.values()) record.controller.abort();
+  missionStreams.clear();
   setRealtimeStatus('connecting');
 }
 
@@ -189,6 +192,8 @@ function disconnectTransportWhenIdle(): void {
   workspaceStreams.clear();
   for (const record of runStreams.values()) record.controller.abort();
   runStreams.clear();
+  for (const record of missionStreams.values()) record.controller.abort();
+  missionStreams.clear();
   sharedSocket?.disconnect();
   sharedSocket = null;
   sharedSocketToken = null;
@@ -290,6 +295,7 @@ export function rtSubscribe(
     // Run-scoped SSE fallback streams events directly from the API so node/run
     // status and reasoning continue even while the socket is reconnecting.
     if (kind === 'run' && args.runId) acquireRunStream(args.runId);
+    if (kind === 'mission' && args.missionId) acquireMissionStream(args.missionId);
   }
   const sock = getSocket();
   // A disconnected Socket.IO client buffers emits, but replay-on-connect is the
@@ -307,6 +313,7 @@ export function rtSubscribe(
     activeSubscriptions.delete(key);
     if (kind === 'workspace' && workspaceId) releaseWorkspaceStream(workspaceId);
     if (kind === 'run' && args.runId) releaseRunStream(args.runId);
+    if (kind === 'mission' && args.missionId) releaseMissionStream(args.missionId);
     if (sharedSocket?.connected) emitRoomSubscription(sharedSocket, kind, nextArgs, false);
     disconnectTransportWhenIdle();
   };
@@ -342,6 +349,9 @@ function restoreFallbackStreams(): void {
     if (subscription.kind === 'run' && subscription.args.runId) {
       acquireRunStream(subscription.args.runId);
     }
+    if (subscription.kind === 'mission' && subscription.args.missionId) {
+      acquireMissionStream(subscription.args.missionId);
+    }
   }
 }
 
@@ -364,6 +374,22 @@ function releaseRunStream(runId: string): void {
   runStreams.delete(runId);
 }
 
+function acquireMissionStream(missionId: string): void {
+  if (missionStreams.has(missionId)) return;
+  const record: WorkspaceStreamRecord = { count: 1, controller: new AbortController() };
+  missionStreams.set(missionId, record);
+  void runScopedStream('mission', missionId, record);
+}
+
+function releaseMissionStream(missionId: string): void {
+  const record = missionStreams.get(missionId);
+  if (!record) return;
+  record.count -= 1;
+  if (record.count > 0) return;
+  record.controller.abort();
+  missionStreams.delete(missionId);
+}
+
 /**
  * Stream one run's events from `/v1/runs/:id/stream`. The server relays raw
  * run-room envelopes with their original event names, so we emit them straight
@@ -372,6 +398,10 @@ function releaseRunStream(runId: string): void {
  * with backoff until released.
  */
 async function runRunStream(runId: string, record: WorkspaceStreamRecord): Promise<void> {
+  return runScopedStream('run', runId, record);
+}
+
+async function runScopedStream(kind: 'run' | 'mission', id: string, record: WorkspaceStreamRecord): Promise<void> {
   const markOpen = () => {
     fallbackOpenCount += 1;
     refreshRealtimeStatus();
@@ -386,7 +416,7 @@ async function runRunStream(runId: string, record: WorkspaceStreamRecord): Promi
     let opened = false;
     try {
       await streamSse(
-        `/v1/runs/${encodeURIComponent(runId)}/stream`,
+        `/v1/${kind}s/${encodeURIComponent(id)}/stream`,
         { signal: record.controller.signal },
         {
           onEvent: (event, data) => {
@@ -403,7 +433,7 @@ async function runRunStream(runId: string, record: WorkspaceStreamRecord): Promi
       );
     } catch (err) {
       if (!record.controller.signal.aborted) {
-        console.warn('[agentis] run SSE stream disconnected', err);
+        console.warn(`[agentis] ${kind} SSE stream disconnected`, err);
       }
     } finally {
       markClosed(opened);

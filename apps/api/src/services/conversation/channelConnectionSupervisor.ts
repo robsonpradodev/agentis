@@ -1,3 +1,5 @@
+import { isAcknowledgedChannelDelivery } from '../../adapters/channels/types.js';
+import type { ResolvedChannelQuote } from '../../adapters/channels/types.js';
 ﻿/**
  * ChannelConnectionSupervisor — owns the live, persistent channel connections
  * (WhatsApp sockets; Telegram long-poll) that don't fit the stateless webhook
@@ -32,7 +34,7 @@ import type { CredentialVault } from '../credentialVault.js';
 import type { ArtifactService } from '../artifactService.js';
 import type { ConversationStore } from './conversationStore.js';
 import type { ChannelTurnDispatcher } from './channelTurnDispatcher.js';
-import { WhatsAppSession, type InboundChannelMedia, type WhatsAppHistoryEntry, type WhatsAppObservedOutbound, type WhatsAppRecoveryState } from '../../adapters/channels/whatsappSession.js';
+import { WhatsAppSession, type InboundChannelMedia, type WhatsAppHistoryEntry, type WhatsAppObservedOutbound, type WhatsAppRecoveryState, type WhatsAppMediaContext } from '../../adapters/channels/whatsappSession.js';
 import { TelegramSession } from '../../adapters/channels/telegramSession.js';
 import { resolveTelegramTransport } from '../../adapters/channels/telegram.js';
 import { DiscordSession } from '../../adapters/channels/discordSession.js';
@@ -251,14 +253,8 @@ export class ChannelConnectionSupervisor {
   }
 
   /**
-   * Deliver an outbound message over the live session. When attachments are
-   * present, each is sent as its own native media message (the first carries the
-   * body as its caption), mirroring the WhatsApp Cloud + Telegram webhook paths.
-   * A session that cannot carry media still delivers the text so nothing is lost.
-   *
-   * When a human-like `humanize` config is supplied, long text is split into a
-   * natural burst and each message is preceded by a jittered "typing…" indicator
-   * (§6). Presence is best-effort — a session without `setTyping` still delivers.
+   * Deliver text/media over the live session. The first attachment carries the
+   * body as its caption; optional humanized bursts use best-effort typing state.
    */
   async send(
     connectionId: string,
@@ -267,7 +263,7 @@ export class ChannelConnectionSupervisor {
     attachments?: OutboundAttachment[],
     humanize?: HumanizeConfig,
     native?: OutboundNativeContent,
-    authority?: { actor: 'automation' | 'human'; conversationId?: string; expectedEpoch?: number },
+    authority?: { quotedMessage?: ResolvedChannelQuote; actor: 'automation' | 'human'; conversationId?: string; expectedEpoch?: number; validatedEffect?: { basis: 'verified_owner_command'; effectIntentId: string; idempotencyKey: string } },
   ): Promise<ChannelDeliveryReceipt> {
     const session = this.#sessions.get(connectionId);
     if (!session) throw new Error(`no live session for connection ${connectionId}`);
@@ -283,7 +279,7 @@ export class ChannelConnectionSupervisor {
     const isStale = () => (this.#pacingEpoch.get(pacingKey) ?? 0) !== pacingEpoch;
     const assertFresh = () => {
       if (isStale()) throw new ChannelPacingCancelledError(connectionId, chatId);
-      if (authority?.actor === 'human') return;
+      if (authority?.actor === 'human' || authority?.validatedEffect?.basis === 'verified_owner_command') return;
       if (authority?.conversationId) this.deps.handoffs?.assertAutomationAllowed({
         workspaceId: connection.workspaceId,
         conversationId: authority.conversationId,
@@ -296,6 +292,19 @@ export class ChannelConnectionSupervisor {
         ...(authority?.expectedEpoch !== undefined ? { expectedEpoch: authority.expectedEpoch } : {}),
       });
     };
+
+    if (authority?.quotedMessage) {
+      if (!(session instanceof WhatsAppSession)) throw new Error('Quoted replies require WhatsApp QR');
+      const receipts: ChannelDeliveryReceipt[] = [];
+      if (!media.length) { assertFresh(); return session.sendQuoted(chatId, body, authority.quotedMessage, undefined, native); }
+      for (let index = 0; index < media.length; index++) {
+        assertFresh();
+        const receipt = await session.sendQuoted(chatId, index === 0 ? body : '', authority.quotedMessage, media[index]);
+        receipts.push(receipt);
+        if (!isAcknowledgedChannelDelivery(receipt)) break;
+      }
+      return aggregateReceipts(receipts);
+    }
 
     if (native) {
       const nativeSession = session as { sendNative?: (chatId: string, content: OutboundNativeContent) => Promise<ChannelDeliveryReceipt> };
@@ -427,6 +436,17 @@ export class ChannelConnectionSupervisor {
   }
 
   /** Show/clear the typing indicator on a live session (best-effort, no-op otherwise). */
+  setReadPolicy(connectionId: string, automatic: boolean): void {
+    const session = this.#sessions.get(connectionId);
+    if (session instanceof WhatsAppSession) session.setAutoReadInbound(automatic);
+  }
+
+  async markRead(connectionId: string, chatId: string, messageId: string): Promise<void> {
+    const session = this.#sessions.get(connectionId);
+    if (!(session instanceof WhatsAppSession)) throw new Error('Read receipts require a live WhatsApp session');
+    await session.markRead(chatId, messageId);
+  }
+
   async setTyping(connectionId: string, chatId: string, on: boolean): Promise<void> {
     const session = this.#sessions.get(connectionId);
     if (!session) return;
@@ -493,6 +513,7 @@ export class ChannelConnectionSupervisor {
       );
       session = new WhatsAppSession({
         connectionId,
+        autoReadInbound: profile.inboundReadReceipts === 'automatic',
         authDir,
         logger: this.deps.logger,
         onInbound: (msg) => this.#onInbound(connectionId, msg),
@@ -569,6 +590,8 @@ export class ChannelConnectionSupervisor {
     alternateChatIds?: string[];
     threadId?: string;
     attachmentIds?: string[];
+    mediaContext?: WhatsAppMediaContext;
+    quotedContext?: {providerMessageId: string; body: string};
   }): void {
     const pacingKey = `${connectionId}:${msg.chatId}`;
     this.#pacingEpoch.set(pacingKey, (this.#pacingEpoch.get(pacingKey) ?? 0) + 1);
@@ -637,6 +660,8 @@ export class ChannelConnectionSupervisor {
         channelConnectionId: row.id,
         channelInbound: true,
         ...(msg.attachmentIds?.length ? { artifactIds: msg.attachmentIds } : {}),
+        ...(msg.mediaContext ? { channelMediaContext: msg.mediaContext } : {}),
+        ...(msg.quotedContext ? { channelQuotedContext: msg.quotedContext } : {}),
         ...(msg.threadId ? { threadId: msg.threadId } : {}),
         ...(msg.from ? { from: msg.from } : {}),
       },
@@ -672,6 +697,8 @@ export class ChannelConnectionSupervisor {
       chatId: msg.chatId,
       text: msg.body,
       ...(msg.attachmentIds?.length ? { attachmentIds: msg.attachmentIds } : {}),
+      ...(msg.mediaContext ? { mediaContext: msg.mediaContext } : {}),
+      ...(msg.quotedContext ? { quotedContext: msg.quotedContext } : {}),
       ...(msg.threadId ? { threadId: msg.threadId } : {}),
       ...(msg.from ? { from: msg.from } : {}),
       inboundMessageId: message.id,
@@ -877,6 +904,20 @@ export class ChannelConnectionSupervisor {
         error: null,
         updatedAt: new Date().toISOString(),
       }).where(eq(schema.channelOutboundDeliveries.id, delivery.id)).run();
+      if (delivery.conversationId && isAcknowledgedChannelDelivery(receipt)) {
+        const conversation = this.deps.db.select({
+          needsAttentionReason: schema.conversations.needsAttentionReason,
+        }).from(schema.conversations).where(and(
+          eq(schema.conversations.id, delivery.conversationId),
+          eq(schema.conversations.workspaceId, connection.workspaceId),
+        )).get();
+        if (conversation?.needsAttentionReason?.startsWith(`Channel delivery [${delivery.idempotencyKey}]:`)) {
+          this.deps.db.update(schema.conversations).set({
+            needsAttention: 0,
+            needsAttentionReason: null,
+          }).where(eq(schema.conversations.id, delivery.conversationId)).run();
+        }
+      }
       const conversationMessage = this.deps.db.select().from(schema.conversationMessages)
         .where(and(
           eq(schema.conversationMessages.workspaceId, connection.workspaceId),

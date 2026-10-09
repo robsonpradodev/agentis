@@ -1,3 +1,4 @@
+import type { ResolvedChannelQuote } from './types.js';
 ﻿/**
  * WhatsAppSession — one live baileys WhatsApp Web connection.
  *
@@ -26,16 +27,19 @@ import {
   artifactIdFromRef,
   observedWhatsAppChatJid,
   observedWhatsAppChatJids,
+  extractWhatsAppQuotedContext,
   resolveWhatsAppInboundBody,
   whatsappMediaContent,
   whatsappNativeContent,
   type InboundChannelMedia,
+  type WhatsAppMediaContext,
 } from './whatsappMessageCodec.js';
 import {
   classifyWhatsAppReconnect,
   messageTimestampMs,
   normalizeWhatsAppJid,
   readDisconnectStatus,
+  shouldProcessWhatsAppUpsert,
   whatsappDeliverySignal,
   whatsappDeliveryStatus,
   whatsappProviderRejectionMessage,
@@ -48,6 +52,7 @@ import {
 export {
   extractWhatsAppText,
   resolveWhatsAppInboundBody,
+  extractWhatsAppQuotedContext,
   resolveWhatsAppNativeBody,
   unwrapAudioMessage,
   unwrapDocumentMessage,
@@ -55,7 +60,7 @@ export {
   whatsappMediaContent,
   whatsappNativeContent,
 } from './whatsappMessageCodec.js';
-export type { InboundChannelMedia } from './whatsappMessageCodec.js';
+export type { InboundChannelMedia, WhatsAppMediaContext } from './whatsappMessageCodec.js';
 export {
   classifyWhatsAppReconnect,
   shouldProcessWhatsAppUpsert,
@@ -83,6 +88,8 @@ export interface WhatsAppInbound {
   alternateChatIds?: string[];
   /** Durable artifacts created from provider media. Kept typed through the turn. */
   attachmentIds?: string[];
+  mediaContext?: WhatsAppMediaContext;
+  quotedContext?: {providerMessageId: string; body: string};
 }
 
 export interface WhatsAppPeerObservation {
@@ -118,6 +125,7 @@ export interface WhatsAppRecoveryState {
 }
 
 export interface WhatsAppSessionOptions {
+  autoReadInbound?: boolean;
   connectionId: string;
   authDir: string;
   logger: Logger;
@@ -180,12 +188,16 @@ const HISTORY_SESSION_LIMIT = 2_000;
 const HISTORY_MEDIA_LIMIT = 20;
 const HISTORY_INACTIVITY_FLUSH_MS = 1_500;
 const LOCAL_SUBMISSION_CORRELATION_TIMEOUT_MS = 30_000;
+/** WhatsApp expires a composing presence after roughly ten seconds. */
+const TYPING_PRESENCE_REFRESH_MS = 7_000;
 
 export class WhatsAppSession {
   #status: WhatsAppSessionStatus = 'idle';
   #qr: string | undefined;
   #qrDataUrl: string | undefined;
   #selfId: string | undefined;
+  /** Every provider address known to belong to the linked account (PN + LID). */
+  readonly #selfJids = new Set<string>();
   #sock: Awaited<ReturnType<BaileysModule['makeWASocket']>> | undefined;
   #closed = false;
   #reconnectAttempts = 0;
@@ -209,7 +221,8 @@ export class WhatsAppSession {
   readonly #historyMediaPersistedByChat = new Map<string, number>();
   #historyFlushTimer: ReturnType<typeof setTimeout> | undefined;
   #historyFlushPromise: Promise<void> | undefined;
-  #openedAt = 0;
+  /** Keep long-running turns visibly composing until the dispatcher clears them. */
+  readonly #typingRefreshTimers = new Map<string, ReturnType<typeof setInterval>>();
 
   constructor(private readonly opts: WhatsAppSessionOptions) {}
 
@@ -250,6 +263,8 @@ export class WhatsAppSession {
   }
 
   async stop(): Promise<void> {
+    for (const timer of this.#typingRefreshTimers.values()) clearInterval(timer);
+    this.#typingRefreshTimers.clear();
     this.#closed = true;
     if (this.#reconnectTimer) clearTimeout(this.#reconnectTimer);
     this.#clearStableOpenTimer();
@@ -269,6 +284,7 @@ export class WhatsAppSession {
     this.#localSubmissionWaiters.clear();
     this.#deliveryRecipients.clear();
     this.#locallySubmittedMessageIds.clear();
+    this.#selfJids.clear();
     this.#recovery = undefined;
     this.#setStatus('closed');
   }
@@ -292,6 +308,18 @@ export class WhatsAppSession {
     return this.#submit(jid, whatsappNativeContent(native));
   }
 
+  setAutoReadInbound(enabled: boolean): void { this.opts.autoReadInbound = enabled; }
+
+  async markRead(jid: string, messageId: string): Promise<void> {
+    if (!this.#sock || this.#status !== 'open') throw new Error('WhatsApp session is not open');
+    await this.#sock.readMessages([{remoteJid: jid, id: messageId, fromMe: false}]);
+  }
+
+  async sendQuoted(jid: string, body: string, quote: ResolvedChannelQuote, attachment?: OutboundAttachment, native?: OutboundNativeContent): Promise<ChannelDeliveryReceipt> {
+    const content = attachment ? whatsappMediaContent(attachment, body) : native ? whatsappNativeContent(native) : {text: body};
+    return this.#submit(jid, content, quote);
+  }
+
   /** Add/clear a reaction on a prior message (best-effort; requires the message key). */
   async sendReaction(jid: string, targetMessageId: string, emoji: string): Promise<void> {
     if (!this.#sock || this.#status !== 'open') return;
@@ -307,7 +335,7 @@ export class WhatsAppSession {
    * recipient-mismatch guard are identical regardless of content.
    */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  async #submit(jid: string, content: any): Promise<ChannelDeliveryReceipt> {
+  async #submit(jid: string, content: any, quote?: ResolvedChannelQuote): Promise<ChannelDeliveryReceipt> {
     if (!this.#sock || this.#status !== 'open') {
       throw new Error(`whatsapp session ${this.opts.connectionId} is not open (status=${this.#status})`);
     }
@@ -326,11 +354,14 @@ export class WhatsAppSession {
       if (!match) throw new Error(`whatsapp recipient ${jid} is not registered or could not be resolved`);
       if (typeof match.jid === 'string' && match.jid) recipient = match.jid;
     }
+    if (this.#isSelfJid(recipient)) {
+      throw new Error('whatsapp refused to send to the linked account itself because self-targeted messages can be re-ingested as new inbound turns');
+    }
     const localKey = normalizeWhatsAppJid(recipient);
     this.#localSubmissionsByChat.set(localKey, (this.#localSubmissionsByChat.get(localKey) ?? 0) + 1);
     let sent;
     try {
-      sent = await this.#sock.sendMessage(recipient, content);
+      sent = await this.#sock.sendMessage(recipient, content, quote ? {quoted: {key: {remoteJid: recipient, id: quote.providerMessageId, fromMe: quote.fromMe}, message: {conversation: quote.body}}} : undefined);
       const submittedId = typeof sent?.key?.id === 'string' ? sent.key.id.trim() : '';
       if (submittedId) this.#rememberLocalSubmission(submittedId);
     } finally {
@@ -556,8 +587,22 @@ export class WhatsAppSession {
   /** Show/clear the "typing…" presence in a chat (best-effort). */
   async setTyping(jid: string, on: boolean): Promise<void> {
     if (!this.#sock || this.#status !== 'open') return;
+    const key = normalizeWhatsAppJid(jid);
+    const existing = this.#typingRefreshTimers.get(key);
+    if (existing) {
+      clearInterval(existing);
+      this.#typingRefreshTimers.delete(key);
+    }
     try {
       await this.#sock.sendPresenceUpdate(on ? 'composing' : 'paused', jid);
+      if (on) {
+        const timer = setInterval(() => {
+          if (!this.#sock || this.#status !== 'open') return;
+          void this.#sock.sendPresenceUpdate('composing', jid).catch(() => {});
+        }, TYPING_PRESENCE_REFRESH_MS);
+        timer.unref?.();
+        this.#typingRefreshTimers.set(key, timer);
+      }
     } catch {
       /* presence is best-effort */
     }
@@ -639,9 +684,12 @@ export class WhatsAppSession {
         this.#qr = undefined;
         this.#qrDataUrl = undefined;
         this.#selfId = sock.user?.id;
+        this.#selfJids.clear();
+        for (const jid of [sock.user?.id, sock.user?.lid, sock.user?.phoneNumber]) {
+          if (typeof jid === 'string' && jid.trim()) this.#selfJids.add(normalizeWhatsAppJid(jid));
+        }
         this.#reachoutBlockedUntil = undefined; // a real open clears any reach-out pause
         this.#recovery = undefined;
-        this.#openedAt = Date.now();
         this.#setStatus('open');
         // Only reset the backoff after the connection STAYS open — a flap
         // (open→close during enforcement) must grow the backoff, not zero it each time.
@@ -662,10 +710,13 @@ export class WhatsAppSession {
 
     sock.ev.on('messages.upsert', (event) => {
       for (const msg of event.messages) {
-        const liveManualOutbound = event.type === 'append'
-          && msg?.key?.fromMe === true
-          && messageTimestampMs(msg) >= this.#openedAt - 5_000;
-        if (event.type !== 'notify' && !liveManualOutbound) {
+        const occurredAt = messageTimestampMs(msg);
+        const processLive = shouldProcessWhatsAppUpsert(
+          event.type,
+          msg?.key?.fromMe === true,
+          occurredAt,
+        );
+        if (!processLive) {
           this.#stageHistory(msg);
           continue;
         }
@@ -818,6 +869,15 @@ export class WhatsAppSession {
   async #handleMessage(msg: any): Promise<void> {
     const key = msg?.key;
     if (!key) return;
+    const observedChatIds = observedWhatsAppChatJids(key);
+    if (observedChatIds.some((jid) => this.#isSelfJid(jid))) {
+      this.opts.logger.warn('whatsapp.self_message_ignored', {
+        connectionId: this.opts.connectionId,
+        externalId: typeof key.id === 'string' ? key.id : undefined,
+        fromMe: key.fromMe === true,
+      });
+      return;
+    }
     if (key.fromMe) {
       const externalId = typeof key.id === 'string' ? key.id.trim() : '';
       if (!externalId || this.#locallySubmittedMessageIds.has(externalId)) return;
@@ -873,6 +933,23 @@ export class WhatsAppSession {
     // replying to the raw @lid lands in a phantom chat. Non-LID chats are
     // unchanged, and we fall back to the LID if no PN alt is present.
     const chatJid = observedWhatsAppChatJid(key) ?? remoteJid;
+
+    // A live inbound has reached the resident agent, so acknowledge it before
+    // potentially expensive transcription/vision/model work. This produces the
+    // normal blue read receipt when the linked account and peer permit receipts.
+    // Use the provider key unchanged: replacing a LID with its PN alias can make
+    // Baileys acknowledge a different chat.
+    try {
+      if (this.opts.autoReadInbound !== false && typeof this.#sock?.readMessages === 'function' && typeof key.id === 'string' && key.id) {
+        await this.#sock.readMessages([key]);
+      }
+    } catch (err) {
+      this.opts.logger.warn('whatsapp.read_receipt_failed', {
+        connectionId: this.opts.connectionId,
+        externalId: typeof key.id === 'string' ? key.id : undefined,
+        err: (err as Error).message,
+      });
+    }
     if (chatJid !== remoteJid) {
       this.opts.logger.info('whatsapp.lid_mapped_to_pn', { connectionId: this.opts.connectionId, lid: remoteJid, repliesTo: chatJid });
     } else if (remoteJid.endsWith('@lid')) {
@@ -892,7 +969,9 @@ export class WhatsAppSession {
     });
 
     const attachmentIds: string[] = [];
+    let mediaContext: WhatsAppMediaContext | undefined;
     const body = await resolveWhatsAppInboundBody(msg, {
+      onMediaContext: (context) => { mediaContext = context; },
       downloadMedia: this.#downloadMedia,
       transcribeAudio: this.opts.transcribeAudio,
       describeImage: this.opts.describeImage,
@@ -916,6 +995,8 @@ export class WhatsAppSession {
       ...(from ? { from } : {}),
       ...(aliases.length > 1 ? { alternateChatIds: aliases.filter((value) => value !== chatJid) } : {}),
       ...(attachmentIds.length ? { attachmentIds: [...new Set(attachmentIds)] } : {}),
+      ...(mediaContext ? { mediaContext } : {}),
+      ...(extractWhatsAppQuotedContext(msg) ? { quotedContext: extractWhatsAppQuotedContext(msg) } : {}),
     });
   }
 
@@ -935,6 +1016,10 @@ export class WhatsAppSession {
       source: 'contact',
       verified: Boolean(contact?.verifiedName || aliases.length > 1),
     });
+  }
+
+  #isSelfJid(jid: string): boolean {
+    return this.#selfJids.has(normalizeWhatsAppJid(jid));
   }
 
   #rememberLocalSubmission(providerMessageId: string): void {

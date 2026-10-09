@@ -5,6 +5,8 @@ export interface ConversationTurnLeaseContext {
   channelOrigin?: ChannelToolOrigin;
   /** Exact catalog this turn may invoke, including through MCP-native harnesses. */
   allowedToolIds?: string[];
+  /** Server-selected durable Mission; never accepted from a client header. */
+  missionId?: string;
 }
 
 export interface TurnToolObservation {
@@ -168,6 +170,23 @@ export class ConversationTurnLeaseRegistry {
   context(workspaceId: string, conversationId: string, token: string): ConversationTurnLeaseContext | undefined {
     this.assertActive(workspaceId, conversationId, token);
     return this.#active.get(conversationId)?.context;
+  }
+
+  /**
+   * Enrich the server-owned capability after semantic planning has selected a
+   * mission. Harnesses receive their lease before that planning round, so the
+   * context must be safely updatable without issuing a new token mid-turn.
+   */
+  updateContext(
+    workspaceId: string,
+    conversationId: string,
+    token: string,
+    context: Partial<ConversationTurnLeaseContext>,
+  ): ConversationTurnLeaseContext {
+    this.assertActive(workspaceId, conversationId, token);
+    const active = this.#active.get(conversationId)!;
+    active.context = { ...(active.context ?? {}), ...context };
+    return active.context;
   }
 
   /**

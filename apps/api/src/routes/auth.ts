@@ -16,7 +16,13 @@ import { requireWorkspace, getWorkspace } from '../middleware/workspace.js';
 import { createRateLimiter, clientIp } from '../middleware/rateLimit.js';
 import { createApiKeySecret, hashApiKey } from '../services/apiKeys.js';
 
-export function buildAuthRoutes(deps: { db: AgentisSqliteDb; auth: AuthService; secrets?: AgentisSecrets }) {
+export function buildAuthRoutes(deps: {
+  db: AgentisSqliteDb;
+  auth: AuthService;
+  secrets?: AgentisSecrets;
+  /** The URL-token convenience flow is intentionally unavailable on a VPS. */
+  allowLocalBypass?: boolean;
+}) {
   const app = new Hono();
   const productionMode = process.env.NODE_ENV === 'production';
   let fallbackLaunchToken = deps.secrets?.launchToken;
@@ -70,6 +76,16 @@ export function buildAuthRoutes(deps: { db: AgentisSqliteDb; auth: AuthService; 
     windowMs: 60_000,
     keyFn: (c) => (testModeBypass ? null : `ip:${clientIp(c)}`),
   });
+  const refreshPerIp = createRateLimiter({
+    limit: 30,
+    windowMs: 60_000,
+    keyFn: (c) => (testModeBypass ? null : `refresh:${clientIp(c)}`),
+  });
+  const launchPerIp = createRateLimiter({
+    limit: 5,
+    windowMs: 60_000,
+    keyFn: (c) => (testModeBypass ? null : `launch:${clientIp(c)}`),
+  });
 
   app.post('/login', loginPerIp, loginPerPair, async (c) => {
     const body = schemas.loginRequestSchema.parse(await c.req.json());
@@ -90,7 +106,7 @@ export function buildAuthRoutes(deps: { db: AgentisSqliteDb; auth: AuthService; 
     });
   });
 
-  app.post('/refresh', async (c) => {
+  app.post('/refresh', refreshPerIp, async (c) => {
     const body = schemas.refreshRequestSchema.parse(await c.req.json());
     const claims = await deps.auth.verify(body.refreshToken, 'refresh');
     const user = deps.db
@@ -205,7 +221,7 @@ export function buildAuthRoutes(deps: { db: AgentisSqliteDb; auth: AuthService; 
    * while the server has a launchToken (i.e. local/file-backed installs).
    * Server deployments (env-var secrets) have no launchToken and always get 404.
    */
-  app.post('/launch', async (c) => {
+  app.post('/launch', launchPerIp, async (c) => {
     if (!fallbackLaunchToken && !deps.secrets?.consumeLaunchToken) {
       throw new AgentisError('RESOURCE_NOT_FOUND', 'Launch auth is not available on this deployment');
     }
@@ -214,7 +230,7 @@ export function buildAuthRoutes(deps: { db: AgentisSqliteDb; auth: AuthService; 
       throw new AgentisError('AUTH_INVALID_CREDENTIALS', 'Invalid launch token');
     }
 
-    if (body.token === 'local-bypass') {
+    if (deps.allowLocalBypass && body.token === 'local-bypass') {
       const ip = clientIp(c);
       const host = c.req.header('host') || '';
       const isLocalIp = ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1' || ip === 'localhost';

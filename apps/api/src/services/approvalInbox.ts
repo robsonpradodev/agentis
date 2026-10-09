@@ -37,7 +37,7 @@ export interface ApprovalCreateArgs {
   taskId: string | null;
   targetId?: string | null;
   gatewayId: string | null;
-  source: 'checkpoint' | 'phase_gate' | 'self_heal' | 'openclaw_exec' | 'package_install' | 'credential_access' | 'budget_limit' | 'outbound' | 'workflow_revision' | 'agent_consultation';
+  source: 'checkpoint' | 'phase_gate' | 'self_heal' | 'openclaw_exec' | 'package_install' | 'credential_access' | 'budget_limit' | 'outbound' | 'workflow_revision' | 'agent_consultation' | 'durable_suspension';
   title: string;
   summary: string;
   confidence: number | null;
@@ -90,11 +90,22 @@ export type AgentConsultationApprovalHandler = (args: {
   payload: Record<string, unknown>;
 }) => Promise<void>;
 
+export type DurableSuspensionApprovalHandler = (args: {
+  approvalId: string;
+  workspaceId: string;
+  userId: string;
+  decision: 'approve' | 'reject';
+  payload: Record<string, unknown>;
+  data?: Record<string, unknown>;
+  reason?: string;
+}) => Promise<void>;
+
 export class ApprovalInboxService {
   #onCheckpointResolved: CheckpointResumeHandler | null = null;
   #onOutboundResolved: OutboundApprovalHandler | null = null;
   #onWorkflowRevisionResolved: WorkflowRevisionApprovalHandler | null = null;
   #onAgentConsultationResolved: AgentConsultationApprovalHandler | null = null;
+  #onDurableSuspensionResolved: DurableSuspensionApprovalHandler | null = null;
 
   constructor(
     private readonly db: AgentisSqliteDb,
@@ -116,6 +127,10 @@ export class ApprovalInboxService {
 
   bindAgentConsultationHandler(handler: AgentConsultationApprovalHandler): void {
     this.#onAgentConsultationResolved = handler;
+  }
+
+  bindDurableSuspensionHandler(handler: DurableSuspensionApprovalHandler): void {
+    this.#onDurableSuspensionResolved = handler;
   }
 
   async create(args: ApprovalCreateArgs) {
@@ -175,6 +190,27 @@ export class ApprovalInboxService {
 
   countActionable(workspaceId: string): number {
     return this.list(workspaceId, 'pending').length;
+  }
+
+  /** Retire a source presentation when its owning durable condition settles elsewhere. */
+  cancelPending(workspaceId: string, approvalId: string, reason: string): boolean {
+    const row = this.db.select().from(schema.approvalRequests).where(and(
+      eq(schema.approvalRequests.workspaceId, workspaceId),
+      eq(schema.approvalRequests.id, approvalId),
+    )).get();
+    if (!row || row.status !== 'pending') return false;
+    const resolvedAt = new Date().toISOString();
+    this.db.update(schema.approvalRequests).set({
+      status: 'cancelled',
+      resolutionReason: reason,
+      resolvedAt,
+    }).where(eq(schema.approvalRequests.id, approvalId)).run();
+    this.bus.publish(REALTIME_ROOMS.workspace(workspaceId), REALTIME_EVENTS.APPROVAL_RESOLVED, {
+      id: approvalId,
+      status: 'cancelled',
+      resolvedAt,
+    });
+    return true;
   }
 
   /**
@@ -310,6 +346,20 @@ export class ApprovalInboxService {
     if (row.status !== 'pending') {
       throw new AgentisError('RESOURCE_CONFLICT', `Approval already ${row.status}`);
     }
+    if (row.source === 'durable_suspension' && args.decision === 'approve') {
+      const payload = asRecord(row.payload);
+      const form = asRecord(payload.humanInputForm);
+      const fields = Array.isArray(form.fields) ? form.fields.map(asRecord).filter(Boolean) as Record<string, unknown>[] : [];
+      const missing = fields.filter((field) => field.required !== false).filter((field) => {
+        const key = typeof field.key === 'string' ? field.key : '';
+        const value = key ? args.data?.[key] : undefined;
+        return value === undefined || value === null || (typeof value === 'string' && !value.trim());
+      });
+      if (missing.length) {
+        const labels = missing.map((field) => String(field.label ?? field.key ?? 'field')).join(', ');
+        throw new AgentisError('VALIDATION_FAILED', `Required response fields are missing: ${labels}`);
+      }
+    }
     if (row.source === 'workflow_revision' && args.decision === 'approve') {
       const operator = args.resolvedByUserId
         ? this.db.select({ isAdmin: schema.users.isAdmin }).from(schema.users)
@@ -377,6 +427,16 @@ export class ApprovalInboxService {
         userId: row.userId,
         decision: args.decision,
         payload: (row.payload ?? {}) as Record<string, unknown>,
+      });
+    } else if (row.source === 'durable_suspension' && this.#onDurableSuspensionResolved && args.decision !== 'revise') {
+      await this.#onDurableSuspensionResolved({
+        approvalId: row.id,
+        workspaceId: row.workspaceId,
+        userId: args.resolvedByUserId ?? row.userId,
+        decision: args.decision,
+        payload: asRecord(row.payload),
+        ...(args.data ? { data: args.data } : {}),
+        ...(args.reason ? { reason: args.reason } : {}),
       });
     }
     return { ...row, status: next, resolvedAt, resolutionReason };

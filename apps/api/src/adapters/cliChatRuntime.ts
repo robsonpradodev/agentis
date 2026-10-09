@@ -27,7 +27,7 @@
 
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import type { ChatDelta, ChatMessage } from '@agentis/core';
+import type { ChatDelta, ChatMessage, ToolDefinition } from '@agentis/core';
 import type { Logger } from '../logger.js';
 import { resolveSpawnCwd, resolveSpawnTarget, withExpandedPath } from '../services/pathExpander.js';
 import { extractMarkerToolCalls, isProcessNoiseLine, stripProcessNoise } from './markerToolProtocol.js';
@@ -49,7 +49,7 @@ export const DEFAULT_CHAT_TURN_TIMEOUT_MS = 180_000;
 const DEFAULT_CHAT_HARD_CEILING_MS = 1_800_000;
 
 /** How often a quiet-but-alive turn emits a "still working" heartbeat to the UI. */
-const HEARTBEAT_INTERVAL_MS = 15_000;
+const HEARTBEAT_INTERVAL_MS = 10_000;
 
 /**
  * Native runtime sessions already own prior conversation/tool history. Refresh
@@ -60,7 +60,37 @@ const HEARTBEAT_INTERVAL_MS = 15_000;
 export function messagesForRuntimeSession(messages: ChatMessage[], resumed: boolean): ChatMessage[] {
   if (!resumed) return messages;
   const system = [...messages].reverse().find((message) => message.role === 'system');
-  const latestUser = [...messages].reverse().find((message) => message.role === 'user');
+  let latestUserIndex = -1;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index]?.role === 'user') {
+      latestUserIndex = index;
+      break;
+    }
+  }
+  const latestUser = latestUserIndex >= 0 ? messages[latestUserIndex] : undefined;
+
+  // A caller-managed tool loop respawns/resumes the CLI after every tool round.
+  // The runtime session already remembers the user request and its own tool-call
+  // marker, but it does NOT know the result Agentis executed out-of-process. The
+  // old optimization returned only SYSTEM + latest USER here, silently dropping
+  // that result. Codex/Hermes therefore saw the original request again, repeated
+  // the same mutation, and re-ingested a rapidly growing session for no progress.
+  // Forward only the newest tool-result batch after the latest assistant tool
+  // boundary; earlier conversation remains owned by the native session.
+  let latestToolBoundary = -1;
+  for (let index = messages.length - 1; index > latestUserIndex; index -= 1) {
+    const message = messages[index];
+    if (message?.role === 'assistant' && message.toolCalls?.length) {
+      latestToolBoundary = index;
+      break;
+    }
+  }
+  if (latestToolBoundary >= 0) {
+    const results = messages.slice(latestToolBoundary + 1).filter((message) => message.role === 'tool');
+    if (results.length > 0) {
+      return [system, ...results].filter((message): message is ChatMessage => Boolean(message));
+    }
+  }
   return [system, latestUser].filter((message): message is ChatMessage => Boolean(message));
 }
 
@@ -143,6 +173,8 @@ export interface CliChatRuntimeConfig {
   /** Log namespace, e.g. "codex.chat". */
   logTag: string;
   logger: Logger;
+  /** Exact tools offered to this turn, used to bind an otherwise bare argument object safely. */
+  tools?: ToolDefinition[];
   /** The caller's turn-cancellation signal. */
   signal?: AbortSignal;
   /** Max gap between events before the turn is treated as idle/stalled. */
@@ -246,7 +278,7 @@ export async function* runCliChatTurn(cfg: CliChatRuntimeConfig): AsyncIterable<
         safeLabel: firstOutputSeen
           ? `${cfg.displayName} is working`
           : finalOnly
-            ? `Waiting for ${cfg.displayName} CLI final response`
+            ? `${cfg.displayName} is processing through the CLI fallback`
             : `Waiting for ${cfg.displayName} provider output`,
         transport: cfg.transport,
         attempt: cfg.attempt,
@@ -314,7 +346,7 @@ export async function* runCliChatTurn(cfg: CliChatRuntimeConfig): AsyncIterable<
   const flushPartialOnTimeout = (): boolean => {
     const partial = lastAgentMessage.trim() || latestAssistantText.trim() || stripProcessNoise(rawFallback);
     if (!partial) return false;
-    const { cleaned } = extractMarkerToolCalls(partial);
+    const { cleaned } = extractMarkerToolCalls(partial, cfg.tools);
     const body = (cleaned || partial).trim();
     if (!body) return false;
     // Only reached after `hardCeilingMs` of TOTAL silence — a genuinely stuck
@@ -539,11 +571,12 @@ export async function* runCliChatTurn(cfg: CliChatRuntimeConfig): AsyncIterable<
       const partial = (() => {
         const raw = lastAgentMessage.trim() || latestAssistantText.trim();
         if (!raw) return '';
-        const { cleaned } = extractMarkerToolCalls(raw);
+        const { cleaned } = extractMarkerToolCalls(raw, cfg.tools);
         return (cleaned || raw).trim();
       })();
       const hitLimit = /tool[-\s]?turn limit|max[\s_-]?turns|turn limit|reached .*limit/i.test(detail);
-      if (hitLimit || partial) {
+      const nonResumableFailure = isNonResumableRuntimeFailure(detail);
+      if (hitLimit || (partial && !nonResumableFailure)) {
         if (partial) queue.push({ type: 'text', delta: partial });
         const note = hitLimit
           ? `${detail} Say "continue" to resume from here.`
@@ -581,8 +614,8 @@ export async function* runCliChatTurn(cfg: CliChatRuntimeConfig): AsyncIterable<
     // raw fallback here silently discarded otherwise valid Agentis tool calls.
     const markerSource = orderedAssistantOutput.trim()
       || `${transcript}\n${lastAgentMessage}\n${rawFallback}`.trim();
-    const { calls: markerCalls } = extractMarkerToolCalls(markerSource);
-    const { cleaned } = extractMarkerToolCalls(source);
+    const { calls: markerCalls } = extractMarkerToolCalls(markerSource, cfg.tools);
+    const { cleaned } = extractMarkerToolCalls(source, cfg.tools);
     // The latest public assistant message becomes the final answer on runtimes
     // without a distinct completion payload. Remove only that provisional row;
     // earlier progress updates remain as an auditable, Codex-like work trace.
@@ -640,6 +673,17 @@ function terminateCliProcessTree(child: ReturnType<typeof spawn>): void {
     }
   }, 1_000);
   force.unref?.();
+}
+
+/** Provider/request failures cannot be repaired by resuming the same native session. */
+function isNonResumableRuntimeFailure(detail: string): boolean {
+  return /\bprompt is too long\b/i.test(detail)
+    || /\bcontext(?: window| length)?(?: is)? (?:too long|exceeded)\b/i.test(detail)
+    || /\bmaximum context length\b/i.test(detail)
+    || /\binvalid[_ -]?(?:api[_ -]?key|model|request)\b/i.test(detail)
+    || /\b(?:authentication|authorization) (?:failed|error)\b/i.test(detail)
+    || /\b(?:model).*(?:does not exist|not found|no access)\b/i.test(detail)
+    || /\b(?:insufficient quota|payment required|billing|out of credits?)\b/i.test(detail);
 }
 
 /**

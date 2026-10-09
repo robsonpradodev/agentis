@@ -41,6 +41,7 @@ import { readWorkflowTests, type WorkflowTestCase } from '../services/workflow/w
 import { readWorkflowSpec } from '../services/workflow/workflowSpec.js';
 import { evalCondition } from '../engine/SafeConditionParser.js';
 import { resolveWorkflowExecutionTarget } from '../services/workflow/workflowExecutionTarget.js';
+import type { AgentMissionService } from '../services/agentMissions.js';
 
 export function buildWorkflowRoutes(deps: {
   db: AgentisSqliteDb;
@@ -50,6 +51,7 @@ export function buildWorkflowRoutes(deps: {
   triggerRuntime?: TriggerRuntime;
   revisions?: WorkflowRevisionService;
   experience?: WorkflowExperienceService;
+  missions?: AgentMissionService;
   /** Optional: when provided, every create/update mirrors the workflow into Packages. */
   packager?: PackagerService;
 }) {
@@ -389,12 +391,14 @@ export function buildWorkflowRoutes(deps: {
     }
 
     const runId = randomUUID();
+    const mission = deps.missions ? createWorkflowMission(deps.db, deps.missions, ws.workspaceId, workflowId, runId, graph) : null;
     const state = buildInitialRunState({ runId, workflowId, graph, inputs });
     deps.db.insert(schema.workflowRuns).values({
       id: runId,
       workspaceId: ws.workspaceId,
       ambientId: ws.ambientId,
       workflowId,
+      missionId: mission?.id ?? null,
       userId: ws.user.id,
       status: 'CREATED',
       runState: state,
@@ -416,6 +420,7 @@ export function buildWorkflowRoutes(deps: {
     });
     return c.json({
       runId,
+      missionId: mission?.id ?? null,
       revisionId,
       mode: 'debug',
       selfHealEnabled: false,
@@ -878,6 +883,7 @@ export function buildWorkflowRoutes(deps: {
     // the persisted graph matches what the engine will run (and so the next read
     // is a no-op). Skipping this left the database permanently out of sync.
     const runId = randomUUID();
+    const mission = deps.missions ? createWorkflowMission(deps.db, deps.missions, ws.workspaceId, id, runId, graph) : null;
     const state = buildInitialRunState({
       runId,
       workflowId: id,
@@ -892,6 +898,7 @@ export function buildWorkflowRoutes(deps: {
         workspaceId: ws.workspaceId,
         ambientId: ws.ambientId,
         workflowId: id,
+        missionId: mission?.id ?? null,
         userId: ws.user.id,
         status: 'CREATED',
         runState: state,
@@ -905,6 +912,7 @@ export function buildWorkflowRoutes(deps: {
     // to CREATED state immediately.
     deps.bus.publish(REALTIME_ROOMS.workspace(ws.workspaceId), REALTIME_EVENTS.RUN_CREATED, {
       runId,
+      missionId: mission?.id ?? null,
       workflowId: id,
       ambientId: ws.ambientId,
     });
@@ -928,6 +936,7 @@ export function buildWorkflowRoutes(deps: {
     // are explicit debug executions; active runs retain production self-healing.
     return c.json({
       runId,
+      missionId: mission?.id ?? null,
       revisionId: selected.id,
       mode: body.mode,
       selfHealEnabled: !debugRun,
@@ -1611,6 +1620,75 @@ function loadWorkflow(db: AgentisSqliteDb, workspaceId: string, id: string) {
   // semantic mutation and must become a candidate, never an invisible read-time
   // graph that differs from what the revision/proof UI displays.
   return wf;
+}
+
+function createWorkflowMission(
+  db: AgentisSqliteDb,
+  missions: AgentMissionService,
+  workspaceId: string,
+  workflowId: string,
+  runId: string,
+  graph: WorkflowGraph,
+) {
+  const workflow = db.select({
+    title: schema.workflows.title, ownerAgentId: schema.workflows.ownerAgentId, appId: schema.workflows.appId,
+  }).from(schema.workflows).where(and(
+    eq(schema.workflows.workspaceId, workspaceId), eq(schema.workflows.id, workflowId),
+  )).get();
+  if (!workflow) return null;
+  const requirements: Array<{ id: string; kind: 'channel_delivery' | 'data_mutation' | 'schedule' | 'subject_update'; planStepId: string; minimum: number }> = [];
+  let configuredAgentId: string | null = null;
+  for (const node of graph.nodes) {
+    const config = node.config as unknown as Record<string, unknown>;
+    if (typeof config.agentId === 'string' && !configuredAgentId) configuredAgentId = config.agentId;
+    if (config.kind === 'agent_task') {
+      const contract = config.completionContract && typeof config.completionContract === 'object'
+        ? config.completionContract as { requiredEffects?: unknown } : null;
+      if (Array.isArray(contract?.requiredEffects)) {
+        for (const effect of contract.requiredEffects) {
+          if (effect === 'channel_delivery' || effect === 'data_mutation' || effect === 'schedule' || effect === 'subject_update') {
+            requirements.push({ id: `workflow:${node.id}:${effect}`, kind: effect, planStepId: node.id, minimum: 1 });
+          }
+        }
+      }
+    }
+    if (config.kind === 'channel') requirements.push({ id: `workflow:${node.id}:channel_delivery`, kind: 'channel_delivery', planStepId: node.id, minimum: 1 });
+    if (config.kind === 'data_mutate' && config.operation !== 'query' && config.operation !== 'get') {
+      requirements.push({ id: `workflow:${node.id}:data_mutation`, kind: 'data_mutation', planStepId: node.id, minimum: 1 });
+    }
+  }
+  if (requirements.length === 0) return null;
+  const appOwner = workflow.appId ? db.select({ ownerAgentId: schema.apps.ownerAgentId }).from(schema.apps)
+    .where(and(eq(schema.apps.workspaceId, workspaceId), eq(schema.apps.id, workflow.appId))).get()?.ownerAgentId ?? null : null;
+  const fallback = db.select({ id: schema.agents.id }).from(schema.agents).where(and(
+    eq(schema.agents.workspaceId, workspaceId), eq(schema.agents.role, 'orchestrator'),
+  )).get()?.id ?? null;
+  const ownerAgentId = workflow.ownerAgentId ?? configuredAgentId ?? appOwner ?? fallback;
+  if (!ownerAgentId) return null;
+  return missions.create({
+    workspaceId, ownerAgentId, appId: workflow.appId, sourceKind: 'workflow', sourceRef: runId,
+    correlationKey: `workflow-run:${runId}`,
+    objective: `Execute workflow "${workflow.title}" and produce its verified external outcome.`,
+    outcomeContract: { requiredEffects: requirements, successPolicy: 'all_required_effects' },
+    executionPlan: {
+      version: 1,
+      steps: graph.nodes.map((node) => {
+        const kind = (node.config as { kind?: string }).kind;
+        return {
+          id: node.id,
+          title: node.title,
+          kind: kind === 'wait' ? 'wait'
+            : kind === 'agent_task' ? 'decide'
+              : kind === 'channel' || kind === 'data_mutate' ? 'effect'
+                : 'verify',
+          status: 'pending' as const,
+          dependsOn: graph.edges.filter((edge) => edge.target === node.id).map((edge) => edge.source),
+          effectRequirementIds: requirements.filter((requirement) => requirement.planStepId === node.id).map((requirement) => requirement.id),
+        };
+      }),
+    },
+    nextWakeAt: new Date().toISOString(),
+  });
 }
 
 function ensureWorkflowSpace(db: AgentisSqliteDb, workspaceId: string, spaceId: string) {

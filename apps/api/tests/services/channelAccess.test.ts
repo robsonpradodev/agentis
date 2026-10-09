@@ -3,9 +3,9 @@ import { resolveChannelAccess, normalizeHandle, buildAccessAddendum } from '../.
 
 describe('normalizeHandle', () => {
   it('reduces phone/jids to digits regardless of formatting', () => {
-    expect(normalizeHandle('+55 31 9 5975237')).toBe('553195975237');
-    expect(normalizeHandle('553195975237@s.whatsapp.net')).toBe('553195975237');
-    expect(normalizeHandle('553195975237:16@s.whatsapp.net')).toBe('553195975237');
+    expect(normalizeHandle('+55 31 9 5975237')).toBe('15552345678');
+    expect(normalizeHandle('15552345678@s.whatsapp.net')).toBe('15552345678');
+    expect(normalizeHandle('15552345678:16@s.whatsapp.net')).toBe('15552345678');
     expect(normalizeHandle('8271269949')).toBe('8271269949');
   });
   it('keeps usernames as lowercased text', () => {
@@ -15,7 +15,7 @@ describe('normalizeHandle', () => {
 });
 
 describe('resolveChannelAccess', () => {
-  const owner = '553195975237@s.whatsapp.net';
+  const owner = '15552345678@s.whatsapp.net';
 
   it('is open when no access is configured (back-compat)', () => {
     const d = resolveChannelAccess({ senderHandle: 'anyone@s.whatsapp.net' });

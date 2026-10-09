@@ -238,6 +238,26 @@ describe('ClaudeCodeAdapter chat', () => {
     expect(deltas.at(-1)).toEqual({ type: 'done', finishReason: 'max_turns' });
   });
 
+  it('does not disguise a context overflow as resumable partial work', async () => {
+    const child = fakeChildProcess();
+    spawnMock.mockReturnValue(child);
+    const adapter = new ClaudeCodeAdapter({ agentId: 'agent-1', logger, binaryPath: 'claude-test' });
+    const consume = collectDeltas(adapter.chat([{ role: 'user', content: 'schedule me' }], []));
+
+    child.stdout.write('{"type":"assistant","message":{"content":[{"type":"text","text":"Prompt is too long"}]}}\n');
+    child.stdout.write('{"type":"result","subtype":"error_during_execution","is_error":true,"api_error_status":400,"result":"Prompt is too long"}\n');
+    child.emit('exit', 1);
+    const deltas = await consume;
+
+    expect(deltas.some((delta) => delta.type === 'text')).toBe(false);
+    expect(deltas).toContainEqual(expect.objectContaining({
+      type: 'tool_result',
+      name: 'adapter.chat',
+      error: expect.stringMatching(/prompt is too long/i),
+    }));
+    expect(deltas.at(-1)).toEqual({ type: 'done', finishReason: 'error' });
+  });
+
   it('treats a turn-limit stop as a SOFT, resumable stop — not a hard FAILED', async () => {
     const child = fakeChildProcess();
     spawnMock.mockReturnValue(child);

@@ -215,6 +215,10 @@ export function WorkflowMonitorCard({
   }, [activeRunId, activeRunStatus]);
 
   useEffect(() => {
+    // The canvas intentionally clears activeRunId when a run pauses or
+    // terminates. Keep the monitor's status latched to the tracked run until a
+    // different active run arrives; realtime/history owns that status now.
+    if (!activeRunId && trackedRunId) return;
     let next = monitorStatusFromRun(activeRunStatus, activeRunId);
     if (topApproval) {
       if (next === 'running') next = 'waiting';
@@ -229,7 +233,7 @@ export function WorkflowMonitorCard({
       }
       return next;
     });
-  }, [activeRunId, activeRunStatus, topApproval]);
+  }, [activeRunId, activeRunStatus, topApproval, trackedRunId]);
 
   useEffect(() => {
     let cancelled = false;
@@ -336,7 +340,7 @@ export function WorkflowMonitorCard({
   const displayFeed = (status === 'completed' || status === 'failed'
     ? feed.filter((item) => item.kind !== 'run')
     : feed
-  ).filter((item) => !(
+  ).filter((item) => !isRuntimeDiagnostic(item)).filter((item) => !(
     terminalKind === 'build'
     && item.kind === 'agent'
     && /workflow ready|response ready|finished this turn/i.test(item.detail)
@@ -952,11 +956,7 @@ function HealthStrip({
 }
 
 function RuntimeDiagnostics({ activity }: { activity: RealtimeActivity[] }) {
-  const diagnostics = activity.filter((item) => (
-    Boolean(item.transport)
-    || typeof item.durationMs === 'number'
-    || item.activityKind === 'fallback'
-  )).slice(0, 6);
+  const diagnostics = activity.filter(isRuntimeDiagnostic).slice(0, 6);
   if (diagnostics.length === 0) return null;
   return (
     <div className="border-t border-white/10 pt-2">
@@ -976,6 +976,16 @@ function RuntimeDiagnostics({ activity }: { activity: RealtimeActivity[] }) {
       </div>
     </div>
   );
+}
+
+function isRuntimeDiagnostic(item: RealtimeActivity): boolean {
+  return Boolean(item.transport)
+    || typeof item.durationMs === 'number'
+    || item.activityKind === 'fallback'
+    || item.activityKind === 'heartbeat'
+    || item.phase === 'runtime'
+    || item.phase === 'context'
+    || /^waiting for .+ (response|output)/i.test(item.detail.trim());
 }
 
 function HealthDetails({
@@ -1296,10 +1306,15 @@ function updateMonitorStatus(
   if (
     env.event === REALTIME_EVENTS.RUN_CREATED
     || env.event === REALTIME_EVENTS.RUN_RUNNING
-    || env.event === REALTIME_EVENTS.NODE_STARTED
-    || env.event === REALTIME_EVENTS.AGENT_WORK_STEP
   ) {
     setStatus((current) => current === 'completed' || current === 'failed' ? current : 'running');
+    return;
+  }
+  if (env.event === REALTIME_EVENTS.NODE_STARTED || env.event === REALTIME_EVENTS.AGENT_WORK_STEP) {
+    // Historical or late work events describe the run but cannot resume a
+    // deterministically paused/waiting run. Only an explicit run-running event
+    // may advance those lifecycle states.
+    setStatus((current) => ['completed', 'failed', 'paused', 'waiting'].includes(current) ? current : 'running');
   }
 }
 

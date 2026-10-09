@@ -24,6 +24,7 @@ import { registerCommandTools } from './commandTools.js';
 import { registerBlueprintTools } from './blueprint.js';
 import { registerTaskSpineTools } from './taskSpine.js';
 import { registerChannelTools } from './channel.js';
+import { registerChannelTeamTools } from './channelTeam.js';
 import { registerConversationTools } from './conversation.js';
 import { registerAppPlanTools } from './appPlan.js';
 import { registerAppGoalTools } from './appGoal.js';
@@ -35,10 +36,14 @@ import { registerAssetTools } from './assets.js';
 import { registerMcpBridgeTools } from './mcp.js';
 import { registerIntegrationTools } from './integration.js';
 import { registerAppDataTools } from './appData.js';
+import { registerAppFrontendTools } from './appFrontend.js';
 import { registerAppDoctorTools } from './appDoctor.js';
 import { registerBrainTools } from './brain.js';
 import { registerSpaceTools } from './spaceTools.js';
 import { registerPermissionTools } from './permissions.js';
+import { registerSuspensionTools } from './suspension.js';
+import { registerFollowUpTools } from './followUp.js';
+import { registerRelationshipQueryTools } from './relationshipQuery.js';
 
 export function registerAllTools(registry: AgentisToolRegistry, deps: ToolHandlerDeps): void {
   registerOrientTools(registry, deps);
@@ -56,6 +61,7 @@ export function registerAllTools(registry: AgentisToolRegistry, deps: ToolHandle
   registerBlueprintTools(registry, deps);
   registerTaskSpineTools(registry, deps);
   registerChannelTools(registry, deps);
+  registerChannelTeamTools(registry, deps);
   registerConversationTools(registry, deps);
   registerAppPlanTools(registry, deps);
   registerAppGoalTools(registry, deps);
@@ -67,10 +73,14 @@ export function registerAllTools(registry: AgentisToolRegistry, deps: ToolHandle
   registerMcpBridgeTools(registry, deps);
   registerIntegrationTools(registry, deps);
   registerAppDataTools(registry, deps);
+  registerAppFrontendTools(registry, deps);
   registerAppDoctorTools(registry, deps);
   registerBrainTools(registry, deps);
   registerSpaceTools(registry, deps);
   registerPermissionTools(registry, deps);
+  registerSuspensionTools(registry, deps);
+  registerFollowUpTools(registry, deps);
+  registerRelationshipQueryTools(registry, deps);
   // Registered last, but its SDK surface is resolved lazily at call time, so it
   // still exposes every tool above (§3.7 code-mode over the whole registry).
   registerCodeTools(registry, deps);

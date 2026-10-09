@@ -68,6 +68,26 @@ export function buildWebhookRoutes(deps: {
     return c.json(result, result.idempotent ? 200 : 202);
   });
 
+  // Meta uses one callback URL per app/WABA integration. Resolve each event to
+  // its workspace-owned phone_number_id instead of requiring a callback URL per
+  // customer connection. Per-connection routes remain available for migrations.
+  app.get('/whatsapp', (c) => {
+    if (!deps.bridge) throw new AgentisError('CHANNEL_BRIDGE_UNAVAILABLE', 'channel bridge not configured');
+    const query: Record<string, string | undefined> = {};
+    for (const [key, value] of Object.entries(c.req.query())) query[key] = value;
+    const verified = deps.bridge.verifyWhatsAppCloudWebhook(query);
+    return c.body(verified.body, 200, { 'content-type': 'text/plain; charset=utf-8' });
+  });
+
+  app.post('/whatsapp', async (c) => {
+    if (!deps.bridge) throw new AgentisError('CHANNEL_BRIDGE_UNAVAILABLE', 'channel bridge not configured');
+    const headers: Record<string, string | undefined> = {};
+    c.req.raw.headers.forEach((value, key) => { headers[key.toLowerCase()] = value; });
+    const rawBody = await c.req.text();
+    const result = await deps.bridge.handleWhatsAppCloudWebhook({ headers, rawBody });
+    return c.json(result, result.accepted ? 200 : 202);
+  });
+
   app.post('/channel/:connectionId', async (c) => {
     if (!deps.bridge) {
       throw new AgentisError('CHANNEL_BRIDGE_UNAVAILABLE', 'channel bridge not configured');

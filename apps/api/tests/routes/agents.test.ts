@@ -14,6 +14,7 @@ import { buildAgentMutationRoutes } from '../../src/routes/agentMutations.js';
 import { AdapterManager } from '../../src/adapters/AdapterManager.js';
 import { HttpAdapter } from '../../src/adapters/HttpAdapter.js';
 import { ConversationStore } from '../../src/services/conversation/conversationStore.js';
+import { AgentisToolRegistry } from '../../src/services/agentisToolRegistry.js';
 import { createTestContext, type TestContext } from '../_helpers/createTestContext.js';
 
 let ctx: TestContext;
@@ -26,7 +27,7 @@ beforeEach(async () => {
   conversations = new ConversationStore({ db: ctx.db, bus: ctx.bus });
 });
 
-function app() {
+function app(toolRegistry?: AgentisToolRegistry) {
   return ctx.buildApp([
     {
       path: '/v1/agents',
@@ -37,10 +38,48 @@ function app() {
         adapters,
         logger: ctx.logger,
         conversations,
+        toolRegistry,
       }),
     },
   ]);
 }
+
+describe('Agent private Brain administration', () => {
+  it('uses the same registered inspect and two-phase prune handlers as Agent/MCP execution', async () => {
+    const agentId = seedAgent();
+    const registry = new AgentisToolRegistry({ logger: ctx.logger });
+    registry.register({
+      id: 'agentis.agent.brain.inspect', family: 'inspect', description: 'Inspect Brain',
+      inputSchema: { type: 'object', required: ['agentId'] }, mutating: false,
+    }, (args) => ({ agentId: args.agentId, counts: { memories: 2 } }));
+    registry.register({
+      id: 'agentis.agent.brain.prune', family: 'build', description: 'Prune Brain',
+      inputSchema: { type: 'object', required: ['agentId', 'keep'] }, mutating: true,
+      autoExecute: true,
+    }, (args) => ({ applied: Boolean(args.confirmationToken), agentId: args.agentId, keep: args.keep }));
+    const api = app(registry);
+
+    const inspected = await api.request(`/v1/agents/${agentId}/brain`, { headers: ctx.authHeaders });
+    expect(inspected.status).toBe(200);
+    expect(await inspected.json()).toMatchObject({ brain: { agentId, counts: { memories: 2 } } });
+
+    const preview = await api.request(`/v1/agents/${agentId}/brain/prune`, {
+      method: 'POST', headers: ctx.authHeaders,
+      body: JSON.stringify({ keep: { memoryIds: ['canonical'] } }),
+    });
+    expect(preview.status).toBe(200);
+    expect(await preview.json()).toMatchObject({
+      brainPrune: { applied: false, agentId, keep: { memoryIds: ['canonical'] } },
+    });
+
+    const applied = await api.request(`/v1/agents/${agentId}/brain/prune`, {
+      method: 'POST', headers: ctx.authHeaders,
+      body: JSON.stringify({ keep: { memoryIds: ['canonical'] }, confirmationToken: 'preview-token' }),
+    });
+    expect(applied.status).toBe(200);
+    expect(await applied.json()).toMatchObject({ brainPrune: { applied: true, agentId } });
+  });
+});
 
 function mutationApp() {
   return ctx.buildApp([

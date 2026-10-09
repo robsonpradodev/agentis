@@ -62,6 +62,14 @@ describe('turn metrics', () => {
     expect(m.byFinishReason).toEqual({ stop: 2, tool_calls: 1 });
   });
 
+  it('surfaces prompt volume and compaction frequency', () => {
+    recordTurn(sample({ promptInputTokens: 2_400, promptCompactions: 1 }));
+    recordTurn(sample({ promptInputTokens: 1_200, promptCompactions: 0 }));
+    const m = getTurnMetrics();
+    expect(m.promptInputTokens.avg).toBe(1_800);
+    expect(m.promptCompactions).toBe(1);
+  });
+
   it('resets with resetToolMetrics', () => {
     recordTurn(sample());
     resetToolMetrics();

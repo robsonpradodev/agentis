@@ -41,4 +41,25 @@ describe('AdapterManager interactive leases', () => {
     releaseChat?.();
     expect(manager.interactiveLease('agent-1')).toBeNull();
   });
+
+  it('clears a stale interactive lease when the agent runtime is replaced', async () => {
+    const manager = new AdapterManager(logger);
+    manager.register('agent-1', {
+      adapterType: 'http',
+      connect: vi.fn(),
+      disconnect: vi.fn(),
+      dispatchTask: vi.fn(),
+      cancelTask: vi.fn(),
+      healthCheck: vi.fn(),
+      capabilities: vi.fn(() => ({})),
+      onEvent: vi.fn(),
+    } as any);
+    manager.tryAcquireInteractiveLease('agent-1', {
+      ownerId: 'conversation:stale-turn', kind: 'operator_chat', priority: 100,
+    });
+
+    await manager.unregister('agent-1');
+
+    expect(manager.interactiveLease('agent-1')).toBeNull();
+  });
 });

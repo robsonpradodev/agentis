@@ -66,6 +66,12 @@ const ALLOWLIST = new Set([
   'apps/api/src/adapters/CodexAdapter.ts',
   'apps/api/src/engine/executors/nodeExecutors.ts',
   'apps/web/src/components/apps/blocks/opsBlocks.tsx',
+  // These files were already over the hard cap at the 1.1.5 baseline (1398,
+  // 1074, and 1010 lines respectively). Keep them visible as decomposition
+  // debt without misclassifying the current release as introducing them.
+  'apps/web/src/components/agents/AgentChannelsTab.tsx',
+  'apps/api/src/adapters/channels/whatsappSession.ts',
+  'apps/web/src/components/agents/AgentHierarchyCanvas.tsx',
 ]);
 
 function collect(dir, out = []) {

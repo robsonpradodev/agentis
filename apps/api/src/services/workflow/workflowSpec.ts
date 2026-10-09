@@ -130,6 +130,7 @@ export function validateWorkflowSpec(spec: WorkflowSpec, args: SpecValidationArg
     errors.push('acceptance is required — at least one verifiable claim ("how will we KNOW it worked?").');
   }
   const declaredKeys = new Set(workflowContractFields(args.graph?.outputContract).map((field) => field.key));
+  const executionServices = workflowExecutionServices(args.graph);
   const seenIds = new Set<string>();
   if (spec.acceptance.length > 0 && spec.acceptance.every((check) => check.verify === 'judge')) {
     errors.push('acceptance requires at least one mechanical or world-observable check; a judge cannot be the only proof.');
@@ -165,6 +166,8 @@ export function validateWorkflowSpec(spec: WorkflowSpec, args: SpecValidationArg
         if (!check.integration?.trim()) errors.push(`${label}: integration is required.`);
         else if (check.integration !== 'agentis_app' && args.knownServices && !args.knownServices.includes(check.integration)) {
           errors.push(`${label}: integration "${check.integration}" is not a runnable service in this workspace.`);
+        } else if (executionServices && !executionServices.has(check.integration)) {
+          errors.push(`${label}: integration "${check.integration}" is outside this workflow's execution closure; the probe cannot define this graph's success.`);
         }
         if (!check.operation?.trim()) errors.push(`${label}: operation is required.`);
         if (check.integration === 'agentis_app' && check.operation !== 'query') {
@@ -222,6 +225,25 @@ export function validateWorkflowSpec(spec: WorkflowSpec, args: SpecValidationArg
     }
   }
   return errors;
+}
+
+/** Services whose effects can actually be produced by this graph. A worldly
+ * acceptance probe may observe one of these services, never an unrelated
+ * mounted integration that happens to exist elsewhere in the workspace. */
+function workflowExecutionServices(graph: WorkflowGraph | undefined): Set<string> | null {
+  if (!graph || graph.nodes.length === 0) return null;
+  const services = new Set<string>();
+  for (const node of graph.nodes) {
+    const config = node.config as unknown as Record<string, unknown>;
+    if (config.kind === 'data_query' || config.kind === 'data_mutate') services.add('agentis_app');
+    if (config.kind === 'integration' && typeof config.integrationId === 'string' && config.integrationId.trim()) {
+      services.add(config.integrationId.trim());
+    }
+    if (config.kind === 'mcp' && typeof config.serverId === 'string' && config.serverId.trim()) {
+      services.add(config.serverId.trim());
+    }
+  }
+  return services;
 }
 
 function exprParses(expr: string | undefined): boolean {

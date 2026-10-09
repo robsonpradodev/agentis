@@ -1,0 +1,12 @@
+.git
+node_modules
+**/node_modules
+apps/api/.agentis
+apps/web/dist
+packages/cli/dist
+.codex-tmp
+.playwright-mcp
+test-results
+landing-run-logs
+=
+*.log

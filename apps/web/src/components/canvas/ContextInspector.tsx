@@ -787,6 +787,17 @@ function AgentTaskForm({ data, update, agents, upstream, session = false, onAgen
   const agentRole = asStr(data.agentRole);
   const boundAgent = agents.find((a) => a.id === agentId);
   const adapterType = boundAgent?.adapterType;
+  const taskMode = data.taskMode === 'act' ? 'act' : data.taskMode === 'answer' ? 'answer' : 'auto';
+  const completionContract = data.completionContract && typeof data.completionContract === 'object'
+    ? data.completionContract as { requiredEffects?: unknown }
+    : {};
+  const requiredEffects = Array.isArray(completionContract.requiredEffects)
+    ? completionContract.requiredEffects.map(String)
+    : [];
+  const setEffect = (effect: string, checked: boolean) => {
+    const next = checked ? [...new Set([...requiredEffects, effect])] : requiredEffects.filter((item) => item !== effect);
+    update({ completionContract: next.length > 0 ? { ...completionContract, requiredEffects: next } : undefined });
+  };
   return (
     <>
       {/* Legacy role-cast nodes (authored by the orchestrator, no explicit agentId)
@@ -843,13 +854,61 @@ function AgentTaskForm({ data, update, agents, upstream, session = false, onAgen
           </label>
         </Field>
       )}
+      {!session && (
+        <Field label="Task outcome" hint="Action tasks cannot finish from prose: Agentis requires receipts for every selected external effect.">
+          <select
+            className={selectCls}
+            value={taskMode}
+            onChange={(event) => {
+              const next = event.target.value;
+              update(next === 'auto'
+                ? { taskMode: undefined, completionContract: undefined }
+                : next === 'answer'
+                  ? { taskMode: 'answer', completionContract: undefined }
+                  : { taskMode: 'act' });
+            }}
+          >
+            <option value="auto">Auto-detect from prompt</option>
+            <option value="answer">Answer only</option>
+            <option value="act">Perform verified actions</option>
+          </select>
+          {taskMode === 'act' && (
+            <div className="mt-2 grid grid-cols-2 gap-1.5">
+              {([
+                ['channel_delivery', 'Channel delivery'],
+                ['data_mutation', 'Data mutation'],
+                ['schedule', 'Next action'],
+                ['subject_update', 'Subject state'],
+              ] as const).map(([effect, label]) => (
+                <label key={effect} className="flex items-center gap-1.5 rounded-md border border-line bg-canvas px-2 py-1.5 text-[10px] text-text-secondary">
+                  <input type="checkbox" checked={requiredEffects.includes(effect)} onChange={(event) => setEffect(effect, event.target.checked)} />
+                  {label}
+                </label>
+              ))}
+            </div>
+          )}
+          {taskMode === 'act' && requiredEffects.length === 0 && (
+            <p className="mt-1 text-[10px] text-warn">Select at least one required effect. The run will fail closed without it.</p>
+          )}
+        </Field>
+      )}
       <Field label="Prompt" hint="Type `{{` to insert a variable from the trigger or any upstream node.">
         <TemplatedTextField
           multiline
           rows={5}
           placeholder="Describe the task in plain English…"
           value={asStr(data.prompt)}
-          onChange={(next) => update({ prompt: next })}
+          onChange={(next) => {
+            const previousInferred = inferAgentTaskEffects(asStr(data.prompt));
+            const contractWasInferred = taskMode === 'auto'
+              || (taskMode === 'act' && sameStringSet(requiredEffects, previousInferred));
+            const inferred = contractWasInferred ? inferAgentTaskEffects(next) : [];
+            update(contractWasInferred
+              ? inferred.length > 0
+                ? { prompt: next, taskMode: 'act', completionContract: { requiredEffects: inferred } }
+                : { prompt: next, taskMode: undefined, completionContract: undefined }
+              : { prompt: next });
+          }}
           upstream={upstream}
         />
         <div className="mt-1.5">
@@ -866,6 +925,21 @@ function AgentTaskForm({ data, update, agents, upstream, session = false, onAgen
       <OutputKeysField data={data} update={update} />
     </>
   );
+}
+
+function inferAgentTaskEffects(prompt: string): string[] {
+  const text = prompt.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+  const effects: string[] = [];
+  if (/\b(send|deliver|envie|enviar|mandar|entregue|envia(?:r|do)?|envio)\b/.test(text)
+    || /\b(message|mensagem|mensaje)\s+(?:the\s+)?(lead|contact|customer|him|her|cliente|contato)\b/.test(text)) effects.push('channel_delivery');
+  if (/\b(update|move|mark|change|persist|save|insert|upsert|delete|atualiz\w*|mova|mover|marque|alter\w*|salv\w*)\b/.test(text)) effects.push('data_mutation');
+  if (/\b(follow[ -]?up|schedule|next action|remind|agend\w*|proxima acao)\b/.test(text)) effects.push('schedule');
+  if (/\b(enroll|update|record|create|cancel|set|inscrev\w*|atualiz\w*|registre|crie|cancele)\b.{0,60}\b(subject|relationship|relacion\w*|handoff|opt[ -]?out|suppression)\b/.test(text)) effects.push('subject_update');
+  return effects;
+}
+
+function sameStringSet(left: string[], right: string[]): boolean {
+  return left.length === right.length && left.every((value) => right.includes(value));
 }
 
 /**

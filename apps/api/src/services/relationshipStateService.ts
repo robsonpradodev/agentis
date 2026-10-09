@@ -18,25 +18,41 @@ export interface RelationshipTouchInput {
 
 /** Owns the canonical per-counterparty Subject. Contacts and conversations are projections of it. */
 export class RelationshipStateService {
-  constructor(private readonly deps: {
-    db: AgentisSqliteDb;
-    entities: DurableEntityService;
-    identities: ChannelIdentityService;
-  }) {}
+  constructor(
+    private readonly deps: {
+      db: AgentisSqliteDb;
+      entities: DurableEntityService;
+      identities: ChannelIdentityService;
+    },
+  ) {}
 
-  touch(input: RelationshipTouchInput): { subject: EntityRow; principal: PrincipalContext; state: RelationshipState } {
-    let identity = this.deps.identities.resolve(input.workspaceId, input.channelKind, input.handle, input.connectionId)
-      ?? this.deps.identities.record({
-      workspaceId: input.workspaceId,
-      connectionId: input.connectionId,
-      channelKind: input.channelKind,
-      handle: input.handle,
-      ...(input.displayName ? { displayName: input.displayName } : {}),
+  touch(input: RelationshipTouchInput): {
+    subject: EntityRow;
+    principal: PrincipalContext;
+    state: RelationshipState;
+  } {
+    let identity =
+      this.deps.identities.resolve(
+        input.workspaceId,
+        input.channelKind,
+        input.handle,
+        input.connectionId,
+      ) ??
+      this.deps.identities.record({
+        workspaceId: input.workspaceId,
+        connectionId: input.connectionId,
+        channelKind: input.channelKind,
+        handle: input.handle,
+        ...(input.displayName ? { displayName: input.displayName } : {}),
       });
     const principal = this.deps.identities.principal(input);
     const now = new Date().toISOString();
     const projection = input.contactId
-      ? this.deps.db.select().from(schema.appContacts).where(eq(schema.appContacts.id, input.contactId)).get()
+      ? this.deps.db
+          .select()
+          .from(schema.appContacts)
+          .where(eq(schema.appContacts.id, input.contactId))
+          .get()
       : null;
     const key = `person:${principal.peerKey}`;
     let current = this.deps.entities.getByKey(input.workspaceId, 'subject', key);
@@ -45,21 +61,33 @@ export class RelationshipStateService {
       if (grounded?.kind === 'subject' && grounded.workspaceId === input.workspaceId) {
         // Linking channels may replace a provisional channel key with a stable
         // person key. Preserve the actor and its history; only rename its key.
-        this.deps.db.update(schema.durableEntities).set({ key, updatedAt: now })
-          .where(eq(schema.durableEntities.id, grounded.id)).run();
+        this.deps.db
+          .update(schema.durableEntities)
+          .set({ key, updatedAt: now })
+          .where(eq(schema.durableEntities.id, grounded.id))
+          .run();
         current = { ...grounded, key, updatedAt: now };
       }
     }
     const existing = current?.stateJson as Partial<RelationshipState> | undefined;
     const handles = [...(existing?.identity?.handles ?? [])];
     if (!handles.some((h) => h.connectionId === input.connectionId && h.handle === input.handle)) {
-      handles.push({ connectionId: input.connectionId, channelKind: input.channelKind, handle: input.handle });
+      handles.push({
+        connectionId: input.connectionId,
+        channelKind: input.channelKind,
+        handle: input.handle,
+      });
     }
     const engagements = [...(existing?.engagements ?? [])];
     if (input.appId && !engagements.some((e) => e.id === `app:${input.appId}`)) {
       engagements.push({
-        id: `app:${input.appId}`, kind: 'app', goal: projection?.goal ?? 'advance this relationship usefully',
-        stage: projection?.stage ?? 'new', status: 'active', openedAt: now, updatedAt: now,
+        id: `app:${input.appId}`,
+        kind: 'app',
+        goal: projection?.goal ?? 'advance this relationship usefully',
+        stage: projection?.stage ?? 'new',
+        status: 'active',
+        openedAt: now,
+        updatedAt: now,
       });
     }
     const state: RelationshipState = {
@@ -77,6 +105,7 @@ export class RelationshipStateService {
       blockers: existing?.blockers ?? [],
       nextAction: existing?.nextAction ?? null,
       memoryRefs: existing?.memoryRefs ?? [],
+      decisionHistory: existing?.decisionHistory ?? [],
       lastInboundAt: input.inboundText != null ? now : (existing?.lastInboundAt ?? null),
       lastOutboundAt: existing?.lastOutboundAt ?? null,
       updatedAt: now,
@@ -93,8 +122,16 @@ export class RelationshipStateService {
       identity = { ...identity, groundingEntityId: subject.id };
     }
     if (input.contactId) {
-      this.deps.db.update(schema.appContacts).set({ subjectId: subject.id, updatedAt: now })
-        .where(and(eq(schema.appContacts.workspaceId, input.workspaceId), eq(schema.appContacts.id, input.contactId))).run();
+      this.deps.db
+        .update(schema.appContacts)
+        .set({ subjectId: subject.id, updatedAt: now })
+        .where(
+          and(
+            eq(schema.appContacts.workspaceId, input.workspaceId),
+            eq(schema.appContacts.id, input.contactId),
+          ),
+        )
+        .run();
     }
     if (input.inboundText != null) {
       this.deps.entities.post(subject.id, 'channel.inbound', {
@@ -107,6 +144,47 @@ export class RelationshipStateService {
       });
     }
     return { subject, principal: { ...principal, groundingEntityId: subject.id }, state };
+  }
+
+  /**
+   * Stamp the outbound clock on the relationship this reply belongs to.
+   *
+   * Without this, `lastOutboundAt` was written ONLY by SubjectRuntime when it
+   * performed a due proactive action, so an ordinary agent reply left the
+   * relationship looking untouched. Every "who went silent" question is a
+   * comparison of these two clocks, so a missing outbound stamp made the whole
+   * cohort undecidable: a lead the agent answered ten minutes ago and a lead
+   * nobody ever wrote to were indistinguishable.
+   *
+   * Resolves an EXISTING identity only — delivering a message must never mint a
+   * relationship that the inbound path did not already establish. Best-effort by
+   * contract: never throws, never touches the wake clock.
+   */
+  recordOutbound(input: {
+    workspaceId: string;
+    connectionId: string;
+    channelKind: string;
+    handle: string;
+    at?: string;
+  }): void {
+    const identity = this.deps.identities.resolve(
+      input.workspaceId,
+      input.channelKind,
+      input.handle,
+      input.connectionId,
+    );
+    if (!identity?.groundingEntityId) return;
+    const entity = this.deps.entities.get(identity.groundingEntityId);
+    if (!entity || entity.kind !== 'subject' || entity.workspaceId !== input.workspaceId) return;
+    const now = input.at ?? new Date().toISOString();
+    // Shallow state merge only: the wake clock and awaited correlation belong to
+    // whatever the SubjectRuntime last decided, and a reply must not disturb them.
+    this.deps.entities.upsert({
+      workspaceId: entity.workspaceId,
+      kind: 'subject',
+      key: entity.key,
+      state: { lastOutboundAt: now, updatedAt: now },
+    });
   }
 
   get(subjectId: string): RelationshipState | null {
@@ -137,23 +215,66 @@ export class RelationshipStateService {
   contextBlock(subjectId: string): string | null {
     const continuity = this.continuity(subjectId);
     if (!continuity) return null;
+    const state = this.get(subjectId);
+    if (!state) return null;
+    const now = Date.now();
+    const facts = state.facts
+      .filter((fact) => !fact.archivedAt && (!fact.expiresAt || Date.parse(fact.expiresAt) > now))
+      .slice(-12)
+      .map(
+        (fact) =>
+          `- ${fact.key}: ${briefValue(fact.value)} (origem ${fact.source}; observado ${fact.observedAt}; confiança ${fact.confidence.toFixed(2)}${fact.expiresAt ? `; válido até ${fact.expiresAt}` : ''})`,
+      );
+    const commitments = state.commitments
+      .filter((item) => item.status === 'open')
+      .slice(-12)
+      .map(
+        (item) =>
+          `- ${item.owner} deve: ${item.text}${item.dueAt ? ` (prazo ${item.dueAt})` : ''} [id ${item.id}]`,
+      );
+    const decisions = (state.decisionHistory ?? [])
+      .slice(-5)
+      .map(
+        (item) =>
+          `- ${item.evaluatedAt}: ${item.outcome} — ${item.reason}${item.relatedEventIds?.length ? ` [eventos ${item.relatedEventIds.join(', ')}]` : ''}`,
+      );
     return [
       'DURABLE RELATIONSHIP STATE',
-      JSON.stringify(continuity),
-      'Treat this person/case as a continuing goal-directed relationship. Update commitments and next action through the Subject tools when material facts change. Do not invent facts; preserve provenance and close or cancel obsolete actions.',
+      `Subject ${state.subjectKey}; atualizado em ${state.updatedAt}; contato ${state.identity.displayName ?? 'sem nome confirmado'}.`,
+      `Objetivo ativo: ${continuity.goal ?? 'nenhum'}; etapa: ${continuity.stage ?? 'não definida'}.`,
+      `Fatos confirmados recentes (fonte, horário e validade fazem parte do fato):\n${facts.length ? facts.join('\n') : '- Nenhum fato ativo confirmado.'}`,
+      `Compromissos abertos:\n${commitments.length ? commitments.join('\n') : '- Nenhum compromisso aberto.'}`,
+      `Próxima ação: ${continuity.nextAction ? JSON.stringify(continuity.nextAction) : 'nenhuma'}. Bloqueios atuais: ${state.blockers.length ? state.blockers.join('; ') : 'nenhum'}.`,
+      `Decisões recentes e motivo:\n${decisions.length ? decisions.join('\n') : '- Ainda não há decisões registradas.'}`,
+      `Perguntas em aberto: ${state.openQuestions.length ? state.openQuestions.join('; ') : 'nenhuma'}. Referências de memória relacionadas: ${state.memoryRefs.length ? state.memoryRefs.slice(-10).join(', ') : 'nenhuma'}.`,
+      'Use apenas fatos ativos. A síntese é uma projeção explicável, não uma fonte nova; confira a origem antes de fazer afirmações externas. Atualize compromissos e próxima ação pelas ferramentas de Subject quando fatos mudarem; feche ou cancele ações obsoletas.',
+      // Stating the obligation is what turns the capability into behaviour. The
+      // spine could always carry a delayed action; without this line the model
+      // ended every turn as if it were the last one it would ever take.
+      'This turn does not have to be your last act here. If you commit to anything you cannot finish now — sending something later, checking back if they go quiet, confirming with someone else — arm it with agentis.followup.schedule before you finish, and describe the goal well enough that you could act on it without re-reading this conversation. If a pending action above is no longer warranted, cancel it with agentis.followup.cancel. Never end a turn leaving a promise with nothing scheduled behind it.',
     ].join('\n');
   }
 }
 
 function projectionFacts(value: unknown, now: string): RelationshipState['facts'] {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return [];
-  return Object.entries(value as Record<string, unknown>).slice(0, 100).map(([key, fact]) => ({
-    key, value: fact, confidence: 0.8, source: 'import' as const, observedAt: now, lastConfirmedAt: now,
-  }));
+  return Object.entries(value as Record<string, unknown>)
+    .slice(0, 100)
+    .map(([key, fact]) => ({
+      key,
+      value: fact,
+      confidence: 0.8,
+      source: 'import' as const,
+      observedAt: now,
+      lastConfirmedAt: now,
+    }));
 }
 
 export function normalizeRelationshipState(subjectKey: string, raw: unknown): RelationshipState {
-  const value = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw as Partial<RelationshipState> : {};
+  const value =
+    raw && typeof raw === 'object' && !Array.isArray(raw)
+      ? (raw as Partial<RelationshipState>)
+      : {};
   const now = new Date().toISOString();
   return {
     version: 2,
@@ -166,8 +287,19 @@ export function normalizeRelationshipState(subjectKey: string, raw: unknown): Re
     blockers: Array.isArray(value.blockers) ? value.blockers : [],
     nextAction: value.nextAction ?? null,
     memoryRefs: Array.isArray(value.memoryRefs) ? value.memoryRefs : [],
+    decisionHistory: Array.isArray(value.decisionHistory) ? value.decisionHistory.slice(-100) : [],
     lastInboundAt: value.lastInboundAt ?? null,
     lastOutboundAt: value.lastOutboundAt ?? null,
     updatedAt: value.updatedAt ?? now,
   };
+}
+
+function briefValue(value: unknown): string {
+  let text: string;
+  try {
+    text = typeof value === 'string' ? value : JSON.stringify(value);
+  } catch {
+    text = '[valor indisponível]';
+  }
+  return (text || 'null').replaceAll('\n', ' ').slice(0, 180);
 }

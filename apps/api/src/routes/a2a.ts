@@ -26,17 +26,24 @@ import type { AgentisSqliteDb } from '@agentis/db/sqlite';
 import type { AuthService } from '../services/auth.js';
 import type { AdapterManager } from '../adapters/AdapterManager.js';
 import type { WorkflowEngine } from '../engine/WorkflowEngine.js';
-import { runPublishedWorkflow, inputSchemaFor } from '../engine/runPublishedWorkflow.js';
+import { runPublishedWorkflow, startPublishedWorkflow, inputSchemaFor } from '../engine/runPublishedWorkflow.js';
+import { streamSSE } from 'hono/streaming';
 import { requireAuth } from '../middleware/auth.js';
 import { getWorkspace, requireWorkspace } from '../middleware/workspace.js';
+import type { AgentMissionService } from '../services/agentMissions.js';
+import { AppOperationRuntime } from '../services/appOperationRuntime.js';
+import { AppDefinitionStore } from '@agentis/app';
+import type { ExtensionRuntime } from '../services/extensionRuntime.js';
 
-const PROTOCOL_VERSION = '0.3.0';
+const PROTOCOL_VERSION = '1.0.0';
 
 export interface A2aRoutesDeps {
   db: AgentisSqliteDb;
   auth: AuthService;
   adapters: AdapterManager;
   engine: WorkflowEngine;
+  missions?: AgentMissionService;
+  extensions?: ExtensionRuntime;
   /** Records the inbound A2A call as a conversation-theater interaction. */
   activity?: import('../services/activityFeed.js').ActivityFeedService;
 }
@@ -50,19 +57,21 @@ interface WorkflowSkill {
 
 export function buildA2aRoutes(deps: A2aRoutesDeps) {
   const app = new Hono();
+  const operationRuntime = deps.missions ? new AppOperationRuntime({ ...deps, missions: deps.missions }) : null;
+  const definitions = new AppDefinitionStore(deps.db);
   app.use('*', requireAuth(deps), requireWorkspace(deps));
 
   // ── Discovery: the workspace Agent Card ──────────────────────────────────
   app.get('/agent-card.json', (c) => {
     const ws = getWorkspace(c);
-    const skills = publishedSkills(deps.db, ws.workspaceId);
+    const skills = [...publishedSkills(deps.db, ws.workspaceId), ...publishedAppSkills(deps.db, definitions, ws.workspaceId)];
     return c.json({
       protocolVersion: PROTOCOL_VERSION,
       name: 'Agentis workspace',
       description: 'Agentis orchestration workspace exposed as an A2A agent. Skills are published workflows.',
       version: '1.0.0',
       url: '/v1/a2a',
-      capabilities: { streaming: false, pushNotifications: false, stateTransitionHistory: false },
+      capabilities: { streaming: true, pushNotifications: false, stateTransitionHistory: true, extendedAgentCard: true },
       defaultInputModes: ['text', 'application/json'],
       defaultOutputModes: ['text', 'application/json'],
       skills: skills.map((s) => ({
@@ -102,11 +111,44 @@ export function buildA2aRoutes(deps: A2aRoutesDeps) {
     const skillId = body.skillId ?? message.skillId;
     if (!skillId) throw new AgentisError('VALIDATION_FAILED', 'a skillId (published workflow slug) is required');
 
+    const inputs = inputsFromParts(message.parts);
+    const appSkill = parseAppSkill(skillId);
+    if (appSkill) {
+      if (!operationRuntime || !deps.missions) throw new AgentisError('VALIDATION_FAILED', 'Durable App operations are not configured on this A2A server.');
+      const result = await operationRuntime.invoke({
+        workspaceId: ws.workspaceId, ambientId: ws.ambientId, userId: ws.user.id,
+        appId: appSkill.appId, operationId: appSkill.operationId, input: inputs,
+        idempotencyKey: body.idempotencyKey ?? `a2a:${message.messageId ?? randomUUID()}`,
+      });
+      if (isObject(result) && result.kind === 'task' && isObject(result.task) && typeof result.task.id === 'string') {
+        return c.json(toA2aTask(deps.missions.inspect(ws.workspaceId, result.task.id)));
+      }
+      return c.json({ kind: 'message', role: 'agent', messageId: randomUUID(), parts: [{ kind: 'data', data: result }] });
+    }
     const wf = publishedWorkflowBySlug(deps.db, ws.workspaceId, skillId);
     if (!wf) throw new AgentisError('RESOURCE_NOT_FOUND', `no published A2A skill '${skillId}'`);
-
-    const inputs = inputsFromParts(message.parts);
-    const taskId = randomUUID();
+    if (!deps.missions) {
+      const completed = await runPublishedWorkflow({
+        db: deps.db, engine: deps.engine, workspaceId: ws.workspaceId, ambientId: ws.ambientId,
+        userId: ws.user.id, workflowId: wf.id, graph: wf.graph as WorkflowGraph, inputs,
+      });
+      if (!completed.terminal || completed.executionStatus !== 'completed') {
+        throw new AgentisError('INTERNAL_ERROR', `A2A workflow settled as ${completed.status}`);
+      }
+      return c.json({
+        id: completed.runId, contextId: completed.runId, kind: 'task',
+        status: { state: 'completed', timestamp: new Date().toISOString() },
+        artifacts: [{ artifactId: `run:${completed.runId}:output`, name: 'Workflow output', parts: [{ kind: 'data', data: completed.output }] }],
+        history: [], metadata: { workflowId: wf.id },
+      });
+    }
+    const ownerAgentId = ownerAgentForWorkflow(deps.db, ws.workspaceId, wf.id);
+    if (!ownerAgentId) throw new AgentisError('VALIDATION_FAILED', 'Published A2A workflows require an owning App agent.');
+    const task = deps.missions.create({
+      workspaceId: ws.workspaceId, ownerAgentId, appId: wf.appId ?? null, sourceKind: 'api',
+      correlationKey: body.idempotencyKey ?? `a2a:${message.messageId ?? randomUUID()}`,
+      objective: `A2A task: ${wf.title}`, outcomeContract: { requiredEffects: [] },
+    });
     // CONVERSATION THEATER: record the inbound agent-to-agent call.
     try {
       deps.activity?.record({
@@ -122,26 +164,52 @@ export function buildA2aRoutes(deps: A2aRoutesDeps) {
         metadata: { skillId, workflowId: wf.id },
       });
     } catch { /* best-effort */ }
-    const run = await runPublishedWorkflow({
+    const run = await startPublishedWorkflow({
       db: deps.db, engine: deps.engine,
       workspaceId: ws.workspaceId, ambientId: ws.ambientId, userId: ws.user.id,
-      workflowId: wf.id, graph: wf.graph as WorkflowGraph, inputs,
+      workflowId: wf.id, graph: wf.graph as WorkflowGraph, inputs, missionId: task.id,
     });
+    deps.missions.linkWorkflowRun(ws.workspaceId, task.id, run.runId);
+    return c.json(toA2aTask(deps.missions.inspect(ws.workspaceId, task.id)));
+  });
 
-    // A2A Task shape: id, status.state, artifacts[].
-    const state = run.status === 'COMPLETED'
-      ? 'completed'
-      : run.terminal ? 'failed' : 'working';
-    return c.json({
-      id: taskId,
-      contextId: run.runId,
-      kind: 'task',
-      status: { state, timestamp: new Date().toISOString() },
-      artifacts: run.output != null ? [{
-        artifactId: randomUUID(),
-        name: `${skillId}-output`,
-        parts: [{ kind: 'data', data: run.output }],
-      }] : [],
+  app.get('/tasks', (c) => {
+    const ws = getWorkspace(c);
+    if (!deps.missions) throw new AgentisError('VALIDATION_FAILED', 'Durable A2A tasks are not configured.');
+    const limit = Math.max(1, Math.min(100, Number(c.req.query('pageSize')) || 50));
+    return c.json({ tasks: deps.missions.list(ws.workspaceId, { limit }).map(toA2aTask), nextPageToken: '' });
+  });
+
+  app.get('/tasks/:id', (c) => {
+    const ws = getWorkspace(c);
+    if (!deps.missions) throw new AgentisError('VALIDATION_FAILED', 'Durable A2A tasks are not configured.');
+    return c.json(toA2aTask(deps.missions.inspect(ws.workspaceId, c.req.param('id'))));
+  });
+
+  app.post('/tasks/:id/cancel', (c) => {
+    const ws = getWorkspace(c);
+    if (!deps.missions) throw new AgentisError('VALIDATION_FAILED', 'Durable A2A tasks are not configured.');
+    return c.json(toA2aTask(deps.missions.cancel(ws.workspaceId, c.req.param('id'), 'Cancelled by A2A client')));
+  });
+
+  app.get('/tasks/:id/subscribe', (c) => {
+    const ws = getWorkspace(c);
+    if (!deps.missions) throw new AgentisError('VALIDATION_FAILED', 'Durable A2A tasks are not configured.');
+    const missions = deps.missions;
+    const id = c.req.param('id');
+    missions.inspect(ws.workspaceId, id);
+    return streamSSE(c, async (stream) => {
+      let last = '';
+      while (!c.req.raw.signal.aborted) {
+        const task = missions.inspect(ws.workspaceId, id);
+        const serialized = JSON.stringify(toA2aTask(task));
+        if (serialized !== last) {
+          await stream.writeSSE({ event: 'task.status', data: serialized });
+          last = serialized;
+        }
+        if (['accomplished', 'blocked', 'failed', 'cancelled', 'rejected'].includes(task.status)) break;
+        await new Promise((resolve) => { const timer = setTimeout(resolve, 750); timer.unref?.(); });
+      }
     });
   });
 
@@ -182,8 +250,8 @@ function buildAgentCard(deps: A2aRoutesDeps, agent: typeof schema.agents.$inferS
 // ─── helpers ────────────────────────────────────────────────────────────────
 
 interface A2aPart { kind?: string; text?: string; data?: unknown }
-interface A2aMessage { role?: string; parts: A2aPart[]; skillId?: string }
-interface A2aSendParams { skillId?: string; message?: A2aMessage }
+interface A2aMessage { role?: string; parts: A2aPart[]; skillId?: string; messageId?: string }
+interface A2aSendParams { skillId?: string; message?: A2aMessage; idempotencyKey?: string }
 
 /** Map A2A message parts → workflow inputs. DataParts merge as structured inputs; TextParts become `input`. */
 function inputsFromParts(parts: A2aPart[]): Record<string, unknown> {
@@ -221,3 +289,53 @@ function mcpOf(settings: unknown): { published?: boolean; slug?: string } {
   const s = settings && typeof settings === 'object' ? (settings as Record<string, unknown>).mcp : undefined;
   return s && typeof s === 'object' ? (s as { published?: boolean; slug?: string }) : {};
 }
+
+function publishedAppSkills(db: AgentisSqliteDb, definitions: AppDefinitionStore, workspaceId: string): WorkflowSkill[] {
+  return db.select({ id: schema.apps.id }).from(schema.apps).where(eq(schema.apps.workspaceId, workspaceId)).all().flatMap((app) => {
+    const definition = definitions.get(workspaceId, app.id);
+    if (definition?.projections?.a2a.enabled === false) return [];
+    const allow = new Set(definition?.projections?.a2a.exposeOperations ?? []);
+    return (definition?.contract?.operations ?? []).filter((operation) => allow.size === 0 || allow.has(operation.id)).map((operation) => ({
+      id: `app:${app.id}:${operation.id}`, name: operation.title, description: operation.description,
+      inputSchema: operation.inputSchema,
+    }));
+  });
+}
+
+function parseAppSkill(skillId: string): { appId: string; operationId: string } | null {
+  const match = /^app:([^:]+):(.+)$/.exec(skillId);
+  return match ? { appId: match[1]!, operationId: match[2]! } : null;
+}
+
+function ownerAgentForWorkflow(db: AgentisSqliteDb, workspaceId: string, workflowId: string): string | null {
+  const workflow = db.select({ appId: schema.workflows.appId }).from(schema.workflows).where(and(
+    eq(schema.workflows.workspaceId, workspaceId), eq(schema.workflows.id, workflowId),
+  )).get();
+  if (workflow?.appId) {
+    const app = db.select({ ownerAgentId: schema.apps.ownerAgentId }).from(schema.apps).where(eq(schema.apps.id, workflow.appId)).get();
+    if (app?.ownerAgentId) return app.ownerAgentId;
+    return db.select({ agentId: schema.appMembers.agentId }).from(schema.appMembers).where(eq(schema.appMembers.appId, workflow.appId)).get()?.agentId ?? null;
+  }
+  return db.select({ id: schema.agents.id }).from(schema.agents).where(eq(schema.agents.workspaceId, workspaceId)).get()?.id ?? null;
+}
+
+function toA2aTask(task: import('@agentis/core').AgentMission) {
+  const state = task.status === 'accomplished' ? 'completed'
+    : task.status === 'cancelled' ? 'canceled'
+    : task.status === 'rejected' ? 'rejected'
+    : task.status === 'input_required' ? 'input_required'
+    : task.status === 'approval_required' ? 'auth_required'
+    : ['blocked', 'failed'].includes(task.status) ? 'failed' : 'working';
+  return {
+    id: task.id, contextId: task.rootMissionId, kind: 'task',
+    status: { state, timestamp: task.updatedAt, message: task.lastProgress ? { role: 'agent', parts: [{ kind: 'text', text: task.lastProgress }] } : undefined },
+    artifacts: task.artifacts.map((artifact) => ({
+      artifactId: artifact.id, name: artifact.name,
+      parts: [{ kind: 'data', data: artifact }],
+    })),
+    history: (task.timeline ?? []).map((event) => ({ role: 'agent', messageId: event.id, parts: [{ kind: 'data', data: { type: event.eventType, payload: event.payload } }] })),
+    metadata: { appId: task.appId, operationId: task.operationId, parentTaskId: task.parentMissionId, childTaskIds: task.childMissionIds },
+  };
+}
+
+function isObject(value: unknown): value is Record<string, unknown> { return Boolean(value) && typeof value === 'object' && !Array.isArray(value); }

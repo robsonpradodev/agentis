@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { ChatDelta, ChatMessage, NormalizedAgentEvent, NormalizedTask } from '@agentis/core';
-import { CodexAdapter, isCodexModelCacheFailure, recoverCodexModelCache } from '../../src/adapters/CodexAdapter.js';
+import { CodexAdapter, isCodexModelCacheFailure, isCodexSessionResumeFailure, recoverCodexModelCache } from '../../src/adapters/CodexAdapter.js';
 import type { Logger } from '../../src/logger.js';
 
 const { spawnMock } = vi.hoisted(() => ({ spawnMock: vi.fn() }));
@@ -664,6 +664,43 @@ describe('CodexAdapter', () => {
     ]));
     expect((spawnMock.mock.calls[1]![1] as string[]).slice(0, 3)).toEqual(['exec', 'resume', 'thread-a']);
     expect((spawnMock.mock.calls[2]![1] as string[]).slice(0, 2)).toEqual(['exec', '--json']);
+  });
+
+  it('retries a missing persisted Codex thread once as a fresh session', async () => {
+    const initial = fakeChildProcess();
+    const staleResume = fakeChildProcess();
+    const freshRetry = fakeChildProcess();
+    spawnMock
+      .mockReturnValueOnce(initial)
+      .mockReturnValueOnce(staleResume)
+      .mockReturnValueOnce(freshRetry);
+    const adapter = new CodexAdapter({ agentId: 'agent-1', logger, binaryPath: 'codex-test' });
+
+    const firstRun = collectDeltas(adapter.chat([{ role: 'user', content: 'first' }], [], { sessionKey: 'channel-a' }));
+    initial.stdout.write('{"type":"thread.started","thread_id":"stale-thread"}\n');
+    initial.stdout.write('{"type":"item.completed","item":{"type":"agent_message","text":"first answer"}}\n');
+    initial.emit('exit', 0);
+    await firstRun;
+
+    const resumed = collectDeltas(adapter.chat([{ role: 'user', content: 'Oi' }], [], { sessionKey: 'channel-a' }));
+    staleResume.stderr.write('Error: thread stale-thread not found\n');
+    staleResume.emit('exit', 1);
+    await vi.waitFor(() => expect(spawnMock).toHaveBeenCalledTimes(3));
+    freshRetry.stdout.write('{"type":"thread.started","thread_id":"fresh-thread"}\n');
+    freshRetry.stdout.write('{"type":"item.completed","item":{"type":"agent_message","text":"Olá! Como posso ajudar?"}}\n');
+    freshRetry.emit('exit', 0);
+    const deltas = await resumed;
+
+    expect((spawnMock.mock.calls[1]![1] as string[]).slice(0, 3)).toEqual(['exec', 'resume', 'stale-thread']);
+    expect((spawnMock.mock.calls[2]![1] as string[]).slice(0, 2)).toEqual(['exec', '--json']);
+    expect(deltas).not.toContainEqual(expect.objectContaining({ type: 'done', finishReason: 'error' }));
+    expect(deltas).toContainEqual({ type: 'text', delta: 'Olá! Como posso ajudar?' });
+  });
+
+  it('recognizes stale Codex resume failures narrowly', () => {
+    expect(isCodexSessionResumeFailure('thread abc not found')).toBe(true);
+    expect(isCodexSessionResumeFailure('failed to resume conversation')).toBe(true);
+    expect(isCodexSessionResumeFailure('rate limit exceeded')).toBe(false);
   });
 
   it('recognizes the newer base_instructions cache mismatch and only quarantines a model cache', () => {

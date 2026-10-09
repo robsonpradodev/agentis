@@ -113,8 +113,8 @@ describe('POST /v1/extensions/install-local', () => {
       headers: ctx.authHeaders,
       body: JSON.stringify({
         manifest: {
-          name: 'BIA Prospecting',
-          slug: 'bia-prospecting',
+          name: 'Sample Prospecting',
+          slug: 'sample-prospecting',
           version: '1.0.0',
           runtime: 'node_worker',
           source: 'async function crawl_and_score(inputs, ctx) { const response = await ctx.http.fetch("https://www.google.com"); return { status: response.status }; }',
@@ -129,14 +129,14 @@ describe('POST /v1/extensions/install-local', () => {
 
     expect(res.status).toBe(201);
     const body = (await res.json()) as { extension: { id: string; slug: string; created: boolean }; repaired: { workflows: number; nodes: number } };
-    expect(body.extension).toEqual(expect.objectContaining({ slug: 'bia-prospecting', created: true }));
+    expect(body.extension).toEqual(expect.objectContaining({ slug: 'sample-prospecting', created: true }));
     expect(body.repaired).toEqual({ workflows: 1, nodes: 1 });
     const workflow = ctx.db.select().from(schema.workflows).where(eq(schema.workflows.id, workflowId)).get()!;
     const candidate = ctx.db.select().from(schema.workflowGraphRevisions)
       .where(and(eq(schema.workflowGraphRevisions.workflowId, workflowId), eq(schema.workflowGraphRevisions.status, 'candidate'))).get()!;
     expect(workflow.candidateRevisionId).toBe(candidate.id);
     expect((candidate.graphJson as { nodes: Array<{ config: { extensionId: string; extensionSlug?: string } }> }).nodes[0]?.config)
-      .toEqual(expect.objectContaining({ extensionId: body.extension.id, extensionSlug: 'bia-prospecting' }));
+      .toEqual(expect.objectContaining({ extensionId: body.extension.id, extensionSlug: 'sample-prospecting' }));
   });
 
   it('updates a duplicate local install through the canonical extension library', async () => {

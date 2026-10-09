@@ -56,6 +56,33 @@ describe('validateWorkflowSpec', () => {
     expect(errors.join(' ')).toMatch(/declares no "deploymentUrl" key/);
   });
 
+  it('rejects an unrelated data probe even when that integration exists elsewhere in the workspace', () => {
+    const graph = {
+      version: 1, viewport: { x: 0, y: 0, zoom: 1 }, edges: [],
+      nodes: [
+        { id: 'leads', title: 'Load leads', position: { x: 0, y: 0 }, config: { kind: 'data_query', collection: 'leads' } },
+        { id: 'send', title: 'Send WhatsApp', position: { x: 200, y: 0 }, config: { kind: 'channel', operation: 'send' } },
+      ],
+    } as unknown as WorkflowGraph;
+    const spec = baseSpec({ acceptance: [{
+      id: 'wrong_store', claim: 'Rows exist in Airtable', verify: 'data_probe', integration: 'airtable',
+      operation: 'select', params: {}, expr: 'probe.rows.length >= 1',
+    }] });
+    expect(validateWorkflowSpec(spec, { graph, knownServices: ['airtable'] }).join(' ')).toMatch(/outside this workflow's execution closure/);
+  });
+
+  it('accepts a native App data probe when the graph uses App data nodes', () => {
+    const graph = {
+      version: 1, viewport: { x: 0, y: 0, zoom: 1 }, edges: [],
+      nodes: [{ id: 'leads', title: 'Load leads', position: { x: 0, y: 0 }, config: { kind: 'data_query', collection: 'leads' } }],
+    } as unknown as WorkflowGraph;
+    const spec = baseSpec({ acceptance: [{
+      id: 'lead_state', claim: 'The exact lead is contacted', verify: 'data_probe', integration: 'agentis_app',
+      operation: 'query', params: { collection: 'leads' }, expr: 'probe.rows.length >= 1',
+    }] });
+    expect(validateWorkflowSpec(spec, { graph })).toEqual([]);
+  });
+
   it('rejects an expr that guesses a viewer envelope instead of the declared terminal data', () => {
     const graph = {
       version: 1, viewport: { x: 0, y: 0, zoom: 1 }, nodes: [], edges: [],

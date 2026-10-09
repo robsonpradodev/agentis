@@ -236,6 +236,7 @@ export class TelegramSession {
 
   async sendNative(chatId: string, native: OutboundNativeContent): Promise<ChannelDeliveryReceipt> {
     if (!this.#bot) throw new Error(`telegram session ${this.opts.connectionId} is not started`);
+    if (native.kind !== 'location' && native.kind !== 'contact' && native.kind !== 'poll') throw new Error('This transport does not support Cloud interactive content or templates');
     let sent: { message_id?: number };
     if (native.kind === 'location') {
       sent = await this.#bot.api.sendLocation(chatId, native.latitude, native.longitude);

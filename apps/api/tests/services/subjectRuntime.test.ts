@@ -5,12 +5,21 @@
  * an agent step → park → reply → done. State persists across every park (restart-durable).
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { DurableEntityService, DurableEntityDispatcher } from '../../src/services/durableEntities.js';
-import { SubjectRuntime, channelCorrelationId, type SubjectScript } from '../../src/services/subjectRuntime.js';
+import {
+  DurableEntityService,
+  DurableEntityDispatcher,
+} from '../../src/services/durableEntities.js';
+import {
+  SubjectRuntime,
+  channelCorrelationId,
+  type SubjectScript,
+} from '../../src/services/subjectRuntime.js';
 import { createTestContext, type TestContext } from '../_helpers/createTestContext.js';
 
 let ctx: TestContext;
-beforeEach(async () => { ctx = await createTestContext(); });
+beforeEach(async () => {
+  ctx = await createTestContext();
+});
 afterEach(() => ctx.close());
 
 const past = '2020-01-01T00:00:00.000Z';
@@ -18,9 +27,13 @@ const past = '2020-01-01T00:00:00.000Z';
 const SCRIPT: SubjectScript = {
   start: 'greet',
   stages: {
-    greet: { action: 'send', text: 'Oi {{name}}', next: 'wait1' },        // deterministic, token-free
+    greet: { action: 'send', text: 'Oi {{name}}', next: 'wait1' }, // deterministic, token-free
     wait1: { action: 'wait', next: 'pitch' },
-    pitch: { action: 'agent', instruction: 'Write a personalized pitch for {{name}}', next: 'wait2' },
+    pitch: {
+      action: 'agent',
+      instruction: 'Write a personalized pitch for {{name}}',
+      next: 'wait2',
+    },
     wait2: { action: 'wait', next: 'finish' },
     finish: { action: 'done' },
   },
@@ -33,19 +46,125 @@ describe('SubjectRuntime on the spine', () => {
     const disp = new DurableEntityDispatcher(svc, { logger: ctx.logger });
     disp.registerHandler('subject', (c) => runtime.handle(c));
     const subject = svc.upsert({
-      workspaceId: ctx.workspace.id, kind: 'subject', key: 'person:wa:42',
+      workspaceId: ctx.workspace.id,
+      kind: 'subject',
+      key: 'person:wa:42',
       state: {
-        version: 2, subjectKey: 'person:wa:42', identity: { handles: [] }, facts: [], engagements: [], commitments: [],
-        openQuestions: [], blockers: [], memoryRefs: [], updatedAt: past,
-        nextAction: { kind: 'follow_up', goal: 'ask for documents', dueAt: '2099-01-01T00:00:00.000Z', status: 'planned' },
+        version: 2,
+        subjectKey: 'person:wa:42',
+        identity: { handles: [] },
+        facts: [],
+        engagements: [],
+        commitments: [],
+        openQuestions: [],
+        blockers: [],
+        memoryRefs: [],
+        updatedAt: past,
+        nextAction: {
+          kind: 'follow_up',
+          goal: 'ask for documents',
+          dueAt: '2099-01-01T00:00:00.000Z',
+          status: 'planned',
+        },
       },
     });
     svc.post(subject.id, 'channel.inbound', { text: 'Here are the documents' });
     await disp.tick();
-    const state = svc.get(subject.id)!.stateJson as { nextAction: { status: string }; lastInboundAt: string };
+    const state = svc.get(subject.id)!.stateJson as {
+      nextAction: { status: string };
+      lastInboundAt: string;
+    };
     expect(svc.get(subject.id)!.status).toBe('active');
     expect(state.nextAction.status).toBe('cancelled');
     expect(state.lastInboundAt).toBeTruthy();
+    expect(
+      (
+        svc.get(subject.id)!.stateJson as {
+          decisionHistory: Array<{ outcome: string; relatedEventIds: string[] }>;
+        }
+      ).decisionHistory,
+    ).toEqual([
+      expect.objectContaining({
+        outcome: 'cancelled',
+        relatedEventIds: expect.arrayContaining([expect.any(String)]),
+      }),
+    ]);
+  });
+
+  it('never treats a missing runtime result or held send as a completed follow-up', async () => {
+    const svc = new DurableEntityService(ctx.db);
+    const disp = new DurableEntityDispatcher(svc, { logger: ctx.logger });
+    const subject = svc.upsert({
+      workspaceId: ctx.workspace.id,
+      kind: 'subject',
+      key: 'person:wa:held-follow-up',
+      state: {
+        version: 2,
+        subjectKey: 'person:wa:held-follow-up',
+        identity: { handles: [] },
+        facts: [],
+        engagements: [],
+        commitments: [],
+        openQuestions: [],
+        blockers: [],
+        memoryRefs: [],
+        updatedAt: past,
+        nextAction: {
+          kind: 'follow_up',
+          goal: 'confirm a quote',
+          dueAt: past,
+          status: 'planned',
+          attempts: 0,
+          sourceRef: 'mission:quote',
+        },
+      },
+      nextWakeAt: past,
+    });
+    const runtime = new SubjectRuntime({ send: () => {}, runAgent: () => undefined });
+    disp.registerHandler('subject', (wake) => runtime.handle(wake));
+    await disp.tick();
+    const afterUnknown = svc.get(subject.id)!.stateJson as {
+      nextAction: { status: string };
+      blockers: string[];
+      decisionHistory: Array<{ outcome: string }>;
+    };
+    expect(afterUnknown.nextAction.status).toBe('blocked');
+    expect(afterUnknown.blockers).toContain('O runtime não confirmou que a ação foi realizada.');
+    expect(afterUnknown.decisionHistory.at(-1)?.outcome).toBe('held');
+
+    svc.upsert({
+      workspaceId: ctx.workspace.id,
+      kind: 'subject',
+      key: 'person:wa:held-follow-up',
+      state: {
+        nextAction: {
+          kind: 'follow_up',
+          goal: 'confirm a quote',
+          dueAt: past,
+          status: 'planned',
+          attempts: 0,
+        },
+      },
+      nextWakeAt: past,
+    });
+    const heldRuntime = new SubjectRuntime({
+      send: () => {},
+      runAgent: () => ({ outcome: 'held', reason: 'Aprovação humana pendente.' }),
+    });
+    const heldDispatcher = new DurableEntityDispatcher(svc, { logger: ctx.logger });
+    heldDispatcher.registerHandler('subject', (wake) => heldRuntime.handle(wake));
+    await heldDispatcher.tick();
+    const afterHeld = svc.get(subject.id)!.stateJson as {
+      nextAction: { status: string };
+      blockers: string[];
+      decisionHistory: Array<{ outcome: string; reason: string }>;
+    };
+    expect(afterHeld.nextAction.status).toBe('blocked');
+    expect(afterHeld.blockers).toContain('Aprovação humana pendente.');
+    expect(afterHeld.decisionHistory.at(-1)).toMatchObject({
+      outcome: 'held',
+      reason: 'Aprovação humana pendente.',
+    });
   });
 
   it('drives greeting → wait → pitch → wait → done, out of order, on one durable model', async () => {
@@ -53,14 +172,30 @@ describe('SubjectRuntime on the spine', () => {
     const sends: Array<{ text: string; to: unknown }> = [];
     const agentCalls: string[] = [];
     const runtime = new SubjectRuntime({
-      send: ({ text, facts }) => { sends.push({ text, to: facts.to }); },
-      runAgent: ({ instruction }) => { agentCalls.push(instruction); },
+      send: ({ text, facts }) => {
+        sends.push({ text, to: facts.to });
+      },
+      runAgent: ({ instruction }) => {
+        agentCalls.push(instruction);
+      },
     });
     const disp = new DurableEntityDispatcher(svc, { logger: ctx.logger });
     disp.registerHandler('subject', (c) => runtime.handle(c));
 
-    const s1 = svc.upsert({ workspaceId: ctx.workspace.id, kind: 'subject', key: 'lead-1', state: { script: SCRIPT, stage: 'greet', facts: { name: 'Ana', to: '111' } }, nextWakeAt: past });
-    const s2 = svc.upsert({ workspaceId: ctx.workspace.id, kind: 'subject', key: 'lead-2', state: { script: SCRIPT, stage: 'greet', facts: { name: 'Bruno', to: '222' } }, nextWakeAt: past });
+    const s1 = svc.upsert({
+      workspaceId: ctx.workspace.id,
+      kind: 'subject',
+      key: 'lead-1',
+      state: { script: SCRIPT, stage: 'greet', facts: { name: 'Ana', to: '111' } },
+      nextWakeAt: past,
+    });
+    const s2 = svc.upsert({
+      workspaceId: ctx.workspace.id,
+      kind: 'subject',
+      key: 'lead-2',
+      state: { script: SCRIPT, stage: 'greet', facts: { name: 'Bruno', to: '222' } },
+      nextWakeAt: past,
+    });
 
     // Tick 1: both send the deterministic greeting, then park at wait1.
     expect(await disp.tick()).toBe(2);
@@ -92,7 +227,9 @@ describe('SubjectRuntime on the spine', () => {
     svc.post(s2.id, 'reply', {});
     expect(await disp.tick()).toBe(0);
     // The reply payload was captured into the subject's facts along the way.
-    expect((svc.get(s2.id)!.stateJson as { facts: Record<string, unknown> }).facts.lastReply).toBeTruthy();
+    expect(
+      (svc.get(s2.id)!.stateJson as { facts: Record<string, unknown> }).facts.lastReply,
+    ).toBeTruthy();
   });
 
   it('auto-routes an inbound channel reply to the parked subject by correlation', async () => {
@@ -103,20 +240,38 @@ describe('SubjectRuntime on the spine', () => {
 
     const script: SubjectScript = {
       start: 'greet',
-      stages: { greet: { action: 'send', text: 'Oi', next: 'wait1' }, wait1: { action: 'wait', next: 'finish' }, finish: { action: 'done' } },
+      stages: {
+        greet: { action: 'send', text: 'Oi', next: 'wait1' },
+        wait1: { action: 'wait', next: 'finish' },
+        finish: { action: 'done' },
+      },
     };
     // The subject carries its channel facts — no explicit correlation in the script.
-    const s = svc.upsert({ workspaceId: ctx.workspace.id, kind: 'subject', key: 'lead-1', state: { script, stage: 'greet', facts: { connectionId: 'c1', to: '42' } }, nextWakeAt: past });
+    const s = svc.upsert({
+      workspaceId: ctx.workspace.id,
+      kind: 'subject',
+      key: 'lead-1',
+      state: { script, stage: 'greet', facts: { connectionId: 'c1', to: '42' } },
+      nextWakeAt: past,
+    });
 
     // Tick → greet, then park at wait1 with a DERIVED channel correlation.
     await disp.tick();
     const parked = svc.get(s.id)!;
     expect((parked.stateJson as { stage: string }).stage).toBe('wait1');
-    expect(parked.awaitingCorrelationJson).toEqual({ kind: 'channel', id: channelCorrelationId('c1', '42') });
+    expect(parked.awaitingCorrelationJson).toEqual({
+      kind: 'channel',
+      id: channelCorrelationId('c1', '42'),
+    });
 
     // An inbound reply on that connection+chat routes to THIS subject (the bootstrap
     // onInbound hook does exactly this) — days later, out of order, is irrelevant.
-    const routed = svc.postByCorrelation(ctx.workspace.id, { kind: 'channel', id: channelCorrelationId('c1', '42') }, 'reply', { text: 'yes' });
+    const routed = svc.postByCorrelation(
+      ctx.workspace.id,
+      { kind: 'channel', id: channelCorrelationId('c1', '42') },
+      'reply',
+      { text: 'yes' },
+    );
     expect(routed).toBe(s.id);
 
     // Next sweep advances past the wait to done.
@@ -131,7 +286,13 @@ describe('SubjectRuntime on the spine', () => {
     disp.registerHandler('subject', (c) => runtime.handle(c));
 
     // Malformed (no script) → the handler terminates the entity instead of looping.
-    const bad = svc.upsert({ workspaceId: ctx.workspace.id, kind: 'subject', key: 'bad', state: {} as never, nextWakeAt: past });
+    const bad = svc.upsert({
+      workspaceId: ctx.workspace.id,
+      kind: 'subject',
+      key: 'bad',
+      state: {} as never,
+      nextWakeAt: past,
+    });
     await disp.tick();
     expect(svc.get(bad.id)!.status).toBe('done');
   });

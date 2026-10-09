@@ -105,7 +105,7 @@ describe('WorkflowEngine — channel node', () => {
     const ownerAgentId = randomUUID();
     ctx.db.insert(schema.agents).values({
       id: ownerAgentId, workspaceId: ctx.workspace.id, ambientId: ctx.ambient.id,
-      userId: ctx.user.id, name: 'Bia', adapterType: 'http',
+      userId: ctx.user.id, name: 'Ava', adapterType: 'http',
     }).run();
     let callerAgentId: string | null | undefined;
     const port: ChannelSendPort = {

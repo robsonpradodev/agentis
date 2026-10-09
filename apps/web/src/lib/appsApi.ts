@@ -20,6 +20,10 @@ import type {
   UpdateAppWorkflowBindingInput,
   SurfaceAction,
   ViewNode,
+  AgentMission,
+  AppOperation,
+  AuthorityContext,
+  EffectPlan,
 } from '@agentis/core';
 import { api, apiCached } from './api';
 
@@ -128,6 +132,48 @@ export interface AppOrchestrationRuleInput {
   enabled?: boolean;
 }
 
+export interface AgenticAppDefinition {
+  appId: string;
+  workspaceId: string;
+  revision: number;
+  contract?: AppManifest['contract'];
+  frontend?: AppManifest['frontend'];
+  components?: AppManifest['components'];
+  storage?: AppManifest['storage'];
+  orchestration?: AppManifest['orchestration'];
+  brainPolicy?: AppManifest['brainPolicy'];
+  permissionsV3?: AppManifest['permissionsV3'];
+  quality?: AppManifest['quality'];
+  artifacts?: AppManifest['artifacts'];
+  projections?: AppManifest['projections'];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AgenticAppProject {
+  appId: string;
+  workspaceId: string;
+  repoPath: string;
+  defaultBranch: string;
+  headCommit: string | null;
+  framework: string;
+  packageManager: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AgenticAppBuild {
+  id: string;
+  status: string;
+  sourceCommit: string;
+  artifactPath: string | null;
+  artifactSha256: string | null;
+  sbomPath: string | null;
+  log: string;
+  createdAt: string;
+  completedAt: string | null;
+}
+
 /** A live App conversation (Phase 1 — the real channel thread, not a datastore row). */
 export interface AppConversation {
   id: string;
@@ -188,6 +234,22 @@ export const appsApi = {
   update: (id: string, body: AppUpdatePayload) =>
     api<Wrapped<AppRecord>>(`/v1/apps/${id}`, { method: 'PATCH', body: JSON.stringify(body) }).then((r) => r.data),
   remove: (id: string) => api(`/v1/apps/${id}`, { method: 'DELETE' }),
+  getAgenticDefinition: (id: string) => api<{ definition: AgenticAppDefinition | null }>(`/v1/apps/${id}/definition`).then((r) => r.definition),
+  updateAgenticDefinition: (id: string, definition: Partial<AgenticAppDefinition>) =>
+    api<{ definition: AgenticAppDefinition }>(`/v1/apps/${id}/definition`, { method: 'PUT', body: JSON.stringify(definition) }).then((r) => r.definition),
+  listOperations: (id: string) => api<{ operations: AppOperation[] }>(`/v1/apps/${id}/operations`).then((r) => r.operations),
+  invokeOperation: (id: string, operationId: string, input: Record<string, unknown>) =>
+    api<unknown>(`/v1/apps/${id}/operations/${encodeURIComponent(operationId)}/invoke`, { method: 'POST', body: JSON.stringify({ input }) }),
+  listTasks: (id: string) => api<{ tasks: AgentMission[] }>(`/v1/apps/${id}/tasks`).then((r) => r.tasks),
+  cancelTask: (taskId: string) => api<{ mission: AgentMission }>(`/v1/missions/${taskId}/cancel`, { method: 'POST' }).then((r) => r.mission),
+  respondTaskInput: (taskId: string, requestId: string, response: unknown) =>
+    api<{ mission: AgentMission }>(`/v1/missions/${taskId}/input-requests/${requestId}/respond`, { method: 'POST', body: JSON.stringify({ response }) }).then((r) => r.mission),
+  listEffects: (id: string) => api<{ effects: EffectPlan[] }>(`/v1/effects?appId=${encodeURIComponent(id)}`).then((r) => r.effects),
+  authorizeEffect: (effectId: string, authorityContext: AuthorityContext) =>
+    api<{ plan: EffectPlan }>(`/v1/effects/${effectId}/authorize`, { method: 'POST', body: JSON.stringify({ authorityContext }) }).then((r) => r.plan),
+  getProject: (id: string) => api<{ project: AgenticAppProject | null; builds: AgenticAppBuild[] }>(`/v1/apps/${id}/project`),
+  initializeProject: (id: string) => api<{ project: AgenticAppProject }>(`/v1/apps/${id}/project/initialize`, { method: 'POST' }).then((r) => r.project),
+  buildProject: (id: string) => api<{ build: AgenticAppBuild }>(`/v1/apps/${id}/builds`, { method: 'POST' }).then((r) => r.build),
 
   // Surfaces
   listSurfaces: (id: string) => api<Wrapped<AppSurface[]>>(`/v1/apps/${id}/surfaces`).then((r) => r.data),
@@ -375,4 +437,3 @@ export const appsApi = {
       { method: 'POST', body: JSON.stringify({ collection, ...q }) },
     ),
 };
-

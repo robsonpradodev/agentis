@@ -287,7 +287,7 @@ describe('WorkflowMonitorCard', () => {
     expect(apiMock).toHaveBeenCalledWith('/v1/workflows/workflow-1/analytics');
   });
 
-  it('replays typed activity for the latched paused run after activeRunId clears', async () => {
+  it('replays typed diagnostics for the latched paused run after activeRunId clears', async () => {
     apiMock.mockImplementation(async (path: string) => {
       if (path === '/v1/runs/run-paused/activity') {
         return { activity: [{
@@ -316,8 +316,11 @@ describe('WorkflowMonitorCard', () => {
     await act(async () => { await Promise.resolve(); });
 
     expect(apiMock).toHaveBeenCalledWith('/v1/runs/run-paused/activity');
-    expect(screen.getByText('ACP stalled; continuing through Hermes CLI.')).toBeInTheDocument();
-    expect(screen.getByText(/Hermes CLI · fallback/i)).toBeInTheDocument();
+    expect(screen.getByText('Run paused')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'health' }));
+    expect(await screen.findByText('ACP stalled; continuing through Hermes CLI.')).toBeInTheDocument();
+    expect(screen.getAllByText(/hermes cli/i).length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText('attempt 1')).toBeInTheDocument();
   });
 
   it('coalesces legacy Hermes final-only heartbeat rows from durable replay', async () => {
@@ -329,7 +332,7 @@ describe('WorkflowMonitorCard', () => {
           emittedAt: `2026-08-23T12:00:${String(seconds % 60).padStart(2, '0')}.000Z`,
           payload: {
             activityId: `legacy-${seconds}`, workflowId: 'workflow-1', runId: 'run-legacy', nodeId: 'node-1',
-            agentId: 'agent-1', agentName: 'Bia', phase: 'thinking',
+            agentId: 'agent-1', agentName: 'Ava', phase: 'thinking',
             description: `Hermes is running — ${seconds}s elapsed; final-answer-only mode`,
           },
         })) };

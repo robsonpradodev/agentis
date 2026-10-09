@@ -94,12 +94,12 @@ describe('ChannelConnectionSupervisor observed outbound synchronization', () => 
 
     supervisor.observeOutbound(connectionId, {
       externalId: 'PHONE-MESSAGE-1',
-      chatId: '5521970398568@s.whatsapp.net',
+      chatId: '15553456789@s.whatsapp.net',
       body: 'Oi, boa tarde',
     });
     supervisor.observeOutbound(connectionId, {
       externalId: 'PHONE-MESSAGE-1',
-      chatId: '5521970398568@s.whatsapp.net',
+      chatId: '15553456789@s.whatsapp.net',
       body: 'Oi, boa tarde',
     });
 
@@ -131,7 +131,7 @@ describe('ChannelConnectionSupervisor observed outbound synchronization', () => 
       workspaceId: ctx.workspace.id,
       connectionId,
       idempotencyKey: 'workflow:run:node',
-      chatId: '5521970398568@s.whatsapp.net',
+      chatId: '15553456789@s.whatsapp.net',
       bodyHash: 'hash',
       status: 'accepted',
       providerMessageId: 'AGENTIS-MESSAGE-1',
@@ -139,7 +139,7 @@ describe('ChannelConnectionSupervisor observed outbound synchronization', () => 
 
     supervisor.observeOutbound(connectionId, {
       externalId: 'AGENTIS-MESSAGE-1',
-      chatId: '5521970398568@s.whatsapp.net',
+      chatId: '15553456789@s.whatsapp.net',
       body: 'Agentis echo',
     });
 
@@ -151,11 +151,11 @@ describe('ChannelConnectionSupervisor observed outbound synchronization', () => 
   it('keeps automation available for the explicitly configured owner/operator chat by default', () => {
     const { connectionId, supervisor, handoffs } = fixture();
     ctx.db.update(schema.channelConnections).set({
-      settings: { mode: 'qr_local', ownerChatId: '5521970398568@s.whatsapp.net' },
+      settings: { mode: 'qr_local', ownerChatId: '15553456789@s.whatsapp.net' },
     }).where(eq(schema.channelConnections.id, connectionId)).run();
 
     supervisor.observeOutbound(connectionId, {
-      externalId: 'OWNER-MESSAGE-1', chatId: '5521970398568@s.whatsapp.net', body: 'Testing my assistant',
+      externalId: 'OWNER-MESSAGE-1', chatId: '15553456789@s.whatsapp.net', body: 'Testing my assistant',
     });
 
     const message = ctx.db.select().from(schema.conversationMessages).get()!;
@@ -180,7 +180,7 @@ describe('ChannelConnectionSupervisor observed outbound synchronization', () => 
 
     supervisor.observeOutbound(connectionId, {
       externalId: 'VERIFIED-OWNER-MESSAGE-1',
-      chatId: '5521970398568:12@s.whatsapp.net',
+      chatId: '15553456789:12@s.whatsapp.net',
       body: 'Testing my assistant from another device',
     });
 
@@ -193,13 +193,13 @@ describe('ChannelConnectionSupervisor observed outbound synchronization', () => 
   it('uses the alternate PN identity when WhatsApp observes the owner chat under a LID', () => {
     const { connectionId, supervisor, handoffs } = fixture();
     ctx.db.update(schema.channelConnections).set({
-      settings: { mode: 'qr_local', ownerChatId: '5521970398568@s.whatsapp.net' },
+      settings: { mode: 'qr_local', ownerChatId: '15553456789@s.whatsapp.net' },
     }).where(eq(schema.channelConnections.id, connectionId)).run();
 
     supervisor.observeOutbound(connectionId, {
       externalId: 'OWNER-LID-MESSAGE-1',
       chatId: '187654321098765@lid',
-      alternateChatIds: ['5521970398568@s.whatsapp.net'],
+      alternateChatIds: ['15553456789@s.whatsapp.net'],
       body: 'Self-chat through the LID alias',
     });
 
@@ -214,13 +214,13 @@ describe('ChannelConnectionSupervisor observed outbound synchronization', () => 
     ctx.db.update(schema.channelConnections).set({
       settings: {
         mode: 'qr_local',
-        ownerChatId: '5521970398568@s.whatsapp.net',
+        ownerChatId: '15553456789@s.whatsapp.net',
         whatsappProfile: { ownerManualOutboundTakeover: 'until_handback' },
       },
     }).where(eq(schema.channelConnections.id, connectionId)).run();
 
     supervisor.observeOutbound(connectionId, {
-      externalId: 'OWNER-MESSAGE-2', chatId: '5521970398568@s.whatsapp.net', body: 'Take over this one',
+      externalId: 'OWNER-MESSAGE-2', chatId: '15553456789@s.whatsapp.net', body: 'Take over this one',
     });
 
     const message = ctx.db.select().from(schema.conversationMessages).get()!;
@@ -230,11 +230,11 @@ describe('ChannelConnectionSupervisor observed outbound synchronization', () => 
   it('does not treat an auto/default routing target as an owner exception', () => {
     const { connectionId, supervisor, handoffs } = fixture();
     ctx.db.update(schema.channelConnections).set({
-      settings: { mode: 'qr_local', defaultChatId: '5521970398568@s.whatsapp.net' },
+      settings: { mode: 'qr_local', defaultChatId: '15553456789@s.whatsapp.net' },
     }).where(eq(schema.channelConnections.id, connectionId)).run();
 
     supervisor.observeOutbound(connectionId, {
-      externalId: 'DEFAULT-MESSAGE-1', chatId: '5521970398568@s.whatsapp.net', body: 'Still take over',
+      externalId: 'DEFAULT-MESSAGE-1', chatId: '15553456789@s.whatsapp.net', body: 'Still take over',
     });
 
     const message = ctx.db.select().from(schema.conversationMessages).get()!;
@@ -248,7 +248,7 @@ describe('ChannelConnectionSupervisor observed outbound synchronization', () => 
     }).where(eq(schema.channelConnections.id, connectionId)).run();
 
     supervisor.observeOutbound(connectionId, {
-      externalId: 'NO-TAKEOVER-1', chatId: '5521970398568@s.whatsapp.net', body: 'Do not claim',
+      externalId: 'NO-TAKEOVER-1', chatId: '15553456789@s.whatsapp.net', body: 'Do not claim',
     });
 
     const message = ctx.db.select().from(schema.conversationMessages).get()!;

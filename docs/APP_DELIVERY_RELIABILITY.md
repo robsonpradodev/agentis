@@ -2,6 +2,10 @@
 
 Agentis considers an App delivered only when one exact workflow revision passes every layer below and, when required, the verified revision is explicitly approved and promoted.
 
+For action-oriented execution, the associated Agent Mission and effect ledger are authoritative.
+A workflow run cannot supply clean delivery proof if the mission lacks its required acknowledged
+delivery, mutation, scheduling, or Subject receipts.
+
 ## One revision, one truth
 
 - `workflow_graph_revisions` is the source of truth. During authoring, App Doctor and the debug compiler inspect the candidate head. After promotion, production uses the active revision.
@@ -51,7 +55,12 @@ The reliability suite must keep coverage for:
 - `return_output` envelope unwrapping before output-contract validation;
 - a world-accomplished but contract-violating run not being delivered;
 - App readiness requiring `delivered: true` and `published: true` for every enabled workflow;
-- short continuation prompts inheriting an unfinished mission build session.
+- semantic continuation prompts inheriting the uniquely correlated unfinished mission/build session;
+- action Agent Tasks rejecting empty/prose-only completion without required effect receipts;
+- crash/replay reconciliation reusing an existing channel intent without duplicate delivery;
+- provider acknowledgement gating the exact downstream lead/Subject mutation.
+- ordered multi-item delivery retaining the first receipt and retrying only an unacknowledged item;
+- verified owner-command authority reaching the live transport without disabling unrelated handoff.
 
 ## Operator evidence
 

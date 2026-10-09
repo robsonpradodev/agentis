@@ -742,6 +742,62 @@ export class ConversationStore {
     return row;
   }
 
+  /** Update a still-pending legacy queue item without dispatching it. */
+  updateQueuedMessage(args: { workspaceId: string; conversationId: string; queueId: string; text: string }) {
+    const conversation = this.#loadConversation(args.workspaceId, args.conversationId);
+    const existing = this.deps.db
+      .select()
+      .from(schema.conversationMessageQueue)
+      .where(and(
+        eq(schema.conversationMessageQueue.id, args.queueId),
+        eq(schema.conversationMessageQueue.conversationId, args.conversationId),
+        eq(schema.conversationMessageQueue.workspaceId, args.workspaceId),
+      ))
+      .get();
+    if (!existing) throw new AgentisError('RESOURCE_NOT_FOUND', `queued message ${args.queueId} not found`);
+    if (existing.status !== 'pending') return existing;
+    this.deps.db.update(schema.conversationMessageQueue)
+      .set({ text: args.text })
+      .where(eq(schema.conversationMessageQueue.id, args.queueId))
+      .run();
+    const row = { ...existing, text: args.text };
+    this.deps.bus.publish(
+      REALTIME_ROOMS.conversation(conversation.agentId),
+      REALTIME_EVENTS.CONVERSATION_QUEUE_UPDATED,
+      { conversationId: args.conversationId, agentId: conversation.agentId, item: row, action: 'updated' },
+    );
+    return row;
+  }
+
+  /** Put a still-pending legacy queue item at the front of its conversation. */
+  promoteQueuedMessage(args: { workspaceId: string; conversationId: string; queueId: string }) {
+    const conversation = this.#loadConversation(args.workspaceId, args.conversationId);
+    const existing = this.deps.db
+      .select()
+      .from(schema.conversationMessageQueue)
+      .where(and(
+        eq(schema.conversationMessageQueue.id, args.queueId),
+        eq(schema.conversationMessageQueue.conversationId, args.conversationId),
+        eq(schema.conversationMessageQueue.workspaceId, args.workspaceId),
+      ))
+      .get();
+    if (!existing) throw new AgentisError('RESOURCE_NOT_FOUND', `queued message ${args.queueId} not found`);
+    if (existing.status !== 'pending') return existing;
+    const pending = this.listQueue(args.workspaceId, args.conversationId);
+    const nextPosition = Math.min(...pending.map((item) => item.position), existing.position) - 1;
+    this.deps.db.update(schema.conversationMessageQueue)
+      .set({ position: nextPosition })
+      .where(eq(schema.conversationMessageQueue.id, args.queueId))
+      .run();
+    const row = { ...existing, position: nextPosition };
+    this.deps.bus.publish(
+      REALTIME_ROOMS.conversation(conversation.agentId),
+      REALTIME_EVENTS.CONVERSATION_QUEUE_UPDATED,
+      { conversationId: args.conversationId, agentId: conversation.agentId, item: row, action: 'promoted' },
+    );
+    return row;
+  }
+
   /** Cancel a still-pending queued message before it dispatches. */
   discardQueuedMessage(args: { workspaceId: string; conversationId: string; queueId: string }) {
     const conversation = this.#loadConversation(args.workspaceId, args.conversationId);

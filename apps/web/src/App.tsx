@@ -11,6 +11,7 @@ import { ChatPanelMount } from './components/chat/ChatPanelMount';
 import { RealtimeStatusIndicator } from './components/shared/RealtimeStatusIndicator';
 import { ChatPanelHeaderButton } from './components/chat/ChatPanelHeaderButton';
 import { BrandMark } from './components/shared/BrandMark';
+import { PwaInstallButton } from './components/shared/PwaInstallButton';
 import { RunModalProvider } from './components/runs/RunModalProvider';
 import { ApprovalModalProvider } from './components/shared/ApprovalModalProvider';
 import { ConfirmProvider } from './components/shared/ConfirmDialog';
@@ -541,7 +542,7 @@ function Shell({
   }, [nav]);
 
   if (embedded) {
-    return <main className="h-full min-h-0 bg-canvas">{children}</main>;
+    return <main className="h-full min-h-0 overflow-auto bg-canvas">{children}</main>;
   }
 
   return (
@@ -577,6 +578,7 @@ function Shell({
             <Search size={14} />
           </button>
           <RealtimeStatusIndicator />
+          <PwaInstallButton />
           <Suspense fallback={null}>
             <LazyNotificationPanel />
           </Suspense>
@@ -596,7 +598,7 @@ function Shell({
       </div>
       <div data-agentis-shell-layout className="flex min-h-0 min-w-0 flex-1">
         <Sidebar />
-        <main data-agentis-shell-main className="min-h-0 min-w-0 flex-1 overflow-auto">
+        <main data-agentis-shell-main className="h-full min-h-0 min-w-0 flex-1 overflow-auto">
           {children}
         </main>
         <ChatPanelMount />

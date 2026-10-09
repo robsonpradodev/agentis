@@ -221,12 +221,12 @@ export class ChatProgressMonitor {
 export function stopReasonMessage(reason: StopReason): string {
   switch (reason.kind) {
     case 'identical_repetition':
-      return `I stopped because I was repeating myself — I ${reason.detail} and wasn't getting anywhere. Tell me how you'd like me to proceed and I'll continue.`;
+      return `I stopped because I was repeating myself: ${reason.detail}. The action was not marked complete; the last tool result is the blocker and can be retried safely without duplicating a successful external effect.`;
     case 'oscillation':
-      return `I stopped because I was going in circles — I ${reason.detail}. Let me know how to break the deadlock and I'll pick it back up.`;
+      return `I stopped because the tool loop was going in circles: ${reason.detail}. No unverified action was marked complete; inspect the last tool result for the concrete dependency.`;
     case 'error_storm':
-      return `I stopped because I hit ${reason.detail}. Something upstream looks broken; I'd rather check in than keep retrying. How would you like to handle it?`;
+      return `Agentis stopped after ${reason.detail}. The action remains incomplete and the final tool error identifies the dependency that must recover.`;
     case 'no_progress':
-      return `I stopped because I went ${reason.detail} — I don't seem to be moving the work forward. Want me to try a different approach?`;
+      return `I stopped because execution was not moving forward after ${reason.detail}. No result was accepted without evidence; the action can resume from its last durable state.`;
   }
 }

@@ -1,4 +1,4 @@
-﻿/**
+/**
  * AgentChannelsTab - manage native messaging channels for an agent.
  *
  * The UI mirrors the backend health contract: a channel is only "active" when
@@ -12,6 +12,7 @@ import { api } from '../../lib/api';
 import { Button } from '../shared/Button';
 import { Skeleton } from '../shared/Skeleton';
 import { useToast } from '../shared/Toast';
+import { TeamMembersPanel } from './TeamMembersPanel';
 
 type ChannelStatus = 'needs_action' | 'verifying' | 'active' | 'degraded' | 'error' | 'paused' | string;
 type ChannelKind = 'telegram' | 'discord' | 'slack' | 'whatsapp';
@@ -177,13 +178,20 @@ export function AgentChannelsTab({ agentId, agentName }: { agentId: string; agen
       });
       setAccess(next);
     } catch {
-      setConnections([]);
-      setWorkspaceConnections([]);
+      // Keep the last known cards on a transient API/network failure. Clearing
+      // them makes a healthy channel appear to disappear and can leave a newly
+      // saved connection looking permanently stuck at `verifying`.
+      setConnections((current) => current ?? []);
     }
   }, [agentId]);
 
   useEffect(() => {
     void refresh();
+    // Provider startup and initial diagnostics can complete after the create
+    // request returns. Keep the cards in sync so a transient `verifying` state
+    // naturally settles to active/error without requiring a manual click.
+    const timer = window.setInterval(() => void refresh(), 5_000);
+    return () => window.clearInterval(timer);
   }, [refresh]);
 
   if (connections === null) return <Skeleton height={360} />;
@@ -773,6 +781,7 @@ function ProviderCard({
             access={access}
             onAccessChange={setAccess}
           />
+          <TeamMembersPanel connectionId={connection.id} channelKind={provider.kind} />
           <HealthDetails health={health} />
           <ChannelBehaviorControls connection={connection} onChanged={onChanged} toast={toast} />
           <div className="mt-3 flex flex-wrap gap-2">
@@ -865,12 +874,12 @@ function ProviderCard({
                 />
                 <span>
                   This is my owner/operator chat
-                  <span className="mt-0.5 block text-[11px] text-text-muted">Manual messages here keep the agent available by default. This does not grant extra permissions.</span>
+                  <span className="mt-0.5 block text-[11px] text-text-muted">The agent will recognize you here as the verified workspace owner — full tool access, direct commands, and durable corrections you give it are saved.</span>
                 </span>
               </label>
               {defaultIsOwner && (
                 <ConnectField label="Owner/operator name (optional)" hint="Lets the agent recognize who it is speaking with.">
-                  <input value={ownerName} onChange={(event) => setOwnerName(event.target.value)} placeholder="e.g. Robson" className={INPUT_CLS} />
+                  <input value={ownerName} onChange={(event) => setOwnerName(event.target.value)} placeholder="e.g. Jordan" className={INPUT_CLS} />
                 </ConnectField>
               )}
             </div>
@@ -1263,12 +1272,12 @@ function TargetEditor({
             />
             <span>
               This is my owner/operator chat
-              <span className="mt-0.5 block text-[11px] text-text-muted">Manual messages here keep automation active by default. It does not grant owner access or expose diagnostics.</span>
+              <span className="mt-0.5 block text-[11px] text-text-muted">The agent will recognize you here as the verified workspace owner — full tool access, direct commands, and durable corrections you give it are saved.</span>
             </span>
           </label>
           {ownerTarget && (
             <ConnectField label="Owner/operator name (optional)" hint="Lets the agent recognize who it is speaking with.">
-              <input value={ownerName} onChange={(event) => onOwnerNameChange(event.target.value)} placeholder="e.g. Robson" className={INPUT_CLS} />
+              <input value={ownerName} onChange={(event) => onOwnerNameChange(event.target.value)} placeholder="e.g. Jordan" className={INPUT_CLS} />
             </ConnectField>
           )}
         </div>

@@ -35,11 +35,20 @@ export interface AcpHttpMcpServer {
   headers: Array<{ name: string; value: string }>;
 }
 
-/** One content block in a prompt or update (text is the only kind we send). */
+/** Content blocks Agentis sends to ACP-capable runtimes. */
 export interface AcpTextBlock {
   type: 'text';
   text: string;
 }
+
+export interface AcpImageBlock {
+  type: 'image';
+  data: string;
+  mimeType: string;
+  uri?: string;
+}
+
+export type AcpPromptBlock = AcpTextBlock | AcpImageBlock;
 
 /** A model offered by the agent, surfaced from `session/new`. */
 export interface AcpModelInfo {
@@ -216,7 +225,7 @@ export class AcpClient {
    * the final `{ stopReason }`.
    */
   async sessionPrompt(
-    params: { sessionId: string; prompt: AcpTextBlock[] },
+    params: { sessionId: string; prompt: AcpPromptBlock[] },
     onUpdate: (update: AcpSessionUpdate, sessionId: string) => void,
   ): Promise<AcpPromptResult> {
     this.#updateHandler = onUpdate;

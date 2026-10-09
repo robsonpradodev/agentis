@@ -92,6 +92,98 @@ describe('runSqliteMigrations', () => {
       sqlite.close();
     }
   });
+  it('adds agent standing goals and resumable unresolved channel targets', () => {
+    const { sqlite } = openSqlite({ path: tempDbPath() });
+    try {
+      expect(SQLITE_MIGRATIONS.find((migration) => migration.version === 139)?.name)
+        .toBe('agent_standing_goals_and_resumable_channel_targets');
+      expect(sqlite.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='agent_standing_goals'").get()).toBeDefined();
+      const goalColumns = sqlite.prepare("PRAGMA table_info('agent_standing_goals')").all() as Array<{ name: string }>;
+      expect(goalColumns.map((column) => column.name)).toEqual(expect.arrayContaining(['agent_id', 'objective', 'source_instructions', 'status', 'version', 'policy_json']));
+      const actionColumns = sqlite.prepare("PRAGMA table_info('channel_action_intents')").all() as Array<{ name: string; notnull: number }>;
+      expect(actionColumns.map((column) => column.name)).toEqual(expect.arrayContaining(['recipient_query', 'required_slots_json', 'effect_receipts_json']));
+      expect(actionColumns.find((column) => column.name === 'peer_identity_id')?.notnull).toBe(0);
+      expect(sqliteSchema.agentStandingGoals).toBeDefined();
+    } finally { sqlite.close(); }
+  });
+  it('installs durable missions, normalized effect receipts, and workflow/channel linkage', () => {
+    const { sqlite } = openSqlite({ path: tempDbPath() });
+    try {
+      expect(SQLITE_MIGRATIONS.find((migration) => migration.version === 140)?.name)
+        .toBe('durable_agent_missions_and_effect_ledger');
+      expect(SQLITE_MIGRATIONS.find((migration) => migration.version === 142)?.name)
+        .toBe('agent_execution_requirement_receipts');
+      expect(SQLITE_MIGRATIONS.find((migration) => migration.version === 143)?.name)
+        .toBe('remove_legacy_two_turn_mission_budget');
+      const tables = sqlite.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('agent_missions','effect_receipts')").all() as Array<{ name: string }>;
+      expect(tables.map((row) => row.name).sort()).toEqual(['agent_missions', 'effect_receipts']);
+      const missionColumns = sqlite.prepare("PRAGMA table_info('agent_missions')").all() as Array<{ name: string }>;
+      expect(missionColumns.map((column) => column.name)).toEqual(expect.arrayContaining([
+        'owner_agent_id', 'objective', 'status', 'outcome_contract_json', 'execution_plan_json', 'next_wake_at', 'blocker_json',
+      ]));
+      expect((missionColumns.find((column) => column.name === 'max_attempts') as { dflt_value?: string } | undefined)?.dflt_value).toBe('12');
+      const receiptColumns = sqlite.prepare("PRAGMA table_info('effect_receipts')").all() as Array<{ name: string }>;
+      expect(receiptColumns.map((column) => column.name)).toEqual(expect.arrayContaining([
+        'mission_id', 'requirement_id', 'plan_step_id', 'kind', 'provider_message_id', 'acknowledged', 'resource_id', 'idempotency_key',
+      ]));
+      const runColumns = sqlite.prepare("PRAGMA table_info('workflow_runs')").all() as Array<{ name: string }>;
+      expect(runColumns.map((column) => column.name)).toContain('mission_id');
+      const actionColumns = sqlite.prepare("PRAGMA table_info('channel_action_intents')").all() as Array<{ name: string }>;
+      expect(actionColumns.map((column) => column.name)).toEqual(expect.arrayContaining(['mission_id', 'post_ack_mutations_json']));
+      expect(sqliteSchema.agentMissions).toBeDefined();
+      expect(sqliteSchema.effectReceipts).toBeDefined();
+    } finally { sqlite.close(); }
+  });
+  it('installs Agentic Apps v3 task, effect, and definition storage', () => {
+    const { sqlite } = openSqlite({ path: tempDbPath() });
+    try {
+      expect(SQLITE_MIGRATIONS.find((migration) => migration.version === 144)?.name)
+        .toBe('agentic_apps_v3_tasks_effects_and_definitions');
+      const tables = sqlite.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('mission_events','effect_plans','effect_authorization_grants','app_definitions')").all() as Array<{ name: string }>;
+      expect(tables.map((row) => row.name).sort()).toEqual(['app_definitions', 'effect_authorization_grants', 'effect_plans', 'mission_events']);
+      const missionColumns = sqlite.prepare("PRAGMA table_info('agent_missions')").all() as Array<{ name: string }>;
+      expect(missionColumns.map((column) => column.name)).toEqual(expect.arrayContaining([
+        'operation_id', 'root_mission_id', 'parent_mission_id', 'authority_context_json',
+        'input_requests_json', 'approval_requests_json', 'artifacts_json', 'cost_budget_cents', 'latency_budget_ms',
+      ]));
+      expect(sqliteSchema.effectPlans).toBeDefined();
+      expect(sqliteSchema.effectAuthorizationGrants).toBeDefined();
+      expect(sqliteSchema.appDefinitions).toBeDefined();
+    } finally { sqlite.close(); }
+  });
+  it('installs managed App Git project and immutable build records', () => {
+    const { sqlite } = openSqlite({ path: tempDbPath() });
+    try {
+      expect(SQLITE_MIGRATIONS.find((migration) => migration.version === 145)?.name).toBe('managed_agentic_app_git_projects');
+      const tables = sqlite.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('app_projects','app_builds')").all() as Array<{ name: string }>;
+      expect(tables.map((row) => row.name).sort()).toEqual(['app_builds', 'app_projects']);
+      expect(sqliteSchema.appProjects).toBeDefined();
+      expect(sqliteSchema.appBuilds).toBeDefined();
+    } finally { sqlite.close(); }
+  });
+  it('repairs a database where the mission migration was recorded only partially', () => {
+    const { sqlite } = openSqlite({ path: tempDbPath() });
+    try {
+      sqlite.exec(`
+        ALTER TABLE channel_action_intents DROP COLUMN post_ack_mutations_json;
+        DELETE FROM schema_migrations WHERE version = 141;
+      `);
+
+      expect(
+        (sqlite.prepare("PRAGMA table_info('channel_action_intents')").all() as Array<{ name: string }>)
+          .map((column) => column.name),
+      ).not.toContain('post_ack_mutations_json');
+
+      runSqliteMigrations(sqlite);
+
+      const actionColumns = sqlite.prepare("PRAGMA table_info('channel_action_intents')").all() as Array<{ name: string }>;
+      expect(actionColumns.map((column) => column.name)).toContain('post_ack_mutations_json');
+      expect(sqlite.prepare('SELECT name FROM schema_migrations WHERE version = 141').get())
+        .toEqual({ name: 'repair_partial_agent_mission_effect_columns' });
+      expect(sqlite.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_channel_action_mission'").get())
+        .toEqual({ name: 'idx_channel_action_mission' });
+    } finally { sqlite.close(); }
+  });
   it('uses an external-content ledger FTS index instead of duplicating payload storage', () => {
     const { sqlite } = openSqlite({ path: tempDbPath() });
     try {

@@ -7,6 +7,8 @@
  * during V1.0/V1.1 development.
  */
 
+import { randomUUID } from 'node:crypto';
+import { assertProtectedInstructions, instructionProtection } from '../services/agent/agentInstructionProtection.js';
 import { Hono } from 'hono';
 import { and, eq, inArray } from 'drizzle-orm';
 import {
@@ -43,6 +45,10 @@ import { registerAdapter } from '../services/agent/agentCommission.js';
 import { repairCliHarnessConfig } from '../services/harness/harnessConfigRepair.js';
 import type { V1HarnessAdapterType } from '../services/harness/harnessProbe.js';
 import { normalizeAntigravityModel } from '../adapters/antigravityModels.js';
+import { AgentStandingGoalService } from '../services/agentStandingGoals.js';
+import type { AgentMissionService } from '../services/agentMissions.js';
+import type { AgentisToolRegistry } from '../services/agentisToolRegistry.js';
+import { parseMissionCreateBody } from './missions.js';
 
 export interface AgentRoutesDeps {
   db: AgentisSqliteDb;
@@ -59,11 +65,14 @@ export interface AgentRoutesDeps {
   skillMaterializer?: SkillMaterializer;
   /** Optional: lets agent deletion decide the fate of the agent's memory (B11). */
   episodes?: EpisodicMemoryStore;
+  missions?: AgentMissionService;
+  toolRegistry?: AgentisToolRegistry;
 }
 
 export function buildAgentRoutes(deps: AgentRoutesDeps) {
   const app = new Hono();
   const runtimeProfiles = new RuntimeProfileService(deps.db, deps.adapters, deps.logger);
+  const standingGoals = new AgentStandingGoalService(deps.db);
   app.use('*', requireAuth(deps), requireWorkspace(deps));
 
   app.get('/', (c) => {
@@ -208,6 +217,173 @@ export function buildAgentRoutes(deps: AgentRoutesDeps) {
     });
   });
 
+  app.get('/:id/standing-goals', (c) => {
+    const ws = getWorkspace(c);
+    return c.json({ goals: standingGoals.list(ws.workspaceId, c.req.param('id')) });
+  });
+
+  app.get('/:id/missions', (c) => {
+    const ws = getWorkspace(c);
+    if (!deps.missions) return c.json({ missions: [] });
+    return c.json({ missions: deps.missions.list(ws.workspaceId, { ownerAgentId: c.req.param('id'), limit: 100 }) });
+  });
+
+  app.post('/:id/missions', async (c) => {
+    const ws = getWorkspace(c);
+    if (!deps.missions) throw new AgentisError('INTERNAL_ERROR', 'Mission runtime is unavailable.');
+    const input = parseMissionCreateBody(await c.req.json(), c.req.param('id'));
+    return c.json({ mission: deps.missions.create({ workspaceId: ws.workspaceId, ...input }) }, 201);
+  });
+
+  /** Complete private-Brain inventory, including the stable ids required for a
+   * safe selective reset. This intentionally uses the same registered handler
+   * available to Agents/MCP so the UI, API, and runtime cannot disagree. */
+  app.get('/:id/brain', async (c) => {
+    const ws = getWorkspace(c);
+    if (!deps.toolRegistry) throw new AgentisError('INTERNAL_ERROR', 'Agent Brain administration is unavailable.');
+    const result = await deps.toolRegistry.execute({
+      id: randomUUID(), toolId: 'agentis.agent.brain.inspect', arguments: { agentId: c.req.param('id') },
+    }, {
+      workspaceId: ws.workspaceId, userId: ws.user.id, ambientId: ws.ambientId ?? null, caller: 'chat',
+    });
+    if (!result.ok) {
+      return c.json({ error: { code: result.errorCode, message: result.errorMessage } }, result.errorCode === 'RESOURCE_NOT_FOUND' ? 404 : 422);
+    }
+    return c.json({ brain: result.output });
+  });
+
+  /** Two-phase, recoverable Brain pruning. Omit confirmationToken for a preview;
+   * replay the unchanged keep selection and returned token to archive. The Agent
+   * entity, identity, runtime, Apps, and Connections are never deleted. */
+  app.post('/:id/brain/prune', async (c) => {
+    const ws = getWorkspace(c);
+    if (!deps.toolRegistry) throw new AgentisError('INTERNAL_ERROR', 'Agent Brain administration is unavailable.');
+    const body = await c.req.json().catch(() => ({})) as { keep?: unknown; confirmationToken?: unknown };
+    const result = await deps.toolRegistry.execute({
+      id: randomUUID(), toolId: 'agentis.agent.brain.prune',
+      arguments: {
+        agentId: c.req.param('id'),
+        keep: body.keep,
+        ...(body.confirmationToken !== undefined ? { confirmationToken: body.confirmationToken } : {}),
+      },
+    }, {
+      workspaceId: ws.workspaceId, userId: ws.user.id, ambientId: ws.ambientId ?? null, caller: 'chat',
+    });
+    if (!result.ok) {
+      return c.json({ error: { code: result.errorCode, message: result.errorMessage } }, result.errorCode === 'RESOURCE_NOT_FOUND' ? 404 : 422);
+    }
+    return c.json({ brainPrune: result.output });
+  });
+
+  app.get('/:id/effective-capabilities', (c) => {
+    const ws = getWorkspace(c); const agentId = c.req.param('id');
+    const agent = deps.db.select({ id: schema.agents.id }).from(schema.agents).where(and(
+      eq(schema.agents.workspaceId, ws.workspaceId), eq(schema.agents.id, agentId),
+    )).get();
+    if (!agent) throw new AgentisError('RESOURCE_NOT_FOUND', `agent ${agentId} not found`);
+    const ownedConnections = deps.db.select({
+      id: schema.channelConnections.id, kind: schema.channelConnections.kind,
+      name: schema.channelConnections.name, status: schema.channelConnections.status,
+    }).from(schema.channelConnections).where(and(
+      eq(schema.channelConnections.workspaceId, ws.workspaceId), eq(schema.channelConnections.agentId, agentId),
+    )).all().map((connection) => ({ ...connection, scope: 'manage', authorityBasis: 'connection_owner' }));
+    const grants = deps.db.select().from(schema.connectionAgentGrants).where(and(
+      eq(schema.connectionAgentGrants.workspaceId, ws.workspaceId), eq(schema.connectionAgentGrants.agentId, agentId),
+      eq(schema.connectionAgentGrants.status, 'active'),
+    )).all();
+    const catalog = deps.toolRegistry?.catalog() ?? { tools: [], hash: 'unavailable', generatedAt: new Date().toISOString() };
+    return c.json({
+      agentId, catalogHash: catalog.hash, tools: catalog.tools,
+      connections: [...ownedConnections, ...grants.map((grant) => ({
+        id: grant.connectionId, kind: grant.connectionKind, scope: grant.scope, authorityBasis: 'persistent_grant', status: grant.status,
+      }))],
+      policy: { workspaceApiSurface: 'complete', selection: 'relevance_scoped', hostSecretsExposed: false },
+    });
+  });
+
+  app.get('/:id/standing-goals/:goalId', (c) => {
+    const ws = getWorkspace(c);
+    return c.json({ goal: standingGoals.inspect(ws.workspaceId, c.req.param('id'), c.req.param('goalId')) });
+  });
+
+  app.get('/:id/standing-goals/:goalId/review-diff', (c) => {
+    const ws = getWorkspace(c);
+    return c.json({ diff: standingGoals.reviewDiff(ws.workspaceId, c.req.param('id'), c.req.param('goalId')) });
+  });
+
+  app.get('/:id/autonomy-status', (c) => {
+    const ws = getWorkspace(c); const agentId = c.req.param('id');
+    const entity = deps.db.select().from(schema.durableEntities).where(and(
+      eq(schema.durableEntities.workspaceId, ws.workspaceId), eq(schema.durableEntities.kind, 'agent'), eq(schema.durableEntities.key, agentId),
+    )).get();
+    const actions = deps.db.select().from(schema.channelActionIntents).where(and(
+      eq(schema.channelActionIntents.workspaceId, ws.workspaceId), eq(schema.channelActionIntents.agentId, agentId),
+    )).all().sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    const pending = actions.filter((action) => ['planned', 'awaiting_approval', 'authorized', 'executing', 'failed'].includes(action.status));
+    const missions = deps.missions?.list(ws.workspaceId, { ownerAgentId: agentId, limit: 50 }) ?? [];
+    const activeMissions = missions.filter((mission) => ['queued', 'running', 'waiting', 'replanning'].includes(mission.status));
+    const missionBlocker = missions.find((mission) => mission.status === 'blocked')?.blocker?.detail ?? null;
+    const missionDetails = deps.missions
+      ? missions.slice(0, 12).map((mission) => deps.missions!.inspect(ws.workspaceId, mission.id))
+      : [];
+    return c.json({
+      status: activeMissions.length > 0 ? 'active' : entity?.status ?? 'inactive',
+      lastWakeAt: entity?.updatedAt ?? null,
+      nextWakeAt: activeMissions.map((mission) => mission.nextWakeAt).filter((value): value is string => Boolean(value)).sort()[0] ?? entity?.nextWakeAt ?? null,
+      pendingActions: pending.length,
+      activeMissions: activeMissions.length,
+      blocker: missionBlocker ?? pending.find((action) => action.lastError)?.lastError ?? null,
+      missions: missionDetails,
+      recentOutcomes: actions.filter((action) => ['delivered', 'failed', 'cancelled'].includes(action.status)).slice(0, 5).map((action) => ({
+        id: action.id, status: action.status, goal: action.goal, at: action.deliveredAt ?? action.updatedAt,
+      })),
+    });
+  });
+
+  app.post('/:id/standing-goals/compile', async (c) => {
+    const ws = getWorkspace(c);
+    const body = await c.req.json() as { instructions?: unknown; title?: unknown; policy?: unknown };
+    if (typeof body.instructions !== 'string') throw new AgentisError('VALIDATION_FAILED', 'instructions must be a string');
+    const goal = standingGoals.compile({
+      workspaceId: ws.workspaceId, agentId: c.req.param('id'), instructions: body.instructions,
+      ...(typeof body.title === 'string' ? { title: body.title } : {}),
+      ...(body.policy && typeof body.policy === 'object' ? { policy: body.policy as never } : {}),
+    });
+    return c.json({ goal }, 201);
+  });
+
+  app.patch('/:id/standing-goals/:goalId', async (c) => {
+    const ws = getWorkspace(c);
+    const body = await c.req.json() as { instructions?: unknown; title?: unknown; policy?: unknown };
+    if (body.instructions !== undefined && typeof body.instructions !== 'string') {
+      throw new AgentisError('VALIDATION_FAILED', 'instructions must be a string');
+    }
+    if (body.title !== undefined && typeof body.title !== 'string') {
+      throw new AgentisError('VALIDATION_FAILED', 'title must be a string');
+    }
+    if (body.policy !== undefined && (!body.policy || typeof body.policy !== 'object' || Array.isArray(body.policy))) {
+      throw new AgentisError('VALIDATION_FAILED', 'policy must be an object');
+    }
+    return c.json({ goal: standingGoals.revise({
+      workspaceId: ws.workspaceId,
+      agentId: c.req.param('id'),
+      goalId: c.req.param('goalId'),
+      ...(typeof body.instructions === 'string' ? { instructions: body.instructions } : {}),
+      ...(typeof body.title === 'string' ? { title: body.title } : {}),
+      ...(body.policy && typeof body.policy === 'object' ? { policy: body.policy as never } : {}),
+    }) });
+  });
+
+  app.post('/:id/standing-goals/:goalId/activate', (c) => {
+    const ws = getWorkspace(c);
+    return c.json({ goal: standingGoals.activate(ws.workspaceId, c.req.param('id'), c.req.param('goalId')) });
+  });
+
+  app.post('/:id/standing-goals/:goalId/pause', (c) => {
+    const ws = getWorkspace(c);
+    return c.json({ goal: standingGoals.pause(ws.workspaceId, c.req.param('id'), c.req.param('goalId')) });
+  });
+
   app.get('/:id/connections', (c) => {
     const ws = getWorkspace(c);
     const id = c.req.param('id');
@@ -279,12 +455,14 @@ export function buildAgentRoutes(deps: AgentRoutesDeps) {
       throw new AgentisError('VALIDATION_FAILED', 'Instruction file is not writable from Agentis.');
     }
     if (target.kind === 'platform') {
+      assertProtectedInstructions(agent, body.content);
       deps.db
         .update(schema.agents)
         .set({ instructions: body.content, updatedAt: new Date().toISOString() })
         .where(eq(schema.agents.id, id))
         .run();
     } else {
+      if (instructionProtection(agent.config)) throw new AgentisError('AUTH_FORBIDDEN', 'Edit the protected platform instructions, not a separate harness file.');
       writeInstructionFile(target, body.content);
     }
     return c.json({ ok: true });

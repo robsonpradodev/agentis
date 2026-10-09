@@ -319,6 +319,7 @@ export class OpenClawAdapter implements AgentAdapter {
       sessionKey,
       prompt,
       callerManagedTools,
+      tools,
       signal: options?.signal,
       timeoutMs: options?.timeoutMs,
     });
@@ -330,6 +331,7 @@ export class OpenClawAdapter implements AgentAdapter {
     signal?: AbortSignal;
     timeoutMs?: number;
     callerManagedTools?: boolean;
+    tools?: ToolDefinition[];
   }): AsyncIterable<ChatDelta> {
     const queue = createChatQueue();
     const idleTimeoutMs = clampChatTimeout(args.timeoutMs ?? (this.opts.timeoutSec ? this.opts.timeoutSec * 1000 : DEFAULT_CHAT_TURN_TIMEOUT_MS));
@@ -427,7 +429,7 @@ export class OpenClawAdapter implements AgentAdapter {
           },
         );
         if (args.callerManagedTools) {
-          const callerDeltas = openClawCallerManagedDeltas(bufferedAssistantText);
+          const callerDeltas = openClawCallerManagedDeltas(bufferedAssistantText, args.tools);
           for (const delta of callerDeltas) queue.push(delta);
           if (callerDeltas.some((delta) => delta.type === 'tool_call')) {
             finish([{ type: 'done', finishReason: 'tool_calls' }]);
@@ -541,8 +543,8 @@ export class OpenClawAdapter implements AgentAdapter {
 /** Convert the buffered ACP assistant response into the same safe marker-call
  * boundary used by the other caller-managed runtimes. Exported so this critical
  * capability path can be tested without starting a real OpenClaw gateway. */
-export function openClawCallerManagedDeltas(text: string): ChatDelta[] {
-  const { cleaned, calls } = extractMarkerToolCalls(text);
+export function openClawCallerManagedDeltas(text: string, tools: ToolDefinition[] = []): ChatDelta[] {
+  const { cleaned, calls } = extractMarkerToolCalls(text, tools);
   return [
     ...(cleaned.trim() ? [{ type: 'text' as const, delta: cleaned.trim() }] : []),
     ...calls.map((call) => ({

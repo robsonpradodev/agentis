@@ -143,7 +143,7 @@ describe('<AgentChannelsTab />', () => {
 
     await userEvent.type(screen.getByPlaceholderText(/\+12345678901/i), '+1 234 567-8901');
     await userEvent.click(screen.getByLabelText(/This is my owner\/operator chat/i));
-    await userEvent.type(screen.getByPlaceholderText(/e\.g\. Robson/i), 'Robson');
+    await userEvent.type(screen.getByPlaceholderText(/e\.g\. Jordan/i), 'Jordan');
     await userEvent.click(screen.getByRole('button', { name: /^Save$/i }));
 
     await waitFor(() => expect(calls.some((call) => call.url === '/v1/channels/wa1/targets' && call.method === 'PATCH')).toBe(true));
@@ -157,7 +157,7 @@ describe('<AgentChannelsTab />', () => {
     const calls: Array<{ url: string; method: string; body?: string }> = [];
     const connection = {
       id: 'wa-owner', agentId: 'a1', kind: 'whatsapp', name: 'Owner WhatsApp', status: 'active', mode: 'qr_local',
-      defaultChatId: '553171443148@s.whatsapp.net', ownerChatId: '553171443148@s.whatsapp.net', targetAliases: {},
+      defaultChatId: '15559876543@s.whatsapp.net', ownerChatId: '15559876543@s.whatsapp.net', targetAliases: {},
       whatsappProfile: {
         version: 3, ownerReasoningVisibility: 'off', manualOutboundTakeover: 'until_handback',
         ownerManualOutboundTakeover: 'off', historyReconciliation: 'recent',
@@ -174,7 +174,7 @@ describe('<AgentChannelsTab />', () => {
     }));
 
     render(<AgentChannelsTab agentId="a1" agentName="Orchestrator" />);
-    await waitFor(() => expect(screen.getByDisplayValue('553171443148@s.whatsapp.net')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByDisplayValue('15559876543@s.whatsapp.net')).toBeInTheDocument());
     await userEvent.click(screen.getByRole('button', { name: /Behavior & safety/i }));
     expect(screen.getByLabelText(/Pause automation in a conversation/i)).toBeChecked();
     expect(screen.queryByLabelText(/Also pause automation for the owner\/operator chat/i)).not.toBeInTheDocument();
@@ -187,14 +187,14 @@ describe('<AgentChannelsTab />', () => {
       const url = String(input);
       if (url === '/v1/channels') return jsonResponse({
         connections: [{
-          id: 'wa1', agentId: 'a1', kind: 'whatsapp', name: 'Bia WhatsApp', status: 'active', mode: 'qr_local',
+          id: 'wa1', agentId: 'a1', kind: 'whatsapp', name: 'Ava WhatsApp', status: 'active', mode: 'qr_local',
           defaultChatId: null, ownerChatId: null, targetAliases: {}, health: { status: 'active', checks: [] },
         }],
       });
       if (url.startsWith('/v1/channels/inbox?')) return jsonResponse({
         peers: [{
           recipientRef: 'peer:p1', peerIdentityId: 'p1', connectionId: 'wa1', channelKind: 'whatsapp',
-          displayName: 'atacadaosertaneja', conversationId: 'conv1', lastInboundAt: '2026-08-25T16:30:00.000Z',
+          displayName: 'example-store', conversationId: 'conv1', lastInboundAt: '2026-08-25T16:30:00.000Z',
           lastOutboundAt: null, lastMessageAt: '2026-08-25T16:30:00.000Z', lastMessagePreview: 'Boa tarde',
           lastMessageDirection: 'inbound', handoffState: 'agent', subjectId: 'subject1', stage: 'qualified',
           goal: 'Book a product demonstration', aliases: [
@@ -214,8 +214,8 @@ describe('<AgentChannelsTab />', () => {
       return jsonResponse({});
     }));
 
-    render(<AgentChannelsTab agentId="a1" agentName="Bia" />);
-    expect((await screen.findAllByText('atacadaosertaneja')).length).toBeGreaterThanOrEqual(1);
+    render(<AgentChannelsTab agentId="a1" agentName="Ava" />);
+    expect((await screen.findAllByText('example-store')).length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText('Boa tarde')).toBeInTheDocument();
     expect(screen.getByText('qualified')).toBeInTheDocument();
     expect(screen.getByText('2 linked identities')).toBeInTheDocument();

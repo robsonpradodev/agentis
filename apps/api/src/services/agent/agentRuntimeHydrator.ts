@@ -58,6 +58,7 @@ export async function hydrateAgentRuntimes(deps: AgentRuntimeHydratorDeps): Prom
   let skipped = 0;
   let failed = 0;
   let needsConfig = 0;
+  const needsConfigByAdapter: Record<string, number> = {};
 
   skipped = agents.length - eligibleAgents.length;
 
@@ -90,7 +91,7 @@ export async function hydrateAgentRuntimes(deps: AgentRuntimeHydratorDeps): Prom
       // next visit to that agent surface the exact fix via the runtime probe.
       if (isNeedsConfigError(err)) {
         needsConfig += 1;
-        deps.logger.info('agent_runtime_hydrator.needs_config', { agentId: agent.id, adapterType, reason: message });
+        needsConfigByAdapter[adapterType] = (needsConfigByAdapter[adapterType] ?? 0) + 1;
         setAgentStatus(deps, agent.workspaceId, agent.id, 'offline');
         return;
       }
@@ -100,7 +101,13 @@ export async function hydrateAgentRuntimes(deps: AgentRuntimeHydratorDeps): Prom
     }
   });
 
-  deps.logger.info('agent_runtime_hydrator.complete', { connected, skipped, failed, needsConfig });
+  deps.logger.info('agent_runtime_hydrator.complete', {
+    connected,
+    skipped,
+    failed,
+    needsConfig,
+    ...(needsConfig > 0 ? { needsConfigByAdapter } : {}),
+  });
 }
 
 /**

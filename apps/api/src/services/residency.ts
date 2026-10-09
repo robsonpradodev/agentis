@@ -22,6 +22,8 @@ export interface ResidencyConfig {
   intervalMinutes: number;
   /** The standing instruction handed to the agent on each wake. */
   wake: string;
+  /** Activated durable standing goals; the driver resolves their current versions on every wake. */
+  activeGoalIds: string[];
 }
 
 const DEFAULT_INTERVAL_MINUTES = 15;
@@ -44,6 +46,7 @@ export function readResidency(config: unknown): ResidencyConfig | null {
     enabled: true,
     intervalMinutes: Math.max(MIN_INTERVAL_MINUTES, Math.floor(rawInterval)),
     wake: typeof obj.wake === 'string' && obj.wake.trim() ? obj.wake.trim() : DEFAULT_WAKE,
+    activeGoalIds: Array.isArray(obj.activeGoalIds) ? obj.activeGoalIds.filter((id): id is string => typeof id === 'string') : [],
   };
 }
 
@@ -56,8 +59,9 @@ export function residencyDue(lastWokeAtIso: string | null, cfg: ResidencyConfig,
 }
 
 /** Compose the wake turn: the standing instruction + the working state carried from the prior wake. */
-export function buildResidencyWake(cfg: ResidencyConfig, carried: { task?: string; plan?: string; observations?: string }): string {
+export function buildResidencyWake(cfg: ResidencyConfig, carried: { task?: string; plan?: string; observations?: string }, goals: Array<{ id: string; objective: string }> = []): string {
   const parts = [`[Scheduled residency wake] ${cfg.wake}`];
+  if (goals.length) parts.push(`Your active standing goals:\n${goals.map((goal) => `- [${goal.id}] ${goal.objective}`).join('\n')}`);
   const task = carried.task?.trim();
   const plan = carried.plan?.trim();
   const obs = carried.observations?.trim();

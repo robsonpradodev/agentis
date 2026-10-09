@@ -21,12 +21,14 @@ import type { ToolHandlerDeps } from '../../src/services/agentisToolHandlers/dep
 import type { ExtensionRuntime } from '../../src/services/extensionRuntime.js';
 import { createTestContext, type TestContext } from '../_helpers/createTestContext.js';
 import { ConversationTurnLeaseRegistry } from '../../src/services/conversation/conversationTurnLease.js';
+import { AgentMissionService } from '../../src/services/agentMissions.js';
 
 let ctx: TestContext;
 let engine: WorkflowEngine;
 let registry: AgentisToolRegistry;
 let adapters: AdapterManager;
 let turnLeases: ConversationTurnLeaseRegistry;
+let missions: AgentMissionService;
 
 beforeEach(async () => {
   ctx = await createTestContext();
@@ -46,6 +48,7 @@ beforeEach(async () => {
   });
   registry = new AgentisToolRegistry({ logger: ctx.logger });
   turnLeases = new ConversationTurnLeaseRegistry();
+  missions = new AgentMissionService(ctx.db, ctx.bus);
   registerBuildTools(registry, {
     db: ctx.db,
     logger: ctx.logger,
@@ -82,12 +85,32 @@ beforeEach(async () => {
     },
     () => ({ mutated: true }),
   );
+  registry.register(
+    {
+      id: 'agentis.provider_deliver', family: 'run', description: 'A provider-acknowledged delivery',
+      inputSchema: { type: 'object' }, mutating: true, mcpExposed: true,
+      approval: { riskLevel: 'low', reversible: false, externalSideEffects: true },
+    },
+    (_args, toolCtx) => {
+      if (!toolCtx.missionId) return { delivered: false, error: 'missing mission context' };
+      missions.recordReceipt({
+        workspaceId: toolCtx.workspaceId,
+        missionId: toolCtx.missionId,
+        kind: 'channel_delivery',
+        providerMessageId: 'provider-message-1',
+        providerStatus: 'accepted',
+        acknowledged: true,
+        idempotencyKey: 'provider-message-1',
+      });
+      return { delivered: true, providerMessageId: 'provider-message-1' };
+    },
+  );
 });
 
 afterEach(() => ctx.close());
 
 function app() {
-  return ctx.buildApp([{ path: '/v1/mcp', app: buildMcpRoutes({ db: ctx.db, auth: ctx.auth, engine, toolRegistry: registry, turnLeases }) }]);
+  return ctx.buildApp([{ path: '/v1/mcp', app: buildMcpRoutes({ db: ctx.db, auth: ctx.auth, engine, toolRegistry: registry, turnLeases, missions }) }]);
 }
 
 function seedPublishedWorkflow(slug: string): void {
@@ -278,6 +301,97 @@ describe('/v1/mcp/rpc', () => {
     const body = await res.json() as { result: { content: Array<{ text: string }>; isError?: boolean } };
     expect(body.result.isError).toBeFalsy();
     expect(JSON.parse(body.result.content[0]!.text)).toEqual({ echoed: { hello: 'world' } });
+  });
+
+  it('settles a planned Mission from a successful MCP-native mutation', async () => {
+    const agentId = seedAgent();
+    const conversationId = randomUUID();
+    const mission = missions.create({
+      workspaceId: ctx.workspace.id,
+      ownerAgentId: agentId,
+      sourceKind: 'conversation',
+      sourceRef: conversationId,
+      objective: 'Apply the planned local mutation.',
+      outcomeContract: { requiredEffects: [{
+        id: 'requirement:mutate',
+        kind: 'data_mutation',
+        planStepId: 'mutate',
+        targetRef: 'local-resource',
+        evidence: 'mutation_receipt',
+      }] },
+      executionPlan: { version: 1, steps: [{
+        id: 'mutate',
+        kind: 'effect',
+        title: 'Apply mutation',
+        toolName: 'agentis.low_risk_mutate',
+        effectRequirementIds: ['requirement:mutate'],
+      }] },
+    });
+    const token = turnLeases.issue(ctx.workspace.id, conversationId, {
+      allowedToolIds: ['agentis.low_risk_mutate'],
+    });
+    // Semantic planning occurs after the lease is issued in real chat turns.
+    turnLeases.updateContext(ctx.workspace.id, conversationId, token, { missionId: mission.id });
+    const response = await rpc(app(), 'tools/call', {
+      name: 'agentis.low_risk_mutate',
+      arguments: {},
+    }, 'mission-mutation', {
+      'x-agentis-conversation': conversationId,
+      'x-agentis-turn-lease': token,
+    });
+
+    expect(response.status).toBe(200);
+    const settled = missions.inspect(ctx.workspace.id, mission.id);
+    expect(settled.status).toBe('accomplished');
+    expect(settled.receipts).toHaveLength(1);
+    expect(settled.receipts?.[0]).toMatchObject({
+      requirementId: 'requirement:mutate',
+      planStepId: 'mutate',
+      kind: 'data_mutation',
+      resourceId: 'local-resource',
+      acknowledged: true,
+    });
+    expect(settled.receipts?.[0]?.toolCallId).toContain('mission-mutation');
+  });
+
+  it('propagates Mission context to provider-backed MCP tools without fabricating acknowledgement', async () => {
+    const agentId = seedAgent();
+    const conversationId = randomUUID();
+    const mission = missions.create({
+      workspaceId: ctx.workspace.id,
+      ownerAgentId: agentId,
+      sourceKind: 'conversation',
+      sourceRef: conversationId,
+      objective: 'Deliver through the provider.',
+      outcomeContract: { requiredEffects: [{
+        id: 'requirement:deliver', kind: 'channel_delivery', planStepId: 'deliver',
+        evidence: 'provider_acknowledgement',
+      }] },
+      executionPlan: { version: 1, steps: [{
+        id: 'deliver', kind: 'effect', title: 'Deliver', toolName: 'agentis.provider_deliver',
+        effectRequirementIds: ['requirement:deliver'],
+      }] },
+    });
+    const token = turnLeases.issue(ctx.workspace.id, conversationId, {
+      missionId: mission.id,
+      allowedToolIds: ['agentis.provider_deliver'],
+    });
+    const response = await rpc(app(), 'tools/call', {
+      name: 'agentis.provider_deliver', arguments: {},
+    }, 'provider-delivery', {
+      'x-agentis-conversation': conversationId,
+      'x-agentis-turn-lease': token,
+    });
+
+    expect(response.status).toBe(200);
+    const settled = missions.inspect(ctx.workspace.id, mission.id);
+    expect(settled.status).toBe('accomplished');
+    expect(settled.receipts).toHaveLength(1);
+    expect(settled.receipts?.[0]).toMatchObject({
+      kind: 'channel_delivery',
+      providerMessageId: 'provider-message-1',
+      acknowledged: true,
+    });
   });
 
   it('rejects a late harness tool call before dispatch after its turn lease is revoked', async () => {

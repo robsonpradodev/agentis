@@ -205,6 +205,14 @@ export function evaluateNodeReadiness(config: unknown, context: NodeConfigContex
         ? ready()
         : missing('Set the content or a content path to ingest.');
     case 'agent_task':
+      if (!stringOf(c.prompt).trim()) return missing('Write the agent prompt.');
+      if (c.taskMode === 'act') {
+        const contract = c.completionContract && typeof c.completionContract === 'object'
+          ? c.completionContract as Record<string, unknown>
+          : {};
+        if (!nonEmptyArray(contract.requiredEffects)) return missing('Select at least one verified effect for this action task.');
+      }
+      return ready();
     case 'agent_session':
       return stringOf(c.prompt).trim() ? ready() : missing('Write the agent prompt.');
     case 'dynamic_swarm':

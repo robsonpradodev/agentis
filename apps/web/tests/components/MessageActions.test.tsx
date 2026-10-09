@@ -72,14 +72,14 @@ describe('MessageActions turn changes', () => {
             direction: 'undo',
             kind: 'conflict',
             summary: summary(),
-            conflicts: [{ resourceKind: 'agents', resourceId: 'agent-1', label: 'Agent · Bia', fields: ['instructions'], reason: 'overlapping_change' }],
+            conflicts: [{ resourceKind: 'agents', resourceId: 'agent-1', label: 'Agent · Ava', fields: ['instructions'], reason: 'overlapping_change' }],
           }}
           onDismissTurnChange={vi.fn()}
         />
       </div>,
     );
     expect(screen.getByRole('alert', { name: 'Undo conflict' })).toBeInTheDocument();
-    expect(screen.getByText(/Agent · Bia/)).toBeInTheDocument();
+    expect(screen.getByText(/Agent · Ava/)).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Force' })).not.toBeInTheDocument();
   });
 });

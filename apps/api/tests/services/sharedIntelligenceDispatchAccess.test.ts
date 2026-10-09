@@ -56,7 +56,7 @@ describe('SharedIntelligenceService — dispatch retrieval marks access', () => 
   it('recalls a stored memory with a missing embedding via lexical fallback (hybrid recall)', async () => {
     const atom = await brain.addAtom({
       workspaceId: ctx.workspace.id,
-      content: 'My name is Robson Prado.',
+      content: 'My name is Jordan Lee.',
       confidence: 1,
       source: 'operator_write',
     });
@@ -74,7 +74,7 @@ describe('SharedIntelligenceService — dispatch retrieval marks access', () => 
       scope: 'workspace',
       limit: 5,
     });
-    expect(hits.some((h) => h.content.includes('Robson Prado'))).toBe(true);
+    expect(hits.some((h) => h.content.includes('Jordan Lee'))).toBe(true);
   });
 
   it('honors an agent-scoped governing rule as constitutional for that agent only, regardless of query relevance', async () => {

@@ -11,6 +11,7 @@ import type { SessionMomentService } from '../sessionMomentService.js';
 import { classifyPacer } from '../brain/brainPacer.js';
 import { extractOperatorCandidates } from '../brain/brainFormation.js';
 import { looksSensitive, redactForMemory, segment } from '../brain/brainText.js';
+import { containsInternalExecutionNarration, isSyntheticCustomerResetPrompt } from './internalExecutionNarration.js';
 
 type CapturedMemoryKind = 'fact' | 'preference' | 'rule' | 'lesson';
 
@@ -137,6 +138,17 @@ export class ChatMemoryCaptureService {
     const userMessage = args.userMessage.trim();
     if (!userMessage) return result;
 
+    const external = isExternalSender(args);
+    if (external && this.#externalContactMemoryPolicy(args.agentId) === 'conversation_only') {
+      this.deps.logger.info('chat.memory_capture.external_conversation_only', {
+        workspaceId: args.workspaceId,
+        conversationId: args.conversationId,
+        agentId: args.agentId,
+      });
+      return result;
+    }
+    if (isSyntheticCustomerResetPrompt(userMessage)) return result;
+
     // The web route normally performs this write before dispatch. Keeping it
     // here makes channel adapters and older callers equally safe.
     const immediateCorrection = extractImmediateAgentCorrection(userMessage, displayName(args));
@@ -205,8 +217,10 @@ export class ChatMemoryCaptureService {
       // formation pipeline (judge dedupes/reconciles), so what an agent learns in
       // one run exists for the next one. This was the biggest silent leak: only
       // operator text was ever mined, so agents never remembered their own work.
-      const agentLearning = extractAgentLearningSignal(args.assistantMessage ?? '');
-      const external = isExternalSender(args);
+      const safeAssistantMessage = containsInternalExecutionNarration(args.assistantMessage ?? '')
+        ? ''
+        : (args.assistantMessage ?? '');
+      const agentLearning = extractAgentLearningSignal(safeAssistantMessage);
       result.signals = operatorCandidates.length + (agentLearning ? 1 : 0);
       if (operatorCandidates.length > 0 || agentLearning) {
         try {
@@ -236,7 +250,7 @@ export class ChatMemoryCaptureService {
               memoryPolicy: 'form',
               originSurface,
               operatorText: external ? redactForMemory(userMessage) : userMessage,
-              taskOutput: (args.assistantMessage ?? '').trim(),
+              taskOutput: safeAssistantMessage.trim(),
               taskTitle: external
                 ? `Contact conversation${args.userDisplayName ? ` with ${args.userDisplayName}` : ''}`
                 : `Operator chat${args.userDisplayName ? ` with ${args.userDisplayName}` : ''}`,
@@ -344,6 +358,15 @@ export class ChatMemoryCaptureService {
       confidence: signals.length > 0 ? 0.78 : 0.62,
     });
     return moment.id;
+  }
+
+  #externalContactMemoryPolicy(agentId: string): 'scoped' | 'conversation_only' {
+    const row = this.deps.db.select({ config: schema.agents.config }).from(schema.agents)
+      .where(eq(schema.agents.id, agentId)).get();
+    const config = row?.config && typeof row.config === 'object' && !Array.isArray(row.config)
+      ? row.config as Record<string, unknown>
+      : {};
+    return config.externalContactMemoryPolicy === 'conversation_only' ? 'conversation_only' : 'scoped';
   }
 
   #writeWorkspaceMemory(args: CaptureChatTurnArgs, signal: OperatorMemorySignal): string | null {

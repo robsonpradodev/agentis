@@ -179,6 +179,7 @@ export class TelegramChannelAdapter implements ChannelAdapter {
   }
 
   async #sendNative(token: string, chatId: string, native: OutboundNativeContent, body: string): Promise<ChannelDeliveryReceipt> {
+    if (native.kind !== 'location' && native.kind !== 'contact' && native.kind !== 'poll') throw new Error('This transport does not support Cloud interactive content or templates');
     const method = native.kind === 'location' ? 'sendLocation' : native.kind === 'contact' ? 'sendContact' : 'sendPoll';
     const nativePayload = native.kind === 'location'
       ? { latitude: native.latitude, longitude: native.longitude }

@@ -188,4 +188,129 @@ describe('agentis.permissions.configure', () => {
     expect(result.ok).toBe(true);
     expect(deliverToConnection).toHaveBeenCalledWith(expect.objectContaining({ chatId: '5522@s.whatsapp.net' }));
   });
+
+  it('binds a raw-number owner action to the target peer instead of the owner conversation', async () => {
+    const createAndExecute = vi.fn(async (input: Record<string, unknown>) => ({
+      result: {
+        sent: true,
+        connectionId: input.connectionId,
+        to: '15551234567@s.whatsapp.net',
+        receipt: { providerMessageId: 'wamid-target', status: 'accepted', providerAcknowledged: true },
+      },
+      action: { id: 'action-target', status: 'delivered' },
+    }));
+    const channels = {
+      list: () => [{
+        id: 'wa-1', kind: 'whatsapp', name: 'Ava WhatsApp', status: 'active', agentId: 'sample-1',
+        defaultChatId: '15559876543@s.whatsapp.net', targetAliases: {}, isDefault: true,
+        health: { status: 'ok' },
+      }],
+      get: () => ({ id: 'wa-1', kind: 'whatsapp', agentId: 'sample-1' }),
+      defaultConnectionFor: () => 'wa-1',
+      resolveDestination: ({ to }: { to?: string | null }) => ({
+        chatId: `${String(to).replace(/\D/g, '')}@s.whatsapp.net`, source: 'explicit' as const,
+      }),
+    };
+    const channelInbox = {
+      ensurePeer: vi.fn(() => ({
+        recipientRef: 'peer:target', peerIdentityId: 'target', connectionId: 'wa-1',
+        channelKind: 'whatsapp', conversationId: null, subjectId: null,
+      })),
+    };
+    const registry = new AgentisToolRegistry({ logger: ctx.logger });
+    registerChannelTools(registry, {
+      db: ctx.db,
+      channels,
+      channelInbox,
+      channelActions: { createAndExecute },
+    } as unknown as ToolHandlerDeps);
+
+    const result = await registry.execute({
+      id: randomUUID(),
+      toolId: 'agentis.channel.send',
+      arguments: { to: '+15551234567', body: 'oi', goal: 'Send the owner-requested greeting' },
+    }, {
+      workspaceId: ctx.workspace.id,
+      userId: ctx.user.id,
+      agentId: 'sample-1',
+      missionId: 'mission-1',
+      executionMode: 'chat',
+      caller: 'chat',
+      channelOrigin: {
+        kind: 'whatsapp', connectionId: 'wa-1', chatId: '15559876543@s.whatsapp.net',
+        conversationId: 'owner-conversation', ownerVerified: true,
+        explicitRecipients: ['15551234567@s.whatsapp.net'],
+      },
+    });
+
+    expect(result.ok).toBe(true);
+    expect(createAndExecute).toHaveBeenCalledWith(expect.objectContaining({
+      connectionId: 'wa-1',
+      recipientRef: 'peer:target',
+      conversationId: null,
+      authorizationBasis: 'verified_owner_command',
+      missionId: 'mission-1',
+    }));
+  });
+
+  it('retains media when an owner sends through a resolved recipient reference', async () => {
+    const createAndExecute = vi.fn(async (input: Record<string, unknown>) => ({
+      result: { sent: true, verified: true, connectionId: input.connectionId, to: '15551234567@s.whatsapp.net' },
+      action: { id: 'action-media', status: 'delivered' },
+    }));
+    const channels = {
+      get: () => ({ id: 'wa-1', kind: 'whatsapp', agentId: 'sample-1' }),
+    };
+    const channelInbox = {
+      resolve: vi.fn(() => ({
+        resolved: true,
+        to: '15551234567@s.whatsapp.net',
+        peer: {
+          recipientRef: 'peer:target', peerIdentityId: 'target', connectionId: 'wa-1',
+          channelKind: 'whatsapp', conversationId: 'target-conversation', subjectId: 'lead-1',
+        },
+      })),
+    };
+    const registry = new AgentisToolRegistry({ logger: ctx.logger });
+    registerChannelTools(registry, {
+      db: ctx.db,
+      channels,
+      channelInbox,
+      channelActions: { createAndExecute },
+    } as unknown as ToolHandlerDeps);
+
+    const result = await registry.execute({
+      id: randomUUID(),
+      toolId: 'agentis.channel.send',
+      arguments: {
+        connectionId: 'wa-1',
+        recipientRef: 'peer:target',
+        body: 'Aqui está a imagem.',
+        attachments: [{ artifactId: 'asset-1', kind: 'image', filename: 'acme.png' }],
+        goal: 'Send the requested existing Acme image',
+      },
+    }, {
+      workspaceId: ctx.workspace.id,
+      userId: ctx.user.id,
+      agentId: 'sample-1',
+      missionId: 'mission-media',
+      executionMode: 'chat',
+      caller: 'chat',
+      channelOrigin: {
+        kind: 'whatsapp', connectionId: 'wa-1', chatId: '15559876543@s.whatsapp.net',
+        ownerVerified: true,
+      },
+    });
+
+    expect(result.ok).toBe(true);
+    expect(createAndExecute).toHaveBeenCalledWith(expect.objectContaining({
+      body: '',
+      recipientRef: 'peer:target',
+      messages: [{
+        body: 'Aqui está a imagem.',
+        attachments: [{ artifactId: 'asset-1', kind: 'image', filename: 'acme.png' }],
+      }],
+      authorizationBasis: 'verified_owner_command',
+    }));
+  });
 });

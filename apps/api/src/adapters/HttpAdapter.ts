@@ -38,6 +38,8 @@ export interface HttpAdapterOptions {
   healthUrl?: string;
   chatUrl?: string;
   supportsTools?: boolean;
+  /** Wire format used by the remote chat endpoint. Defaults to Agentis-native. */
+  chatProtocol?: 'agentis' | 'openai';
   /** Explicit powers implemented by the remote runtime behind this contract. */
   capabilityManifest?: RuntimeCapabilityDeclaration[];
   model?: string;
@@ -199,6 +201,12 @@ export class HttpAdapter implements AgentAdapter {
     const requestMessages = markerFallback
       ? [{ role: 'system' as const, content: buildMarkerToolPrompt(tools, { compact: true }) }, ...messages]
       : messages;
+    const openAiProtocol = this.opts.chatProtocol === 'openai';
+    const toolNames = openAiProtocol ? buildOpenAiToolNameMaps(tools) : null;
+    const wireMessages = openAiProtocol ? requestMessages.map((message) => toOpenAiMessage(message, toolNames!.originalToWire)) : requestMessages;
+    const wireTools = this.opts.supportsTools === true
+      ? openAiProtocol ? tools.map((tool) => toOpenAiTool(tool, toolNames!.originalToWire.get(tool.name) ?? tool.name)) : tools
+      : [];
     try {
       const response = await this.#breaker.exec(() => fetch(safe, {
         method: 'POST',
@@ -212,8 +220,8 @@ export class HttpAdapter implements AgentAdapter {
           model: options?.preferredModel ?? this.opts.model,
           sessionKey: options?.sessionKey,
           timeoutMs: options?.timeoutMs,
-          messages: requestMessages,
-          tools: this.opts.supportsTools === true ? tools : [],
+          messages: wireMessages,
+          tools: wireTools,
           supportsTools: this.opts.supportsTools === true,
         }),
         signal: controller.signal,
@@ -231,7 +239,7 @@ export class HttpAdapter implements AgentAdapter {
         return;
       }
       if (!markerFallback) {
-        yield* parseHttpChatResponse(response);
+        yield* parseHttpChatResponse(response, toolNames?.wireToOriginal);
       } else {
         let text = '';
         let terminal: Extract<ChatDelta, { type: 'done' }> | undefined;
@@ -240,7 +248,7 @@ export class HttpAdapter implements AgentAdapter {
           else if (delta.type === 'done') terminal = delta;
           else yield delta;
         }
-        const { cleaned, calls } = extractMarkerToolCalls(text);
+        const { cleaned, calls } = extractMarkerToolCalls(text, tools);
         if (cleaned.trim()) yield { type: 'text', delta: cleaned.trim() };
         for (const call of calls) {
           yield { type: 'tool_call', id: randomUUID(), name: call.name, args: call.args };
@@ -315,6 +323,62 @@ export class HttpAdapter implements AgentAdapter {
   }
 }
 
+function toOpenAiTool(tool: ToolDefinition, wireName: string): Record<string, unknown> {
+  return {
+    type: 'function',
+    function: {
+      name: wireName,
+      description: tool.description,
+      parameters: tool.parameters,
+    },
+  };
+}
+
+function toOpenAiMessage(message: ChatMessage, originalToWire: Map<string, string>): Record<string, unknown> {
+  if (message.role === 'assistant' && message.toolCalls?.length) {
+    return {
+      role: 'assistant',
+      content: message.content || null,
+      tool_calls: message.toolCalls.map((call) => ({
+        id: call.id,
+        type: 'function',
+        function: {
+          name: originalToWire.get(call.name) ?? call.name,
+          arguments: typeof call.arguments === 'string' ? call.arguments : JSON.stringify(call.arguments ?? {}),
+        },
+      })),
+    };
+  }
+  if (message.role === 'tool') {
+    return {
+      role: 'tool',
+      content: message.content,
+      ...(message.toolCallId ? { tool_call_id: message.toolCallId } : {}),
+    };
+  }
+  return { role: message.role, content: message.content };
+}
+
+function buildOpenAiToolNameMaps(tools: ToolDefinition[]): {
+  originalToWire: Map<string, string>;
+  wireToOriginal: Map<string, string>;
+} {
+  const originalToWire = new Map<string, string>();
+  const wireToOriginal = new Map<string, string>();
+  for (const [index, tool] of tools.entries()) {
+    const base = tool.name.replace(/[^A-Za-z0-9_-]/g, '__').slice(0, 58) || `tool_${index + 1}`;
+    let wire = base;
+    let suffix = 2;
+    while (wireToOriginal.has(wire) && wireToOriginal.get(wire) !== tool.name) {
+      wire = `${base.slice(0, 55)}_${suffix}`;
+      suffix += 1;
+    }
+    originalToWire.set(tool.name, wire);
+    wireToOriginal.set(wire, tool.name);
+  }
+  return { originalToWire, wireToOriginal };
+}
+
 function appendQuery(url: URL, key: string, value: string): string {
   const next = new URL(url.toString());
   next.searchParams.set(key, value);
@@ -343,17 +407,17 @@ function verifySignature(rawBody: string, header: string, secret: string): boole
   }
 }
 
-async function* parseHttpChatResponse(response: Response): AsyncIterable<ChatDelta> {
+async function* parseHttpChatResponse(response: Response, toolNameMap?: Map<string, string>): AsyncIterable<ChatDelta> {
   const contentType = response.headers.get('content-type') ?? '';
   if (contentType.includes('text/event-stream')) {
-    yield* parseHttpChatStream(response);
+    yield* parseHttpChatStream(response, toolNameMap);
     return;
   }
   const json = await response.json().catch(() => null) as unknown;
-  yield* normalizeHttpChatJson(json);
+  yield* normalizeHttpChatJson(json, toolNameMap);
 }
 
-async function* parseHttpChatStream(response: Response): AsyncIterable<ChatDelta> {
+async function* parseHttpChatStream(response: Response, toolNameMap?: Map<string, string>): AsyncIterable<ChatDelta> {
   const reader = response.body?.getReader();
   if (!reader) {
     yield { type: 'done', finishReason: 'error' };
@@ -369,21 +433,21 @@ async function* parseHttpChatStream(response: Response): AsyncIterable<ChatDelta
     while ((sepIdx = buffer.search(/\r?\n\r?\n/)) !== -1) {
       const block = buffer.slice(0, sepIdx);
       buffer = buffer.slice(sepIdx + (buffer[sepIdx] === '\r' ? 4 : 2));
-      for (const delta of parseHttpStreamBlock(block)) {
+      for (const delta of parseHttpStreamBlock(block, toolNameMap)) {
         if (delta.type === 'done') sawDone = true;
         yield delta;
       }
     }
     if (read.done) break;
   }
-  for (const delta of parseHttpStreamBlock(buffer)) {
+  for (const delta of parseHttpStreamBlock(buffer, toolNameMap)) {
     if (delta.type === 'done') sawDone = true;
     yield delta;
   }
   if (!sawDone) yield { type: 'done', finishReason: 'stop' };
 }
 
-function* parseHttpStreamBlock(block: string): Iterable<ChatDelta> {
+function* parseHttpStreamBlock(block: string, toolNameMap?: Map<string, string>): Iterable<ChatDelta> {
   const trimmed = block.trim();
   if (!trimmed) return;
   const dataLines = trimmed
@@ -398,14 +462,14 @@ function* parseHttpStreamBlock(block: string): Iterable<ChatDelta> {
       continue;
     }
     try {
-      yield* normalizeHttpChatJson(JSON.parse(payload) as unknown);
+      yield* normalizeHttpChatJson(JSON.parse(payload) as unknown, toolNameMap);
     } catch {
       yield { type: 'text', delta: payload };
     }
   }
 }
 
-export function* normalizeHttpChatJson(value: unknown): Iterable<ChatDelta> {
+export function* normalizeHttpChatJson(value: unknown, toolNameMap?: Map<string, string>): Iterable<ChatDelta> {
   const object = objectOf(value);
   if (!object) {
     yield { type: 'tool_result', id: 'adapter', name: 'adapter.chat', result: null, error: 'HTTP chat returned a non-object JSON payload.' };
@@ -441,7 +505,7 @@ export function* normalizeHttpChatJson(value: unknown): Iterable<ChatDelta> {
   if (text) yield { type: 'text', delta: text };
 
   const rawToolCalls = object.toolCalls ?? object.tool_calls ?? object.tools;
-  const toolCalls = extractToolCalls(rawToolCalls);
+  const toolCalls = extractToolCalls(rawToolCalls, toolNameMap);
   for (const call of toolCalls) {
     yield { type: 'tool_call', id: call.id, name: call.name, args: call.args };
   }
@@ -453,7 +517,7 @@ export function* normalizeHttpChatJson(value: unknown): Iterable<ChatDelta> {
     const message = objectOf(choiceObject.message);
     const choiceText = firstString(delta?.content, delta?.text, message?.content, choiceObject.text);
     if (choiceText) yield { type: 'text', delta: choiceText };
-    for (const call of extractToolCalls(delta?.tool_calls ?? message?.tool_calls ?? choiceObject.tool_calls)) {
+    for (const call of extractToolCalls(delta?.tool_calls ?? message?.tool_calls ?? choiceObject.tool_calls, toolNameMap)) {
       yield { type: 'tool_call', id: call.id, name: call.name, args: call.args };
       toolCalls.push(call);
     }
@@ -515,7 +579,7 @@ function httpErrorMessage(value: unknown): string | null {
   return firstString(object.message, object.error, object.detail, object.reason) ?? safeStringify(object);
 }
 
-function extractToolCalls(value: unknown): Array<{ id: string; name: string; args: unknown }> {
+function extractToolCalls(value: unknown, toolNameMap?: Map<string, string>): Array<{ id: string; name: string; args: unknown }> {
   if (!Array.isArray(value)) return [];
   return value.map((item) => {
     const object = objectOf(item);
@@ -531,7 +595,10 @@ function extractToolCalls(value: unknown): Array<{ id: string; name: string; arg
     }
     return {
       id: firstString(object?.id) ?? `tc_${Math.random().toString(36).slice(2)}`,
-      name: firstString(fn?.name, object?.name, object?.tool, object?.toolName) ?? 'tool',
+      name: (() => {
+        const wireName = firstString(fn?.name, object?.name, object?.tool, object?.toolName) ?? 'tool';
+        return toolNameMap?.get(wireName) ?? wireName;
+      })(),
       args: parsedArgs,
     };
   });

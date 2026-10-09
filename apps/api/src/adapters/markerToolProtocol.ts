@@ -49,11 +49,12 @@ const MARKER_KEYWORD = 'AGENTIS_TOOL_CALL';
  * that don't parse are left in the cleaned text verbatim so nothing is silently
  * swallowed.
  */
-export function extractMarkerToolCalls(input: string): MarkerExtractionResult {
+export function extractMarkerToolCalls(input: string, tools: ToolDefinition[] = []): MarkerExtractionResult {
   const calls: MarkerToolCall[] = [];
   const seen = new Set<string>();
   const record = (payload: MarkerToolCall | null): boolean => {
     if (!payload) return false;
+    payload = normalizeToolAlias(payload);
     const key = `${payload.name}:${stableJson(payload.args)}`;
     if (!seen.has(key)) {
       seen.add(key);
@@ -62,11 +63,49 @@ export function extractMarkerToolCalls(input: string): MarkerExtractionResult {
     return true;
   };
 
-  // 1) XML-style fenced form: <agentis_tool_call>{...}</agentis_tool_call>
-  const withoutXml = input.replace(
-    /<agentis_tool_call>\s*([\s\S]*?)\s*<\/agentis_tool_call>/gi,
+  // 0) Hermes native transcript form. Some Hermes models do not follow the
+  // Agentis marker instruction verbatim and instead emit their native special
+  // tokens plus one `tool.name {arguments}` line per call:
+  //
+  //   <tool_call>
+  //   </｜tool▁calls_begin｜>
+  //   agentis.channel.send {"to":"...","body":"..."}
+  //   <｜tool▁calls_end｜>
+  //   </｜tool_calls｜>
+  //
+  // This is still an executable tool boundary, never answer prose. Normalize it
+  // before the XML pass so the unmatched outer `<tool_call>` cannot leak into
+  // the operator transcript or falsely complete an action task.
+  let withoutHermes = extractHermesNativeBlocks(input, record);
+
+  // 0b) Hermes nested XML form. Some model/provider combinations emit one
+  // named XML element per tool with an <args> child and omit the closing outer
+  // <tool_call> wrapper entirely:
+  //
+  //   <tool_call>
+  //   <agentis.channel.send><args><to>...</to></args></agentis.channel.send>
+  //
+  // This is executable protocol, not operator prose. Parse the named calls
+  // independently so an unmatched wrapper can never leak into WhatsApp/chat.
+  withoutHermes = extractHermesNestedXmlCalls(withoutHermes, record);
+
+  // 1) XML-style fenced form. Hermes historically emitted <tool_call>, so
+  // normalize both spellings at the adapter boundary.
+  let withoutXml = withoutHermes.replace(
+    /<(?:agentis_)?tool_call>\s*([\s\S]*?)\s*<\/(?:agentis_)?tool_call>/gi,
     (whole, body: string) => (record(parseMarkerPayload(body)) ? '' : whole),
   );
+
+  // 1b) Legacy CLI transcript form: REQUESTED TOOLS: [{name, arguments}].
+  withoutXml = withoutXml.replace(/REQUESTED TOOLS:\s*(\[[\s\S]*?\])(?=\n[A-Z][A-Z ]+:|$)/gi, (whole, body: string) => {
+    try {
+      const payloads = JSON.parse(body) as unknown;
+      if (!Array.isArray(payloads)) return whole;
+      let parsedAny = false;
+      for (const payload of payloads) parsedAny = record(parseMarkerPayload(JSON.stringify(payload))) || parsedAny;
+      return parsedAny ? '' : whole;
+    } catch { return whole; }
+  });
 
   // 2) Keyword form with brace-balanced JSON extraction.
   let cleaned = '';
@@ -105,7 +144,186 @@ export function extractMarkerToolCalls(input: string): MarkerExtractionResult {
     cursor = end;
   }
 
-  return { calls, cleaned: cleaned.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim() };
+  cleaned = cleaned.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+
+  // Some fallback models emit a plain function envelope with no marker at all:
+  //   {"name":"image.generate","arguments":{...}}
+  // When the entire assistant response is that envelope it is executable
+  // protocol, never human-facing prose. Normalize it here so the caller loop can
+  // execute it (or return a schema error for bounded repair) instead of sending
+  // raw JSON to WhatsApp/Telegram.
+  if (looksLikeBareToolEnvelope(cleaned) && record(parseMarkerPayload(cleaned))) cleaned = '';
+
+  // Some fallback runtimes emit only the argument object after the surrounding
+  // prompt has already established one tool. Bind it only when the offered JSON
+  // schemas identify exactly one compatible tool; ambiguity remains visible for
+  // one model repair round instead of guessing a side effect.
+  if (calls.length === 0 && looksLikeBareArguments(cleaned)) {
+    const bound = bindBareArguments(cleaned, tools);
+    if (bound && record(bound)) cleaned = '';
+  }
+
+  return { calls, cleaned };
+}
+
+function looksLikeBareArguments(value: string): boolean {
+  return /^\s*\{[\s\S]*\}\s*$/.test(value) && !looksLikeBareToolEnvelope(value);
+}
+
+function bindBareArguments(value: string, tools: ToolDefinition[]): MarkerToolCall | null {
+  let args: Record<string, unknown>;
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    args = parsed as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+  const keys = Object.keys(args);
+  if (keys.length === 0) return null;
+  const matches = tools.filter((tool) => {
+    const schema = tool.parameters;
+    const properties = schema?.properties ?? {};
+    const required = schema?.required ?? [];
+    return required.every((key) => Object.hasOwn(args, key))
+      && keys.every((key) => Object.hasOwn(properties, key));
+  });
+  if (matches.length !== 1) return null;
+  return { name: matches[0]!.name, args };
+}
+
+function looksLikeBareToolEnvelope(value: string): boolean {
+  return /^\s*\{[\s\S]*\}\s*$/.test(value)
+    && /"(?:name|toolName|tool)"\s*:/.test(value)
+    && /"(?:arguments|args|input)"\s*:/.test(value);
+}
+
+function normalizeToolAlias(payload: MarkerToolCall): MarkerToolCall {
+  const aliases: Record<string, string> = {
+    'image.generate': 'agentis.media.generate',
+    'media.generate': 'agentis.media.generate',
+    'assets.list': 'agentis.assets.list',
+    'assets.search': 'agentis.assets.search',
+    'assets.read': 'agentis.assets.read',
+    'channel.send': 'agentis.channel.send',
+  };
+  const name = aliases[payload.name] ?? payload.name;
+  if (payload.name === 'image.generate' && payload.args && typeof payload.args === 'object' && !Array.isArray(payload.args)) {
+    return { name, args: { modality: 'image', ...(payload.args as Record<string, unknown>) } };
+  }
+  return { name, args: payload.args };
+}
+
+function extractHermesNestedXmlCalls(
+  input: string,
+  record: (payload: MarkerToolCall | null) => boolean,
+): string {
+  let parsedAny = false;
+  const withoutCalls = input.replace(
+    /<((?:agentis\.)[A-Za-z][\w.-]*)>\s*<args>([\s\S]*?)<\/args>\s*<\/\1>/gi,
+    (whole, name: string, argsBody: string) => {
+      const args = parseFlatXmlArgs(argsBody);
+      if (!args || !record({ name, args })) return whole;
+      parsedAny = true;
+      return '';
+    },
+  );
+  if (!parsedAny) return input;
+  return withoutCalls.replace(/<tool_call>\s*/gi, '').replace(/\s*<\/tool_call>/gi, '');
+}
+
+function parseFlatXmlArgs(input: string): Record<string, unknown> | null {
+  const args: Record<string, unknown> = {};
+  const field = /<([A-Za-z][\w.-]*)>([\s\S]*?)<\/\1>/g;
+  let cursor = 0;
+  let found = false;
+  for (let match = field.exec(input); match; match = field.exec(input)) {
+    if (input.slice(cursor, match.index).trim()) return null;
+    const raw = decodeXmlEntities(match[2]!.trim());
+    args[match[1]!] = xmlScalar(raw);
+    cursor = field.lastIndex;
+    found = true;
+  }
+  if (!found || input.slice(cursor).trim()) return null;
+  return args;
+}
+
+function xmlScalar(value: string): unknown {
+  if (/^(?:true|false)$/i.test(value)) return value.toLowerCase() === 'true';
+  if (/^-?(?:\d+\.?\d*|\.\d+)$/.test(value)) return Number(value);
+  return value;
+}
+
+function decodeXmlEntities(value: string): string {
+  return value.replace(/&(amp|lt|gt|quot|apos);/g, (_whole, entity: string) => ({
+    amp: '&', lt: '<', gt: '>', quot: '"', apos: "'",
+  })[entity] ?? _whole);
+}
+
+/** Remove Hermes special-token blocks and record their line-oriented calls. */
+function extractHermesNativeBlocks(
+  input: string,
+  record: (payload: MarkerToolCall | null) => boolean,
+): string {
+  const begin = /<\/?[|｜]tool(?:▁|_|\s)+calls(?:▁|_|\s)+begin[|｜]>/gi;
+  const end = /<\/?[|｜]tool(?:▁|_|\s)+calls(?:▁|_|\s)+end[|｜]>/gi;
+  let output = '';
+  let cursor = 0;
+  while (cursor < input.length) {
+    begin.lastIndex = cursor;
+    const start = begin.exec(input);
+    if (!start) {
+      output += input.slice(cursor);
+      break;
+    }
+    end.lastIndex = begin.lastIndex;
+    const finish = end.exec(input);
+    if (!finish) {
+      output += input.slice(cursor);
+      break;
+    }
+    let prefix = input.slice(cursor, start.index);
+    // Hermes often leaves an unmatched wrapper immediately before the native
+    // begin token. It is protocol syntax too, so remove it with the block.
+    prefix = prefix.replace(/<(?:agentis_)?tool_call>\s*$/i, '');
+    output += prefix;
+    const body = input.slice(begin.lastIndex, finish.index);
+    let parsedAny = false;
+    for (const call of parseHermesNamedCalls(body)) {
+      parsedAny = record(call) || parsedAny;
+    }
+    if (!parsedAny) {
+      // Preserve an unrecognized block for diagnosis; the completion gate will
+      // reject it as unconsumed protocol instead of silently swallowing it.
+      output += input.slice(start.index, end.lastIndex);
+    }
+    cursor = end.lastIndex;
+    // Consume Hermes' optional closing wrapper after the special-token block.
+    const closing = input.slice(cursor).match(/^\s*<\/?[|｜]tool(?:▁|_|\s)*calls[|｜]>\s*/i);
+    if (closing) cursor += closing[0].length;
+  }
+  return output;
+}
+
+/** Parse `agentis.tool.name { ... }` calls with brace balancing. */
+function parseHermesNamedCalls(body: string): MarkerToolCall[] {
+  const calls: MarkerToolCall[] = [];
+  const namePattern = /(?:^|\n)\s*([A-Za-z][\w.-]*)\s*(?=\{)/g;
+  for (let match = namePattern.exec(body); match; match = namePattern.exec(body)) {
+    const name = match[1]!;
+    const brace = body.indexOf('{', match.index + match[0].length - 1);
+    if (brace < 0) continue;
+    const end = matchBalancedBrace(body, brace);
+    if (end < 0) continue;
+    try {
+      calls.push({ name, args: JSON.parse(body.slice(brace, end)) as unknown });
+      namePattern.lastIndex = end;
+    } catch {
+      // Leave malformed native protocol in the cleaned text by returning no
+      // parsed calls for it; the caller retains the original block.
+    }
+  }
+  return calls;
 }
 
 /**

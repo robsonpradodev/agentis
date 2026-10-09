@@ -12,7 +12,7 @@
  */
 
 import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { spawn } from 'node:child_process';
 
 export interface AutostartWrite {
@@ -27,6 +27,8 @@ export interface AutostartTarget {
   reason?: string;
   /** The file whose existence means "autostart is enabled". */
   markerPath: string;
+  /** Absolute data directory used by the unattended process. */
+  dataDir: string;
   /** All files written on enable (marker plus any helper scripts), in write order. */
   writes: AutostartWrite[];
 }
@@ -72,13 +74,14 @@ function buildWindowsTarget(opts: BuildAutostartTargetOptions): Omit<AutostartTa
   const runCmd = [
     '@echo off',
     `set "AGENTIS_DATA_DIR=${opts.dataDir}"`,
-    `${q(opts.execPath)} ${q(opts.scriptPath)} up >> ${q(logPath(opts.dataDir))} 2>&1`,
+    `${q(opts.execPath)} ${q(opts.scriptPath)} up --background >> ${q(logPath(opts.dataDir))} 2>&1`,
     '',
   ].join('\r\n');
 
   return {
     platform: 'win32',
     markerPath,
+    dataDir: opts.dataDir,
     writes: [{ path: markerPath, contents: runCmd }],
   };
 }
@@ -98,6 +101,7 @@ function buildMacTarget(opts: BuildAutostartTargetOptions): Omit<AutostartTarget
     <string>${opts.execPath}</string>
     <string>${opts.scriptPath}</string>
     <string>up</string>
+    <string>--background</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
@@ -117,6 +121,7 @@ function buildMacTarget(opts: BuildAutostartTargetOptions): Omit<AutostartTarget
   return {
     platform: 'darwin',
     markerPath,
+    dataDir: opts.dataDir,
     writes: [{ path: markerPath, contents: plist }],
   };
 }
@@ -129,7 +134,7 @@ function buildLinuxTarget(opts: BuildAutostartTargetOptions): Omit<AutostartTarg
     'Type=Application',
     'Name=Agentis',
     'Comment=Start Agentis on login',
-    `Exec=${q(opts.execPath)} ${q(opts.scriptPath)} up`,
+    `Exec=env ${q(`AGENTIS_DATA_DIR=${opts.dataDir}`)} ${q(opts.execPath)} ${q(opts.scriptPath)} up --background`,
     'X-GNOME-Autostart-enabled=true',
     '',
   ].join('\n');
@@ -137,6 +142,7 @@ function buildLinuxTarget(opts: BuildAutostartTargetOptions): Omit<AutostartTarg
   return {
     platform: 'linux',
     markerPath,
+    dataDir: opts.dataDir,
     writes: [{ path: markerPath, contents: desktopEntry }],
   };
 }
@@ -149,6 +155,7 @@ export function buildAutostartTarget(opts: BuildAutostartTargetOptions): Autosta
       supported: false,
       reason: 'Only available when running the installed Agentis CLI, not from source.',
       markerPath: '',
+      dataDir: resolve(opts.dataDir),
       writes: [],
     };
   }
@@ -158,14 +165,45 @@ export function buildAutostartTarget(opts: BuildAutostartTargetOptions): Autosta
       supported: false,
       reason: `Autostart is not supported on ${opts.platform}.`,
       markerPath: '',
+      dataDir: resolve(opts.dataDir),
       writes: [],
     };
   }
 
+  if (opts.platform === 'win32' && !opts.appDataDir) {
+    return {
+      platform: opts.platform,
+      supported: false,
+      reason: 'Windows APPDATA is unavailable, so the Startup folder cannot be located.',
+      markerPath: '',
+      dataDir: resolve(opts.dataDir),
+      writes: [],
+    };
+  }
+
+  if (!opts.scriptPath) {
+    return {
+      platform: opts.platform,
+      supported: false,
+      reason: 'The installed Agentis CLI entry point could not be located.',
+      markerPath: '',
+      dataDir: resolve(opts.dataDir),
+      writes: [],
+    };
+  }
+
+  // Login items never inherit the terminal's working directory. Persist only
+  // absolute paths so a default `.agentis` store still resolves to the same
+  // database after a reboot/login.
+  const normalized = {
+    ...opts,
+    dataDir: resolve(opts.dataDir),
+  };
+
   const base =
-    opts.platform === 'win32' ? buildWindowsTarget(opts) :
-    opts.platform === 'darwin' ? buildMacTarget(opts) :
-    buildLinuxTarget(opts);
+    opts.platform === 'win32' ? buildWindowsTarget(normalized) :
+    opts.platform === 'darwin' ? buildMacTarget(normalized) :
+    buildLinuxTarget(normalized);
 
   return { ...base, supported: true };
 }
@@ -195,6 +233,9 @@ function tryLaunchctl(args: string[]): void {
 
 export async function enableAutostart(target: AutostartTarget): Promise<void> {
   if (!target.supported) throw new Error(target.reason ?? 'Autostart is not supported on this host.');
+  // Redirection opens the log before Node starts; ensure its parent exists even
+  // when autostart is enabled before the first successful boot.
+  mkdirSync(target.dataDir, { recursive: true });
   // Remove registrations made by earlier releases before writing the direct
   // command entry. Otherwise Windows keeps executing the stale VBS file too.
   if (target.platform === 'win32') rmSync(join(dirname(target.markerPath), 'Agentis.vbs'), { force: true });

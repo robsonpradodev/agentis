@@ -335,7 +335,6 @@ export function AgentCreateWizard({
     if (role === 'orchestrator') {
       setReportsTo('');
       setSpaceId('');
-      if (!name.trim()) setName('The Brain');
       return;
     }
 
@@ -348,7 +347,7 @@ export function AgentCreateWizard({
       const workerSupervisor = managers[0] ?? orchestrator;
       if (workerSupervisor) setReportsTo(workerSupervisor.id);
     }
-  }, [managers, name, orchestrator, reportsTo, role]);
+  }, [managers, orchestrator, reportsTo, role]);
 
   useEffect(() => {
     if (!open || role !== 'worker' || spaceId) return;
@@ -1026,6 +1025,5 @@ function InboxChannelCard({
 const inputCls = 'mt-1 h-10 w-full rounded-input border border-line bg-surface-2 px-3 text-sm text-text-primary outline-none placeholder:text-text-muted focus:border-accent';
 const secondaryBtnCls = 'inline-flex h-9 items-center gap-1.5 rounded-btn border border-line px-3 text-xs font-medium text-text-secondary hover:bg-surface-3 hover:text-text-primary';
 const primaryBtnCls = 'inline-flex h-9 items-center gap-1.5 rounded-btn bg-accent px-3 text-xs font-semibold text-canvas hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-40';
-
 
 

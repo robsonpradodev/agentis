@@ -16,6 +16,10 @@
   type AppInstallPreview,
   type AppManifest,
   type AppManifestEnvelope,
+  type AppOperation,
+  type AgentMission,
+  type AuthorityContext,
+  type EffectPlan,
   type AppPolicy,
   type CapabilityDecl,
   type CollectionMigration,
@@ -37,6 +41,10 @@ export type {
   AppInstallPreview,
   AppManifest,
   AppManifestEnvelope,
+  AppOperation,
+  AgentMission,
+  AuthorityContext,
+  EffectPlan,
   AppPolicy,
   CapabilityDecl,
   CollectionMigration,
@@ -81,12 +89,22 @@ export interface DefineAppInput {
   dependencies?: AppManifest['dependencies'];
   migrations?: CollectionMigration[];
   source?: AppManifest['source'];
+  contract?: AppManifest['contract'];
+  frontend?: AppManifest['frontend'];
+  components?: AppManifest['components'];
+  storage?: AppManifest['storage'];
+  orchestration?: AppManifest['orchestration'];
+  brainPolicy?: AppManifest['brainPolicy'];
+  permissionsV3?: AppManifest['permissionsV3'];
+  quality?: AppManifest['quality'];
+  artifacts?: AppManifest['artifacts'];
+  projections?: AppManifest['projections'];
 }
 
 export function defineApp(input: DefineAppInput): AppManifest {
   const slug = input.slug ?? slugify(input.name);
   return appManifestSchema.parse({
-    manifestVersion: 1,
+    manifestVersion: hasV3Facets(input) ? 3 : 1,
     agentisVersion: input.agentisVersion ?? '1.0.0',
     identity: appIdentitySchema.parse({
       manifestVersion: 1,
@@ -108,6 +126,16 @@ export function defineApp(input: DefineAppInput): AppManifest {
     dependencies: input.dependencies ?? [],
     migrations: input.migrations ?? [],
     source: input.source ?? null,
+    ...(input.contract ? { contract: input.contract } : {}),
+    ...(input.frontend ? { frontend: input.frontend } : {}),
+    ...(input.components ? { components: input.components } : {}),
+    ...(input.storage ? { storage: input.storage } : {}),
+    ...(input.orchestration ? { orchestration: input.orchestration } : {}),
+    ...(input.brainPolicy ? { brainPolicy: input.brainPolicy } : {}),
+    ...(input.permissionsV3 ? { permissionsV3: input.permissionsV3 } : {}),
+    ...(input.quality ? { quality: input.quality } : {}),
+    ...(input.artifacts ? { artifacts: input.artifacts } : {}),
+    ...(input.projections ? { projections: input.projections } : {}),
   });
 }
 
@@ -213,7 +241,7 @@ export function buildAgentisApp(manifestOrInput: AppManifest | DefineAppInput): 
   const manifest = isAppManifest(manifestOrInput) ? appManifestSchema.parse(manifestOrInput) : defineApp(manifestOrInput);
   return appManifestEnvelopeSchema.parse({
     format: '.agentisapp',
-    formatVersion: 1,
+    formatVersion: manifest.manifestVersion,
     manifest,
     checksum: sha256(canonicalizeManifest(manifest)),
     exportedAt: new Date().toISOString(),
@@ -320,11 +348,37 @@ export function createAgentisClient(options: AgentisClientOptions = {}) {
       method: 'POST',
       body: JSON.stringify({ envelope: app, actions: test.actions ?? [], assertions: test.assertions ?? [] }),
     }),
+    getAppDefinition: (appId: string) => request<{ definition: unknown | null }>(`/v1/apps/${encodeURIComponent(appId)}/definition`),
+    updateAppDefinition: (appId: string, definition: Partial<AppManifest>) => request<{ definition: unknown }>(`/v1/apps/${encodeURIComponent(appId)}/definition`, {
+      method: 'PUT', body: JSON.stringify(definition),
+    }),
+    listAppOperations: (appId: string) => request<{ operations: AppOperation[] }>(`/v1/apps/${encodeURIComponent(appId)}/operations`),
+    invokeAppOperation: (appId: string, operationId: string, input: Record<string, unknown>, invokeOptions: {
+      authorityContext?: AuthorityContext; idempotencyKey?: string;
+    } = {}) => request<unknown>(`/v1/apps/${encodeURIComponent(appId)}/operations/${encodeURIComponent(operationId)}/invoke`, {
+      method: 'POST', body: JSON.stringify({ input, ...invokeOptions }),
+    }),
+    listAppTasks: (appId: string) => request<{ tasks: AgentMission[] }>(`/v1/apps/${encodeURIComponent(appId)}/tasks`),
+    getTask: (taskId: string) => request<{ mission: AgentMission }>(`/v1/missions/${encodeURIComponent(taskId)}`),
+    cancelTask: (taskId: string, reason?: string) => request<{ mission: AgentMission }>(`/v1/missions/${encodeURIComponent(taskId)}/cancel`, {
+      method: 'POST', body: JSON.stringify({ reason }),
+    }),
+    respondToTaskInput: (taskId: string, requestId: string, response: unknown) => request<{ mission: AgentMission }>(`/v1/missions/${encodeURIComponent(taskId)}/input-requests/${encodeURIComponent(requestId)}/respond`, {
+      method: 'POST', body: JSON.stringify({ response }),
+    }),
+    authorizeEffect: (effectPlanId: string, authorityContext: AuthorityContext) => request<{ plan: EffectPlan; grant: unknown; invocation: unknown }>(`/v1/effects/${encodeURIComponent(effectPlanId)}/authorize`, {
+      method: 'POST', body: JSON.stringify({ authorityContext }),
+    }),
   };
 }
 
 function isAppManifest(value: AppManifest | DefineAppInput): value is AppManifest {
   return typeof value === 'object' && value !== null && 'identity' in value && 'policy' in value;
+}
+
+function hasV3Facets(value: DefineAppInput): boolean {
+  return Boolean(value.contract || value.frontend || value.components || value.storage || value.orchestration
+    || value.brainPolicy || value.permissionsV3 || value.quality || value.artifacts || value.projections);
 }
 
 function slugify(input: string): string {

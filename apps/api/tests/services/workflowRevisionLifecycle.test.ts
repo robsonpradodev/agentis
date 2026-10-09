@@ -375,7 +375,7 @@ describe('immutable workflow revision lifecycle', () => {
     ['BLOCKED_APPROVAL_REQUIRED: wait for operator', 'human_policy', false],
     ['credential API key missing', 'configuration_capability', false],
     ['agent_task node select_draft: pinned agent e34b5a36-85fc-4384-b8b9-a71392a198c6 has no connected runtime', 'configuration_capability', false],
-    ['Bia Outreacher seleciona um novo lead: agent "Bia Outreacher" is offline. Reconnect its runtime or choose an online agent before running.', 'configuration_capability', false],
+    ['Ava Outreacher seleciona um novo lead: agent "Ava Outreacher" is offline. Reconnect its runtime or choose an online agent before running.', 'configuration_capability', false],
     ['provider returned 429 rate limit', 'transient_resource', false],
     ['Hermes produced no observable output for 3m 0s and appears stuck; the runtime was stopped', 'transient_resource', false],
     ['CONTRACT_OUTPUT_INVALID: missing result', 'data_contract', true],

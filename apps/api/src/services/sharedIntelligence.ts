@@ -1736,7 +1736,7 @@ export class SharedIntelligenceService {
     // rescued by lexical overlap instead of being silently invisible — recall must
     // never drop a stored fact just because its vector is missing. For embedded
     // atoms we take max(semantic, lexical) so a strong literal match ("what's my
-    // name" ↔ "My name is Robson Prado") is never buried below the relevance floor.
+    // name" ↔ "My name is Jordan Lee") is never buried below the relevance floor.
     const staleIds: string[] = [];
     const scored = atoms
       .map((atom) => {

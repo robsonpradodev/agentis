@@ -17,7 +17,7 @@ Families (representative, not exhaustive):
 - **Run & observe** — `run.{await,status,diagnose,cancel,replay,inspect}`, `workflow.{status,list}`, `run.query`, `trace.inspect`, `ephemeral.run`.
 - **Data & apps** — `app.{create,list,archive,delete,adopt_workflow,scaffold,plan}`, `data.{define_collection,insert,update,upsert,delete,query,promote_memory}`.
 - **UI** — `ui.{render,patch,compose,perform_region,action_schema,lint}`.
-- **Memory & knowledge** — `brain.search`, `memory.{write,read,delete}`, `knowledge.{write,search,archive}`, `skill.{load,promote_example}`.
+- **Memory & knowledge** — `brain.search`, `memory.{write,read,delete}`, `knowledge.{write,search,archive}`, `skill.{load,promote_example}`, `agent.brain.{configure,inspect,prune}`.
 - **Media & assets** — `media.generate`, `assets.{list,search,read,save}`, `browser.{screenshot,navigate,extract_text}`.
 - **Channels & conversations** — `channel.{list,send}`, `connection.{request,grant,grants}`, `conversation.{define,enroll,flag_needs_attention}`.
 - **Agents & specialists** — `agents.{list,create}`, `agent.{spawn,dispatch}`, `specialist.{create,request}`, `routing.preview`.
@@ -38,6 +38,38 @@ Tool activity is normalized before it reaches Chat, the canvas, or observability
 `agentis.tools.call` event is rendered as the underlying requested operation, with only a safe
 argument summary. Credentials and hidden reasoning are redacted. This keeps the operator-facing
 trace useful without exposing gateway plumbing or treating model narration as evidence.
+
+## Agent execution controller
+
+`services/agentExecutionController.ts` is the shared intelligence boundary for chat, channels,
+Missions, standing goals, and action-oriented workflow Agent Tasks. It asks the configured Agent
+model for an `AgentDecision`: `reply`, `clarify`, `act`, `wait`, or `complete`. An `act` decision
+contains a dependency-aware plan whose separately verifiable outcomes receive stable requirement
+ids. This supports ordered sends, parallel work, observations before action, conditional work, and
+mixed send/update/schedule requests without command-specific branches.
+
+The controller does not accept “I’ll do it” as completion. If commitments remain, the same execution
+receives its missing requirements and tool observations and continues. Only an answer-only decision
+or receipt-complete Mission may stop normally. A no-progress model response receives one immediate
+protocol repair; external waits move to event-driven reconciliation instead of model polling.
+
+Protocol parsing is runtime-neutral. Native calls, canonical Agentis markers, Hermes
+`<tool_call>` blocks, and `REQUESTED TOOLS` normalize into the same executor. A bare argument object
+binds automatically only when exactly one offered tool schema matches; otherwise the exact schema
+error returns to the model. Raw JSON/XML/tool syntax is never delivered to a person.
+
+## Private Brain administration
+
+An Agent's private Brain can be corrected without deleting or recreating that Agent. The shared
+administrative path is `agentis.agent.brain.inspect` → `agentis.agent.brain.prune` preview → the
+same prune call with its confirmation token. The caller supplies the exact Memory, runtime Episode,
+Knowledge, Skill, and Example ids to preserve; every other private atom is archived and excluded from future
+recall. Agent identity, runtime, Apps, WhatsApp and other Connections are untouched.
+
+The preview token hashes both the keep selection and the current archive candidates. A concurrent
+Brain change invalidates it before any mutation, forcing a new inspection. Archive is recoverable,
+and skill materialization is refreshed immediately so retired procedures disappear from the
+managed harness directory. Deleting an entire Agent is never a Brain-cleanup mechanism.
 
 ## Code-mode
 
@@ -101,4 +133,4 @@ Runtime inspection and installation are exposed through `GET /v1/extensions/runt
 
 ---
 
-Back to the [Agentis README](../README.md) · start over at [00 · Foundation](./00-foundation.md).
+**Next:** [08 · Durable Agent Missions →](./08-agent-missions.md)

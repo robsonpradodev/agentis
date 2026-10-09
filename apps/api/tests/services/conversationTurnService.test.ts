@@ -250,6 +250,36 @@ describe('ConversationTurnService', () => {
     await expect.poll(() => service.require(ctx.workspace.id, turn.id).status).toBe('blocked');
     expect(service.listActive(ctx.workspace.id, conversation.id)).toEqual(expect.arrayContaining([expect.objectContaining({ id: turn.id, status: 'blocked' })]));
   });
+
+  it('terminates a missing interactive harness error even when its copy says to try again', async () => {
+    const agentId = randomUUID();
+    ctx.db.insert(schema.agents).values({
+      id: agentId, workspaceId: ctx.workspace.id, ambientId: ctx.ambient.id, userId: ctx.user.id,
+      name: 'Unconfigured Agent', adapterType: 'claude_code',
+    }).run();
+    const conversations = new ConversationStore({ db: ctx.db, bus: ctx.bus });
+    const conversation = conversations.getOrCreateByAgent({ workspaceId: ctx.workspace.id, ambientId: ctx.ambient.id, userId: ctx.user.id, agentId });
+    const message = conversations.appendOutbound({ workspaceId: ctx.workspace.id, conversationId: conversation.id, operatorId: ctx.user.id, body: 'Hello' });
+    const service = new ConversationTurnService({
+      db: ctx.db,
+      logger: ctx.logger,
+      execute: async () => {
+        throw new Error('This agent is not connected to an interactive chat harness yet. Configure a V1 harness, then try again.');
+      },
+    });
+    const now = new Date().toISOString();
+    const turn = service.enqueue({
+      workspaceId: ctx.workspace.id, conversationId: conversation.id, agentId, userId: ctx.user.id,
+      messageId: message.id, clientTurnId: randomUUID(), prompt: 'Hello', requestedMode: 'auto',
+      effectiveMode: 'quick', permissionMode: 'auto', attachmentIds: [],
+      contextManifest: { version: 1, generatedAt: now, historyMessages: 0, attachmentCount: 0, attachments: [], sources: [], warnings: [] },
+      executionEnvelope: { version: 1, requestedMode: 'auto', effectiveMode: 'quick', classificationReason: 'test', adapterType: 'claude_code', model: 'test', configuredReasoningEffort: 'high', effectiveReasoningEffort: 'high', fastMode: false, loadedSources: ['agentis'], toolMode: 'none', durable: true, createdAt: now, warnings: [] },
+    });
+
+    await expect.poll(() => service.require(ctx.workspace.id, turn.id).status).toBe('failed');
+    expect(service.require(ctx.workspace.id, turn.id)).toMatchObject({ completedAt: expect.any(String), error: expect.stringContaining('not connected to an interactive chat harness') });
+    expect(service.listActive(ctx.workspace.id, conversation.id)).not.toContainEqual(expect.objectContaining({ id: turn.id }));
+  });
 });
 
 describe('classifyConversationExecutionMode', () => {

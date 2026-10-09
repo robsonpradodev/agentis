@@ -4,6 +4,15 @@ import { ConversationTurnLeaseRegistry, proofReceiptsFromExperience } from '../.
 import { createLogger } from '../../src/logger.js';
 
 describe('ConversationTurnLeaseRegistry', () => {
+  it('can attach server-selected Mission context after the lease is issued', () => {
+    const leases = new ConversationTurnLeaseRegistry();
+    const token = leases.issue('workspace-1', 'conversation-1', { allowedToolIds: ['agentis.echo'] });
+
+    expect(leases.updateContext('workspace-1', 'conversation-1', token, { missionId: 'mission-1' }))
+      .toEqual({ allowedToolIds: ['agentis.echo'], missionId: 'mission-1' });
+    expect(leases.context('workspace-1', 'conversation-1', token)?.missionId).toBe('mission-1');
+  });
+
   it('supersedes prior generations and never lets stale completion revoke the new turn', () => {
     const leases = new ConversationTurnLeaseRegistry();
     const first = leases.issue('ws', 'conv');

@@ -44,6 +44,8 @@ export interface AccessDecision {
   /** A human label for who is being answered (for logs + the addendum). */
   who: string;
   isOwner: boolean;
+  /** Verified staff (delegate authority) — recognized as a team member, but never the owner-only privileges. */
+  isDelegate?: boolean;
 }
 
 export const UNKNOWN_SENDER_DECLINE =

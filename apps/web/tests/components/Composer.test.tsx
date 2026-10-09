@@ -16,6 +16,19 @@ function stubComposerCatalogs() {
 }
 
 describe('Composer', () => {
+  it('updates the visible permission mode as soon as a slash-mode suggestion is selected', async () => {
+    stubComposerCatalogs();
+    const onPermissionModeChange = vi.fn();
+    render(<Composer onSend={vi.fn()} onPermissionModeChange={onPermissionModeChange} draftKey="composer-plan-mode-test" />);
+
+    const textarea = screen.getByRole('textbox');
+    fireEvent.change(textarea, { target: { value: '/pl', selectionStart: 3 } });
+    fireEvent.click(await screen.findByText('/plan'));
+
+    expect(onPermissionModeChange).toHaveBeenCalledWith('plan');
+    expect(textarea).toHaveValue('/plan ');
+  });
+
   it('turns the send button into the active stop control while a turn is running', () => {
     stubComposerCatalogs();
     const onSend = vi.fn();

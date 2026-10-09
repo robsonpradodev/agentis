@@ -17,8 +17,9 @@
  *   done  — terminal; the subject stops being woken
  */
 
+import { randomUUID } from 'node:crypto';
 import type { EntityWakeContext, EntityWakeResult, Correlation } from './durableEntities.js';
-import type { RelationshipState } from '@agentis/core';
+import type { RelationshipDecision, RelationshipState } from '@agentis/core';
 import { normalizeRelationshipState } from './relationshipStateService.js';
 
 export type SubjectStage =
@@ -49,7 +50,18 @@ export interface SubjectActions {
   /** Deterministic, token-free send. Resolves the destination from the subject's facts. */
   send(args: SubjectActionArgs & { stage: string; text: string }): Promise<void> | void;
   /** Hand the step to a model (compose a message, classify a reply, trigger a build). */
-  runAgent(args: SubjectActionArgs & { instruction: string }): Promise<{ outcome: 'performed' | 'held' | 'blocked' } | void> | void;
+  runAgent(args: SubjectActionArgs & { instruction: string }):
+    | Promise<{
+        outcome: 'performed' | 'held' | 'blocked';
+        reason?: string;
+        receiptId?: string;
+      } | void>
+    | {
+        outcome: 'performed' | 'held' | 'blocked';
+        reason?: string;
+        receiptId?: string;
+      }
+    | void;
 }
 
 const MAX_STEPS_PER_WAKE = 50;
@@ -69,22 +81,36 @@ export class SubjectRuntime {
     let stageName = state.stage || state.script.start;
     let unread = [...ctx.inbox];
 
-    const base = { entityId: ctx.entity.id, workspaceId: ctx.entity.workspaceId, appId: ctx.entity.appId };
+    const base = {
+      entityId: ctx.entity.id,
+      workspaceId: ctx.entity.workspaceId,
+      appId: ctx.entity.appId,
+    };
 
     for (let step = 0; step < MAX_STEPS_PER_WAKE; step++) {
       const stage = state.script.stages[stageName];
-      if (!stage) return { state: { ...state, stage: stageName, facts }, consumeInboxIds, done: true };
+      if (!stage)
+        return { state: { ...state, stage: stageName, facts }, consumeInboxIds, done: true };
 
       if (stage.action === 'done') {
         return { state: { ...state, stage: stageName, facts }, consumeInboxIds, done: true };
       }
       if (stage.action === 'send') {
-        await this.actions.send({ ...base, facts, stage: stageName, text: interpolate(stage.text, facts) });
+        await this.actions.send({
+          ...base,
+          facts,
+          stage: stageName,
+          text: interpolate(stage.text, facts),
+        });
         stageName = stage.next;
         continue;
       }
       if (stage.action === 'agent') {
-        await this.actions.runAgent({ ...base, facts, instruction: interpolate(stage.instruction, facts) });
+        await this.actions.runAgent({
+          ...base,
+          facts,
+          instruction: interpolate(stage.instruction, facts),
+        });
         stageName = stage.next;
         continue;
       }
@@ -121,53 +147,136 @@ export class SubjectRuntime {
     // turn the compact state into an immortal transcript.
     const archiveCutoff = Date.parse(now) - 365 * 24 * 60 * 60_000;
     state.facts = state.facts
-      .map((fact) => fact.expiresAt && !fact.archivedAt && Date.parse(fact.expiresAt) <= Date.parse(now)
-        ? { ...fact, archivedAt: now }
-        : fact)
+      .map((fact) =>
+        fact.expiresAt && !fact.archivedAt && Date.parse(fact.expiresAt) <= Date.parse(now)
+          ? { ...fact, archivedAt: now }
+          : fact,
+      )
       .filter((fact) => !fact.archivedAt || Date.parse(fact.archivedAt) > archiveCutoff)
       .slice(-100);
-    const inbound = ctx.inbox.filter((event) => event.eventType === 'channel.inbound' || event.eventType === 'reply');
+    const inbound = ctx.inbox.filter(
+      (event) => event.eventType === 'channel.inbound' || event.eventType === 'reply',
+    );
+    let inboundActionCancelled = false;
     if (inbound.length > 0) {
       state.lastInboundAt = inbound[inbound.length - 1]!.receivedAt;
       // A person replied before a scheduled nudge: that nudge has served its
-      // purpose and must not fire later as an embarrassing duplicate.
-      if (state.nextAction?.kind === 'follow_up' && ['planned', 'ready'].includes(state.nextAction.status)) {
+      // purpose and must not fire later as an embarrassing duplicate. An action
+      // armed with `cancelOnReply: false` survives — some follow-ups (a promised
+      // quote, an answer the agent went to fetch) are owed regardless of whether
+      // the person wrote again in the meantime.
+      if (
+        state.nextAction?.kind === 'follow_up' &&
+        state.nextAction.cancelOnReply !== false &&
+        ['planned', 'ready'].includes(state.nextAction.status)
+      ) {
         state.nextAction = { ...state.nextAction, status: 'cancelled' };
+        inboundActionCancelled = true;
+        appendDecision(state, {
+          id: randomUUID(),
+          evaluatedAt: now,
+          trigger: 'inbound',
+          outcome: 'cancelled',
+          actionId: state.nextAction.sourceRef ?? null,
+          relatedEventIds: inbound.map((event) => event.id).slice(-20),
+          reason: 'A nova mensagem da pessoa tornou desnecessário o follow-up planejado.',
+        });
       }
     }
     const next = state.nextAction;
-    const due = next && ['planned', 'ready'].includes(next.status)
-      && (!next.dueAt || Date.parse(next.dueAt) <= Date.parse(now));
+    const due =
+      next &&
+      ['planned', 'ready'].includes(next.status) &&
+      (!next.dueAt || Date.parse(next.dueAt) <= Date.parse(now));
     if (due && next) {
       const handle = state.identity.handles[0];
-      const result = await this.actions.runAgent({
-        entityId: ctx.entity.id,
-        workspaceId: ctx.entity.workspaceId,
-        appId: ctx.entity.appId,
-        facts: {
-          relationship: state,
-          ...(handle ? { connectionId: handle.connectionId, to: handle.handle, channelKind: handle.channelKind } : {}),
-        },
-        instruction: [
-          'Advance the durable relationship next action below. Check its preconditions and stop conditions first.',
-          'Use the known channel destination only if a useful action is still warranted. Never send a generic nudge.',
-          JSON.stringify(next),
-          `Relationship state: ${JSON.stringify(state)}`,
-        ].join('\n'),
-      });
-      const outcome = result?.outcome ?? 'performed';
+      let result: Awaited<ReturnType<SubjectActions['runAgent']>>;
+      try {
+        result = await this.actions.runAgent({
+          entityId: ctx.entity.id,
+          workspaceId: ctx.entity.workspaceId,
+          appId: ctx.entity.appId,
+          facts: {
+            relationship: state,
+            ...(handle
+              ? {
+                  connectionId: handle.connectionId,
+                  to: handle.handle,
+                  channelKind: handle.channelKind,
+                }
+              : {}),
+          },
+          instruction: [
+            'Reevaluate the durable relationship before taking any action. Check every precondition, stop condition, open commitment, new inbound event, and current source first.',
+            'Do not send a generic nudge. If no useful action is justified, return held with a concise reason. Return performed only after the required action has a verified provider or system receipt.',
+            JSON.stringify(next),
+            `Relationship state: ${JSON.stringify(state)}`,
+          ].join('\n'),
+        });
+      } catch {
+        // A thrown runtime may have failed before or after an external effect.
+        // Do not blindly replay a side effect whose provider result is unknown.
+        result = {
+          outcome: 'held',
+          reason:
+            'A execução terminou sem confirmação segura; revisão necessária antes de repetir.',
+        };
+      }
+      const outcome = result?.outcome ?? 'held';
+      const attempts = (next.attempts ?? 0) + 1;
+      // A cadence keeps the action alive for another round; the attempt ceiling
+      // is what stops it. Without the ceiling an agent with a 3-day cadence nudges
+      // the same silent lead every three days forever — the exact behaviour that
+      // makes an outreach account get reported and banned.
+      const retry =
+        outcome === 'performed' &&
+        next.cadenceMs != null &&
+        next.cadenceMs > 0 &&
+        attempts < (next.maxAttempts ?? 1);
+      const reason =
+        result?.reason?.trim().slice(0, 300) ??
+        (outcome === 'performed'
+          ? 'A ação terminou com confirmação do runtime.'
+          : outcome === 'blocked'
+            ? 'As condições atuais impediram a ação.'
+            : 'O runtime não confirmou que a ação foi realizada.');
       state.nextAction = {
         ...next,
-        status: outcome === 'blocked' ? 'blocked' : 'done',
-        attempts: (next.attempts ?? 0) + 1,
+        status: outcome === 'performed' ? (retry ? 'planned' : 'done') : 'blocked',
+        attempts,
         lastAttemptAt: now,
+        ...(retry ? { dueAt: new Date(Date.parse(now) + next.cadenceMs!).toISOString() } : {}),
       };
       if (outcome === 'performed') state.lastOutboundAt = now;
+      if (outcome !== 'performed') {
+        state.blockers = [...new Set([...state.blockers, reason])].slice(-20);
+      }
+      appendDecision(state, {
+        id: randomUUID(),
+        evaluatedAt: now,
+        trigger: 'scheduled_action',
+        outcome,
+        actionId: next.sourceRef ?? null,
+        relatedEventIds: ctx.inbox.map((event) => event.id).slice(-20),
+        receiptId: result?.receiptId ?? null,
+        reason,
+      });
+    } else if (inbound.length > 0 && !inboundActionCancelled) {
+      appendDecision(state, {
+        id: randomUUID(),
+        evaluatedAt: now,
+        trigger: 'inbound',
+        outcome: 'no_action',
+        relatedEventIds: inbound.map((event) => event.id).slice(-20),
+        reason:
+          'A nova mensagem foi incorporada; não havia follow-up vencido que justificasse contato proativo.',
+      });
     }
     state.updatedAt = now;
-    const wake = state.nextAction && ['planned', 'ready'].includes(state.nextAction.status)
-      ? state.nextAction.dueAt ?? null
-      : null;
+    const wake =
+      state.nextAction && ['planned', 'ready'].includes(state.nextAction.status)
+        ? (state.nextAction.dueAt ?? null)
+        : null;
     return {
       state: state as unknown as Record<string, unknown>,
       consumeInboxIds: ctx.inbox.map((event) => event.id),
@@ -175,6 +284,10 @@ export class SubjectRuntime {
       awaitingCorrelation: null,
     };
   }
+}
+
+function appendDecision(state: RelationshipState, decision: RelationshipDecision): void {
+  state.decisionHistory = [...(state.decisionHistory ?? []), decision].slice(-100);
 }
 
 /** The correlation token a subject on a channel awaits — matched by the inbound router. */
@@ -185,7 +298,12 @@ export function channelCorrelationId(connectionId: string, address: string): str
 /** Derive the channel correlation from a subject's facts (connectionId + to/chatId). */
 function deriveChannelCorrelation(facts: Record<string, unknown>): Correlation | undefined {
   const connectionId = typeof facts.connectionId === 'string' ? facts.connectionId : null;
-  const address = typeof facts.to === 'string' ? facts.to : (typeof facts.chatId === 'string' ? facts.chatId : null);
+  const address =
+    typeof facts.to === 'string'
+      ? facts.to
+      : typeof facts.chatId === 'string'
+        ? facts.chatId
+        : null;
   if (!connectionId || !address) return undefined;
   return { kind: 'channel', id: channelCorrelationId(connectionId, address) };
 }

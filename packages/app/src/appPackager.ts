@@ -40,6 +40,8 @@ import type { AgentisSqliteDb } from '@agentis/db/sqlite';
 import { AppStore } from './appStore.js';
 import { AppDatastore } from './appDatastore.js';
 import { AppSurfaceStore } from './appSurfaceStore.js';
+import { AppDefinitionStore } from './appDefinitionStore.js';
+import { chunkDocument, definitionFacets, hasAgenticDefinition } from './appPackagingUtils.js';
 import type { BrainReader, BrainWriter } from './brainPort.js';
 import { rewriteNodeRefs, rewriteScriptRefs, type RefIdMap } from './appRefs.js';
 import { computeAppClosure, CONVERSATION_SCRIPT_COLLECTION, CONVERSATION_SCRIPT_KEY, type AppClosure, type AppRevisionTarget } from './appClosure.js';
@@ -184,6 +186,7 @@ export class AppPackager {
   /** rows → canonical AppManifest IR. `opts.fidelity==='full'` carries brains + rows. */
   toManifest(workspaceId: string, appId: string, opts: AppExportOptions = {}): AppManifest {
     const app = this.apps.get(workspaceId, appId);
+    const definition = new AppDefinitionStore(this.db).get(workspaceId, appId);
     const full = opts.fidelity === 'full';
     const withData = full && (opts.includeCollectionData ?? true);
     const withAppBrain = full && (opts.includeAppBrain ?? true) && !!opts.brain;
@@ -248,7 +251,7 @@ export class AppPackager {
       }));
 
     return appManifestSchema.parse({
-      manifestVersion: 2,
+      manifestVersion: definition ? 3 : 2,
       // Rebinding keys for the App's own data_query/data_mutate self-references.
       exportAppId: appId,
       identity: appIdentitySchema.parse({
@@ -269,6 +272,7 @@ export class AppPackager {
       requirements,
       ...(withAppBrain ? { brain: { atoms: opts.brain!.exportScope(workspaceId, appId) } } : {}),
       source: app.source,
+      ...definitionFacets(definition ?? {}),
     });
   }
 
@@ -665,6 +669,10 @@ export class AppPackager {
       opts.brain!.importScope(workspaceId, app.id, parsed.brain.atoms, 'app');
     }
 
+    if (hasAgenticDefinition(parsed)) {
+      new AppDefinitionStore(db).upsert(workspaceId, app.id, definitionFacets(parsed));
+    }
+
     return { appId: app.id };
   }
 
@@ -819,7 +827,7 @@ export class AppPackager {
 
   serialize(manifest: AppManifest): AppManifestEnvelope {
     const parsed = appManifestSchema.parse(manifest);
-    const formatVersion = parsed.manifestVersion === 2 ? 2 : 1;
+    const formatVersion = parsed.manifestVersion === 3 ? 3 : parsed.manifestVersion === 2 ? 2 : 1;
     return { format: '.agentisapp', formatVersion, manifest: parsed, checksum: checksum(parsed), exportedAt: new Date().toISOString() };
   }
 
@@ -846,37 +854,6 @@ export class AppPackager {
   import(workspaceId: string, userId: string, envelope: RawAppEnvelope, opts: AppImportOptions = {}): { appId: string } {
     return this.fromManifest(workspaceId, userId, this.deserialize(envelope), opts);
   }
-}
-
-/**
- * Split a seed document into retrievable chunks on paragraph boundaries.
- *
- * Chunk BOUNDARIES are deliberately not shipped in the manifest — only the
- * document text — so the importing workspace re-chunks with its own settings.
- * Roughly mirrors the packager's 240-token budget (~4 chars/token).
- */
-function chunkDocument(content: string, maxChars = 960): string[] {
-  const text = content.trim();
-  if (text.length <= maxChars) return text ? [text] : [];
-  const chunks: string[] = [];
-  let current = '';
-  for (const paragraph of text.split(/\n{2,}/)) {
-    const block = paragraph.trim();
-    if (!block) continue;
-    if (current && current.length + block.length + 2 > maxChars) {
-      chunks.push(current);
-      current = '';
-    }
-    // A single oversized paragraph still has to be broken up.
-    if (block.length > maxChars) {
-      if (current) { chunks.push(current); current = ''; }
-      for (let i = 0; i < block.length; i += maxChars) chunks.push(block.slice(i, i + maxChars));
-      continue;
-    }
-    current = current ? `${current}\n\n${block}` : block;
-  }
-  if (current) chunks.push(current);
-  return chunks;
 }
 
 /** Rebind the workflow/agent ids inside one conversation-script datastore row. */

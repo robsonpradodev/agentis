@@ -63,6 +63,11 @@ const agentArtifactPolicySchema = z.object({
 const agentTaskConfigSchema = z.object({
   ...outputConfigFields,
   kind: z.literal('agent_task'),
+  taskMode: z.enum(['answer', 'act']).optional(),
+  completionContract: z.object({
+    requiredEffects: z.array(z.enum(['channel_delivery', 'data_mutation', 'schedule', 'subject_update'])).min(1),
+    timeoutMs: z.number().int().min(5_000).max(600_000).optional(),
+  }).optional(),
   agentId: z.string().uuid().optional(),
   agentRole: agentRoleSchema.optional(),
   agentPackageRef: z.string().optional(),

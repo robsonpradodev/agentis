@@ -26,10 +26,11 @@ checks remain neutral until their optional read-only test runs. Only an observed
 degrades or errors the connection.
 
 For WhatsApp QR sessions, the id returned by `sendMessage()` is initially only a client
-correlation id. Agentis records that attempt as `queued` and does not report `sent:true`
-or advance workflow state until a WhatsApp server acknowledgement arrives. Later server,
-delivery, and read receipts promote the durable journal to `accepted`, `delivered`, and
-`read`. Requested, provider-resolved, and provider-echoed recipients remain separate in
+correlation id. The effect transaction moves through `prepared`, `provider_submitted`,
+`acknowledged`, `failed_pre_submit`, `uncertain`, or `rejected`; it does not report verified
+delivery or advance workflow state until the required WhatsApp acknowledgement arrives. Later
+server, delivery, and read receipts refine the provider evidence. Requested,
+provider-resolved, and provider-echoed recipients remain separate in
 the receipt so canonical number resolution is visible without being mistaken for proof.
 Rich attachments and per-channel access control are supported; peer identity is resolved
 across channels. Inbound messages are durably queued (`channel_turn_queue`) and dispatched to
@@ -60,8 +61,9 @@ the responsible agent/subject.
   context with its durable delivery key. It starts as `sending` before the provider boundary and
   is reconciled to `sent`/`delivered` or `failed` from the same journal. Therefore the recipient's
   next message continues the exchange rather than starting with an empty transcript.
-- Agent-owned connections are an isolation boundary. A workflow resolves through its direct
-  `ownerAgentId` (or its owning App's agent), and an agent can use another agent's connection only
+- Agent-owned connections are an authority boundary. The owning Agent receives its configured
+  scope implicitly, including work delegated under a verified owner's exact command. A workflow
+  resolves through its direct `ownerAgentId` (or its owning App's agent), and an agent can use another agent's connection only
   through an active explicit grant. Workspace-owned connections remain shared until governed;
   an unauthorized workspace default is never silently selected over the caller's eligible channel.
   A workflow without an agent/App owner may use only workspace-owned connections until it is
@@ -81,7 +83,10 @@ the responsible agent/subject.
   pending durable turn jobs, and fences every automated provider send with a monotonic
   `automationEpoch`. Agentis-originated provider echoes never claim ownership.
   Any stale handoff on an owner/operator conversation is released on its next inbound message;
-  customer conversations remain human-owned until explicit **Hand back**.
+  customer conversations remain human-owned until explicit **Hand back**. A verified owner may
+  still order one exact send into a human-owned customer conversation. That command is compiled as
+  a durable, idempotent channel effect, may cross the handoff for that effect only, and leaves the
+  conversation human-owned afterward. Unsolicited automation remains blocked.
 - Operator messages are business-side conversation context and compile as model role `assistant`;
   customer messages compile as `user`. Platform-chat actor semantics are unchanged. This prevents
   a manual promise such as “I will send the proposal” from being interpreted as a new customer
@@ -109,13 +114,14 @@ delegates and external peers retain normal last-human-responder takeover semanti
 The legacy workspace/channel/handle index must not coexist with the connection-scoped principal
 index; migration v136 removes it from databases that briefly recreated it after v135.
 
-Principal authority does not promote the resident agent's organizational role. A worker or
-specialist channel receives only its own Brain, relationship, current-channel/media, and App data
-tools. It cannot list or reconfigure agents, inspect other connections, or write another agent's
-Brain. Orchestrators and managers remain the explicit control-plane roles. On a verified-owner
-turn, a worker may persist a durable correction only into its own Brain; omitting the target is
-safely narrowed to that agent. Raw SQL/provider/runtime errors stay in operator telemetry and are
-replaced by a generic retry message at the external channel boundary.
+Principal authority does not promote the resident agent's organizational role, but role-specific
+tool lists also do not delete native capabilities that a mission needs. Every resident Agent uses
+the shared effective-capability resolver over the complete Agentis workspace API; relevance keeps
+the prompt small, while authorization, connection ownership, action-scoped owner commands, and
+resource policy decide what can execute. This gives a worker enough power to finish an authorized
+mission without granting another Agent's Brain, host secrets, or unrestricted cross-Agent channel
+access. Raw SQL/provider/runtime errors stay in operator telemetry and are replaced by a natural,
+actionable response at the external channel boundary.
 
 WhatsApp provider addresses are aliases, not people. `channel_peer_aliases` folds phone-number
 JIDs (`@s.whatsapp.net`), LIDs (`@lid`), formatted phone numbers, and later provider mappings into
@@ -135,11 +141,40 @@ Cross-recipient work is an action, not an improvised send. `channel_action_inten
 recipient, operating agent, requester, goal/relationship reference, exact message, authorization
 basis, approval, idempotency key, schedule, attempts, provider receipt, and terminal state before
 delivery. `agentis.channel.action.{create,list,cancel}` and `/v1/channels/actions` expose that ledger.
-Verified-owner commands can execute immediately; autonomous outreach must point to durable goal or
-relationship state and pass the App autonomy/outbound envelope. Quiet hours and rolling rate limits
+Verified-owner commands can execute immediately, including one exact receipt-tracked effect during
+a customer-conversation handoff; they do not release that handoff. Autonomous outreach must point
+to durable goal or relationship state and pass the App autonomy/outbound envelope. Quiet hours and rolling rate limits
 are re-evaluated at delivery time, approval resolves the exact held action, provider uncertainty is
 never blindly resent, and a new inbound reply cancels obsolete planned work for that peer. A
 customer-originated turn can never use a `recipientRef` to contact another person.
+
+An action can link to an Agent Mission and carry post-ack App mutations. Missing recipients are
+persisted with the original query and required slots before Agentis asks for more information. A
+phone number supplied later resolves the unique held action and resumes the same authorization and
+mission. After provider acknowledgement, Agentis records the delivery receipt, applies each
+idempotent compare-and-swap mutation, records mutation receipts, and only then settles the mission.
+Pending or uncertain acknowledgement preserves the prior business state and schedules
+reconciliation; retry reuses the intent instead of resending.
+
+The shared execution controller resolves a continuation semantically against incomplete work in
+the conversation. Once it selects the existing Mission, deterministic effect recovery preserves the
+recipient, body, authority, requirement ids, and idempotency keys; it does not create a duplicate
+intent or ask for the same authority again. A previous human-handoff rejection can be crossed only
+by that persisted `verified_owner_command` effect; the handoff remains active for unsolicited
+automation.
+
+Channel actions preserve typed message bursts end to end. Each item has its own stable item id,
+requirement id, idempotency key, provider state, and receipt, and can contain text plus images,
+video, audio, voice notes, stickers, files, locations, contacts, or polls. The model chooses
+workspace media through `agentis.assets.list/search/read` or generates media when appropriate,
+then explicitly commits the selected artifact to a delivery step. Agentis does not manufacture a
+media reply from keywords or silently substitute an asset. Bare function envelopes such as
+`{"name":"image.generate","arguments":{...}}` are executable protocol, never user-facing text;
+legacy aliases are normalized to native Agentis tools before policy and execution.
+
+Ordered bursts are receipt-gated per item. For a sticker followed by a PDF, acknowledgement of the
+sticker unlocks the PDF step. If the second item fails before provider submission, only the PDF is
+retried. An uncertain submission is reconciled instead of resent.
 
 Provider messages are not model turns. Rapid bubbles are assembled in
 `channel_utterance_batches` with a quiet deadline and an eight-second hard deadline; the batch

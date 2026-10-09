@@ -7,8 +7,12 @@ is local-first, model-neutral, self-hosted, and portable, and the supervision la
 ## Local-first data
 
 - All runtime state lives under `AGENTIS_DATA_DIR` (default `./.agentis`, git-ignored): the
-  SQLite database (`agentis.db`, WAL mode), `secrets.json` (`chmod 0600`), per-agent home
+  SQLite database (`data.db`, WAL mode), `secrets.json` (`chmod 0600`), per-agent home
   directories, and backups (`apps/api/src/defaultDataDir.ts`).
+- Keep the data directory outside OneDrive, Dropbox, network-synchronized folders, and the
+  source checkout. SQLite WAL traffic, model artifacts, migration tests, and compiler reads can
+  become several times slower under filesystem synchronization. `/healthz` reports degraded
+  local-model state separately from API readiness.
 - The **asset store** (`AGENTIS_ASSETS_DIR`, `services/assetStore.ts`) is content-addressed:
   every generated blob is stored once by SHA-256 and registered as an artifact. Point it at an
   external drive/NAS; it never needs to live on the system disk or in the repo.
@@ -77,6 +81,8 @@ Supervised autonomy: you own it *and* can supervise it.
   agent/month ceilings; pre-spend assertion; limit-hit events raise approvals.
 - **Approvals** (`services/approvalInbox.ts`, `approval_requests`, `/v1/approvals`) — human
   gates for budget overruns, outbound safety, and workflow decisions; in-thread resolution.
+  Approvals that hold mission work must be visible, mission-linked, and automatically resumable;
+  an invisible grant request is not a valid dependency.
 - **Audit trail** (`services/auditTrail.ts`, `audit_entries`) — every action attributed with
   node-level token accounting; inspectable at `/v1/runs/:id/audit`.
 - **Observability & analytics** (`services/observability.ts`, `observability_events`;
