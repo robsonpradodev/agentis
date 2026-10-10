@@ -7,8 +7,12 @@ import type { AgentisSqliteDb } from '@agentis/db/sqlite';
 import type { V1HarnessAdapterType } from '../harness/harnessProbe.js';
 import { inferModelTierFromId, routingMetadataForModelId, type ModelTier } from '../modelRoutingPolicy.js';
 import { ANTIGRAVITY_MODELS, normalizeAntigravityModel } from '../../adapters/antigravityModels.js';
+import { openRouterModels } from './openRouter.js';
 
 export interface RuntimeModelOption {
+  contextLength?: number;
+  free?: boolean;
+  pricing?: { prompt: string; completion: string };
   id: string;
   label: string;
   provider: string;
@@ -41,6 +45,13 @@ export async function listRuntimeModels(
   agentId: string | null = null,
   db: AgentisSqliteDb | null = null,
 ): Promise<RuntimeModelCatalog> {
+  if (adapterType === 'openrouter') {
+    const models = (await openRouterModels()).filter((model) => model.supportsTools).map((model): RuntimeModelOption => ({
+      ...model, provider: 'OpenRouter', source: 'runtime', verified: true,
+      description: `${model.free ? 'Free' : `$${(Number(model.pricing.prompt) * 1_000_000).toFixed(2)} input / $${(Number(model.pricing.completion) * 1_000_000).toFixed(2)} output per 1M tokens`} · ${model.contextLength.toLocaleString()} context · Tools`,
+    }));
+    return { adapterType, defaultModel: null, defaultLabel: 'Choose a model', supportsManual: false, models };
+  }
   const agent = agentId && db
     ? db.select().from(schema.agents).where(eq(schema.agents.id, agentId)).get()
     : null;
@@ -137,6 +148,7 @@ function configuredModelOption(id: string): RuntimeModelOption {
 }
 
 export function defaultModelFor(adapterType: V1HarnessAdapterType): string | null {
+  if (adapterType === 'openrouter') return null;
   // gpt-5.5 is the broadly-supported Codex default — notably the codex-with-a-
   // ChatGPT-account path rejects the `*-codex` model ids (e.g. gpt-5.3-codex)
   // with "model is not supported". Defaulting here keeps a fresh Codex agent
@@ -202,6 +214,7 @@ function runtimeDefaultModelOption(
 }
 
 function providerLabelFor(adapterType: V1HarnessAdapterType): string {
+  if (adapterType === 'openrouter') return 'OpenRouter';
   if (adapterType === 'codex') return 'OpenAI';
   if (adapterType === 'claude_code') return 'Anthropic';
   if (adapterType === 'cursor') return 'Cursor';

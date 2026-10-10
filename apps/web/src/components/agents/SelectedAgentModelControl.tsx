@@ -15,7 +15,7 @@ import { runtimeModelValue, withRuntimeModel } from './runtimeModelField';
 import { HARNESS } from './harnessMeta';
 
 // The runtimes a local Agentis workspace can drive. Order = most common first.
-const RUNTIME_OPTIONS: AdapterType[] = ['claude_code', 'codex', 'cursor', 'antigravity', 'hermes_agent', 'openclaw', 'http'];
+const RUNTIME_OPTIONS: AdapterType[] = ['claude_code', 'codex', 'cursor', 'antigravity', 'hermes_agent', 'openclaw', 'openrouter', 'http'];
 
 interface AgentRecord {
   id: string;
@@ -134,6 +134,10 @@ export function SelectedAgentModelControl({
 
   async function updateRuntime(nextAdapter: AdapterType) {
     if (!agent || nextAdapter === effectiveAdapterType) return;
+    if (nextAdapter === 'openrouter') {
+      toast.error('Configuration required', 'Choose an API key and model in this agent\'s Runtime settings, then save. The active runtime is unchanged.');
+      return;
+    }
     const previous = agent;
     // Switch harness with that runtime's default config + model. Advanced
     // per-runtime settings (binary paths, cwd…) live in the Runtime tab.

@@ -678,6 +678,7 @@ function harnessLabel(adapterType: string) {
     case 'codex': return 'Codex';
     case 'cursor': return 'Cursor';
     case 'antigravity': return 'Antigravity CLI';
+    case 'openrouter': return 'OpenRouter';
     case 'http': return 'HTTP / Webhook';
     default: return 'Harness';
   }

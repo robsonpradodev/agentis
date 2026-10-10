@@ -1,7 +1,7 @@
 import { basename, dirname, join, resolve } from 'node:path';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 
-type AdapterType = 'openclaw' | 'hermes_agent' | 'claude_code' | 'codex' | 'cursor' | 'http';
+type AdapterType = 'openclaw' | 'hermes_agent' | 'claude_code' | 'codex' | 'cursor' | 'openrouter' | 'http';
 type ConfigSource = 'claude_code' | 'codex';
 type AgentRole = 'orchestrator' | 'manager' | 'worker';
 type ChannelKind = 'telegram' | 'discord';
@@ -276,7 +276,7 @@ function parseRole(value: string): AgentRole {
 
 function parseAdapter(value?: string): AdapterType {
   if (!value) throw new Error('Missing required flag --adapter');
-  if (value === 'openclaw' || value === 'hermes_agent' || value === 'claude_code' || value === 'codex' || value === 'cursor' || value === 'http') {
+  if (value === 'openrouter' || value === 'openclaw' || value === 'hermes_agent' || value === 'claude_code' || value === 'codex' || value === 'cursor' || value === 'http') {
     return value;
   }
   throw new Error(`Unsupported adapter: ${value}`);
@@ -315,6 +315,9 @@ function budgetToCents(value?: string): number | null {
 function buildRuntimeConfig(adapterType: AdapterType, flags: Flags): Record<string, unknown> {
   const cwd = flagString(flags, 'cwd') ?? invocationCwd();
   const binaryPath = flagString(flags, 'binary-path');
+  if (adapterType === 'openrouter') {
+    return { authCredentialId: requireFlag(flags, 'auth-credential-id'), model: requireFlag(flags, 'model'), timeoutMs: 75_000 };
+  }
   if (adapterType === 'openclaw') {
     return {
       openclawGatewayUrl: flagString(flags, 'openclaw-gateway-url') ?? undefined,

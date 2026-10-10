@@ -793,6 +793,7 @@ function firstString(...values: unknown[]): string | null {
 }
 
 function runtimeDisplayName(adapterType: AdapterType): string {
+  if (adapterType === 'openrouter') return 'OpenRouter';
   if (adapterType === 'hermes_agent') return 'Hermes Agent';
   if (adapterType === 'claude_code') return 'Claude Code';
   if (adapterType === 'codex') return 'Codex';

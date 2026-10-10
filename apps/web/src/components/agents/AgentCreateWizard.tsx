@@ -518,6 +518,7 @@ export function AgentCreateWizard({
   }
 
   const canCreate = name.trim().length >= 2
+    && (adapterType !== 'openrouter' || Boolean(runtimeConfig.openrouterAuthCredentialId && runtimeConfig.openrouterModel))
     && !(role === 'orchestrator' && Boolean(orchestrator));
 
   return (

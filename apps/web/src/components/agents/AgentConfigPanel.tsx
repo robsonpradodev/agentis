@@ -48,7 +48,9 @@ export function AgentConfigPanel({
   onSaved: () => void;
 }) {
   const toast = useToast();
-  const adapterType: AdapterType = isSupportedAdapterType(agent.adapterType) ? agent.adapterType : 'http';
+  const savedAdapterType: AdapterType = isSupportedAdapterType(agent.adapterType) ? agent.adapterType : 'http';
+  const [draftAdapterType, setDraftAdapterType] = useState<AdapterType | null>(null);
+  const adapterType = draftAdapterType ?? savedAdapterType;
   const storedConfig = (agent.config ?? {}) as Record<string, unknown>;
 
   // Runtime section state
@@ -72,12 +74,13 @@ export function AgentConfigPanel({
   const [savingOperations, setSavingOperations] = useState(false);
 
   useEffect(() => {
-    setRuntimeConfig(configToRuntimeConfig(adapterType, storedConfig));
+    setDraftAdapterType(null);
+    setRuntimeConfig(configToRuntimeConfig(savedAdapterType, storedConfig));
     setTestResult(null);
     setRuntimeRepair(runtimeRepairState(agent.status, adapterType));
     autoConnectStartedRef.current = '';
     handledInstallPhaseRef.current = '';
-  }, [agent.id, agent.status, adapterType]);
+  }, [agent.id, agent.status, savedAdapterType]);
 
   useEffect(() => {
     if (agent.status !== 'setting_up') return;
@@ -108,6 +111,10 @@ export function AgentConfigPanel({
 
   async function persistRuntime(nextRuntimeConfig: RuntimeConfig, status?: 'online' | 'setting_up' | 'error') {
     const config = runtimeConfigToAdapterConfig(adapterType, nextRuntimeConfig);
+    if (adapterType !== savedAdapterType) {
+      await switchAgentRuntime(agent.id, { adapterType, config, runtimeModel: runtimeModelFor(adapterType, nextRuntimeConfig) });
+      return;
+    }
     await api(`/v1/agents/${agent.id}`, {
       method: 'PATCH',
       body: JSON.stringify({
@@ -236,14 +243,16 @@ export function AgentConfigPanel({
     setTestingRuntime(true);
     setTestResult(null);
     try {
-      const result = await api<HarnessTestResult>(`/v1/agents/${agent.id}/test-harness`, { method: 'POST' });
+      const result = adapterType === 'openrouter'
+        ? await api<HarnessTestResult>('/v1/harness/test', { method: 'POST', body: JSON.stringify({ adapterType, config: runtimeConfigToAdapterConfig(adapterType, runtimeConfig) }) })
+        : await api<HarnessTestResult>(`/v1/agents/${agent.id}/test-harness`, { method: 'POST' });
       setTestResult(result);
       if (result.status === 'pass') toast.success('Connection verified');
       else if (result.status === 'warn') toast.success('Connected with caveats');
-      else if (await connectRuntime('manual')) return;
+      else if (adapterType !== 'openrouter' && await connectRuntime('manual')) return;
       else toast.error('Connection failed', result.checks.find((check) => check.level === 'error')?.message ?? 'Harness check failed.');
     } catch (err) {
-      if (await connectRuntime('manual')) return;
+      if (adapterType !== 'openrouter' && await connectRuntime('manual')) return;
       toast.error('Test failed', apiErrorMessage(err));
     } finally {
       setTestingRuntime(false);
@@ -283,32 +292,35 @@ export function AgentConfigPanel({
           <div className="flex items-center gap-2">
             <button
               onClick={() => void testRuntime()}
-              disabled={testingRuntime}
+              disabled={testingRuntime || (adapterType === 'openrouter' && !hasConnectableRuntimeConfig(adapterType, runtimeConfig))}
               className="rounded-md border border-line px-3 py-1.5 text-xs font-medium text-text-secondary hover:bg-surface-2 hover:text-text-primary disabled:opacity-50"
             >
               {testingRuntime ? 'Testing...' : 'Test connection'}
             </button>
             <button
               onClick={() => void saveRuntime()}
-              disabled={savingRuntime}
+              disabled={savingRuntime || (adapterType === 'openrouter' && !hasConnectableRuntimeConfig(adapterType, runtimeConfig))}
               className="rounded-md bg-accent px-3 py-1.5 text-xs font-medium text-canvas disabled:opacity-50"
             >
               {savingRuntime ? 'Saving...' : 'Save runtime'}
             </button>
           </div>
         </div>
-        <RuntimeConnectPanel
+        {adapterType !== 'openrouter' && <RuntimeConnectPanel
           adapterType={adapterType}
           state={runtimeRepair}
           session={installSession}
           onConnect={() => void connectRuntime('manual')}
           onInstall={isAutoInstallableAdapter(adapterType) ? () => void startRuntimeInstall() : undefined}
-        />
+        />}
         <RuntimePicker
           agentId={agent.id}
           adapterType={adapterType}
           runtimeConfig={runtimeConfig}
-          onAdapterChange={(next) => { void rebindRuntime(next); }}
+          onAdapterChange={(next) => {
+            if (next === 'openrouter') { setDraftAdapterType(next); setTestResult(null); return; }
+            setDraftAdapterType(null); void rebindRuntime(next);
+          }}
           onConfigChange={setRuntimeConfig}
           editing
         />
@@ -491,6 +503,7 @@ function isAutoInstallableAdapter(adapterType: AdapterType): adapterType is 'cla
 }
 
 function runtimeDisplayName(adapterType: AdapterType): string {
+  if (adapterType === 'openrouter') return 'OpenRouter';
   if (adapterType === 'codex') return 'Codex';
   if (adapterType === 'claude_code') return 'Claude Code';
   if (adapterType === 'cursor') return 'Cursor';
@@ -532,6 +545,7 @@ function setRuntimeBinaryPath(config: RuntimeConfig, adapterType: AdapterType, b
 }
 
 function setRuntimeModel(config: RuntimeConfig, adapterType: AdapterType, model: string): RuntimeConfig {
+  if (adapterType === 'openrouter') return { ...config, openrouterModel: config.openrouterModel || model };
   if (adapterType === 'openclaw') return { ...config, openclawModel: config.openclawModel || model };
   if (adapterType === 'claude_code') return { ...config, claudeModel: config.claudeModel || model };
   if (adapterType === 'codex') return { ...config, codexModel: config.codexModel || model };
@@ -555,6 +569,7 @@ function detectionCommand(detection: HarnessDetectionResult): string {
 }
 
 function missingRuntimeMessage(adapterType: AdapterType, detection?: HarnessDetectionResult): string {
+  if (adapterType === 'openrouter') return 'Save an OpenRouter API key and select a model, then test the connection.';
   if (adapterType === 'openclaw') return detection?.detail ?? 'No OpenClaw gateway was discovered. Connect a gateway URL or configure OPENCLAW_GATEWAY_URL, then run detection again.';
   if (adapterType === 'http') return detection?.detail ?? 'No HTTP endpoint was discovered. Add the HTTP base URL in connection settings, then save and test the runtime.';
   const runtimeName = runtimeDisplayName(adapterType);
@@ -562,6 +577,7 @@ function missingRuntimeMessage(adapterType: AdapterType, detection?: HarnessDete
 }
 
 function hasConnectableRuntimeConfig(adapterType: AdapterType, config: RuntimeConfig): boolean {
+  if (adapterType === 'openrouter') return Boolean(config.openrouterAuthCredentialId && config.openrouterModel);
   if (adapterType === 'openclaw') return Boolean(config.openclawGatewayUrl.trim());
   if (adapterType === 'http') return Boolean(config.httpBaseUrl.trim());
   if (adapterType === 'claude_code') return Boolean(config.claudeBinaryPath.trim());

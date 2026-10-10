@@ -57,7 +57,7 @@ const extensionDefSchema = z.object({
 
 const agentDefSchema = z.object({
   name: z.string().min(1),
-  adapterType: z.enum(['openclaw', 'hermes_agent', 'claude_code', 'codex', 'cursor', 'antigravity', 'http']),
+  adapterType: z.enum(['openclaw', 'hermes_agent', 'claude_code', 'codex', 'cursor', 'antigravity', 'openrouter', 'http']),
   capabilityTags: z.array(z.string()).default([]),
   defaultConfig: z.record(z.unknown()).default({}),
 });

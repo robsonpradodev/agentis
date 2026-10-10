@@ -13,7 +13,7 @@ import { requireAuth } from '../middleware/auth.js';
 import { getWorkspace, requireWorkspace } from '../middleware/workspace.js';
 import { commissionAgent, type CommissionAgentInput } from '../services/agent/agentCommission.js';
 
-const adapterTypeSchema = z.enum(['openclaw', 'hermes_agent', 'claude_code', 'codex', 'cursor', 'antigravity', 'http']);
+const adapterTypeSchema = z.enum(['openclaw', 'hermes_agent', 'claude_code', 'codex', 'cursor', 'antigravity', 'openrouter', 'http']);
 const roleSchema = z.enum(['orchestrator', 'manager', 'worker']);
 
 const bootstrapAgentSchema = z.object({

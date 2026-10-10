@@ -95,6 +95,8 @@ export interface ChatExecutionEnvelope {
 }
 
 export interface ChatMessage {
+  /** Opaque provider continuation data; never operator-facing reasoning. */
+  providerMetadata?: Record<string, unknown>;
   role: ChatRole;
   content: string | ChatContentBlock[];
   /** Present when role === 'tool'. Must match the tool_call id from the preceding assistant turn. */
@@ -322,6 +324,7 @@ export type ChatDelta =
   // instead of treating a truncated turn as a clean, empty stop.
   | {
       type: 'done';
+      providerMetadata?: Record<string, unknown>;
       finishReason: ChatFinishReason;
       /** Provider-reported model usage; estimates are explicitly marked. */
       usage?: {

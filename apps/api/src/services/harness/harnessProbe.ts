@@ -8,7 +8,7 @@ import { resolveCommandPath, resolveSpawnTarget, withExpandedPath } from '../pat
 
 const execFileAsync = promisify(execFile);
 
-export type V1HarnessAdapterType = Extract<AdapterType, 'openclaw' | 'hermes_agent' | 'claude_code' | 'codex' | 'cursor' | 'antigravity' | 'http'>;
+export type V1HarnessAdapterType = Extract<AdapterType, 'openclaw' | 'hermes_agent' | 'claude_code' | 'codex' | 'cursor' | 'antigravity' | 'openrouter' | 'http'>;
 
 export interface HarnessDetectionResult {
   adapterType: V1HarnessAdapterType;
@@ -200,6 +200,10 @@ export async function testHarnessConfig(
   options: HarnessTestOptions = {},
 ): Promise<HarnessTestResult> {
   const checks: HarnessCheck[] = [];
+  if (adapterType === 'openrouter') {
+    const configured = typeof config.authCredentialId === 'string' && typeof config.model === 'string' && Boolean(config.model.trim());
+    return { status: configured ? 'pass' : 'fail', checks: [{ code: 'config', level: configured ? 'info' : 'error', message: configured ? 'OpenRouter configuration present. Use Test connection to verify the key and model.' : 'Save an OpenRouter credential and select a model.' }] };
+  }
   const env = runtimeProbeEnv(options.env ?? process.env);
 
   if (adapterType === 'claude_code') {

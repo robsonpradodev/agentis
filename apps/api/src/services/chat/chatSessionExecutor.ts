@@ -1167,7 +1167,7 @@ export class ChatSessionExecutor {
     // watchdog (HermesAdapter.chat) still bounds each streaming call.
     const forwarding = adapter.capabilities?.().toolForwarding;
     const isCliHarness = forwarding === 'marker_protocol' || forwarding === 'mcp_native';
-    const modelRoundTimeoutMs = isCliHarness ? harnessRoundTimeoutMs(Boolean(options.lightweightConversation)) : INTERACTIVE_MODEL_ROUND_TIMEOUT_MS;
+    const modelRoundTimeoutMs = adapter.adapterType === 'openrouter' ? 75_000 : isCliHarness ? harnessRoundTimeoutMs(Boolean(options.lightweightConversation)) : INTERACTIVE_MODEL_ROUND_TIMEOUT_MS;
     const adapterMcpNative = forwarding === 'mcp_native';
     // Per-conversation permission mode (default ask). `auto` runs mutating tools
     // freely; `ask` confirms them; `plan` blocks them upstream (executionMode).
@@ -1205,6 +1205,7 @@ export class ChatSessionExecutor {
       }
       const toolCalls: ChatToolCall[] = [];
       let assistantText = '';
+      let providerMetadata: Record<string, unknown> | undefined;
       let reasoningSeg = '';
       let surfacedReasoning = false;
       const progressiveCommentaryId = `assistant-progress-${ctx.clientTurnId ?? ctx.conversationId}-${turn + 1}`;
@@ -1280,6 +1281,7 @@ export class ChatSessionExecutor {
           if (delta.type === 'done') {
             finishReason = delta.finishReason;
             roundUsage = delta.usage;
+            providerMetadata = delta.providerMetadata;
             continue;
           }
           // Runtime prose is ambiguous until the round finishes. Buffer text so
@@ -1457,7 +1459,7 @@ export class ChatSessionExecutor {
           yield delta;
         }
       }
-      messages.push({ role: 'assistant', content: assistantText, toolCalls });
+      messages.push({ role: 'assistant', content: assistantText, toolCalls, ...(providerMetadata ? { providerMetadata } : {}) });
 
       // Cap batch to remaining budget before kicking off parallel execution.
       const remaining = options.maxToolCalls - toolCallCount;

@@ -588,12 +588,12 @@ export function wireRoutes(deps: WireRoutesDeps) {
     cliVersion: env.AGENTIS_CLI_VERSION,
   });
   app.route('/v1/system', buildSystemRoutes({ db: sqlite, auth, currentVersion: env.AGENTIS_CLI_VERSION, autostartTarget }));
-  app.route('/v1/harness', buildHarnessRoutes({ db: sqlite, auth }));
+  app.route('/v1/harness', buildHarnessRoutes({ db: sqlite, auth, vault: credentialVault }));
   const ownershipSync = new AgentOwnershipSyncService(sqlite, harnessMemoryIngestion, skillService, logger);
   const harnessImportDeps = { db: sqlite, auth, vault: credentialVault, adapters, logger, bus, mcpHarness, ingestion: harnessMemoryIngestion, skills: skillService, skillMaterializer, ownershipSync };
   app.route('/v1/harness', buildHarnessImportRoutes(harnessImportDeps));
   const harnessImportSync = new HarnessImportSyncService(harnessImportDeps, bus, logger, undefined, ownershipSync);
-  app.route('/v1/adapters', buildHarnessRoutes({ db: sqlite, auth }));
+  app.route('/v1/adapters', buildHarnessRoutes({ db: sqlite, auth, vault: credentialVault }));
   app.route('/v1/agents', buildTerminalRoutes({ db: sqlite, auth, conversations }));
   app.route('/v1/gateways', buildGatewayRoutes({ db: sqlite, auth, vault: credentialVault }));
   app.route('/v1/gateways', buildGatewayMutationRoutes({ db: sqlite, auth, vault: credentialVault }));

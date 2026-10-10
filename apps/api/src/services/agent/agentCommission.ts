@@ -11,6 +11,9 @@ import type { Logger } from '../../logger.js';
 import type { EventBus } from '../../event-bus.js';
 import { OpenClawAdapter } from '../../adapters/OpenClawAdapter.js';
 import { HttpAdapter } from '../../adapters/HttpAdapter.js';
+import { OpenRouterAdapter } from '../../adapters/OpenRouterAdapter.js';
+import { openRouterCredential, OPENROUTER_TIMEOUT_MS, validateOpenRouterConfig } from '../runtime/openRouter.js';
+import { runProviderTask } from '../runtime/providerTaskRunner.js';
 import { ClaudeCodeAdapter } from '../../adapters/ClaudeCodeAdapter.js';
 import { CodexAdapter } from '../../adapters/CodexAdapter.js';
 import { CursorAdapter } from '../../adapters/CursorAdapter.js';
@@ -97,6 +100,7 @@ export async function commissionAgent(deps: AgentCommissionDeps, input: Commissi
     ?? '#6366f1';
   const repaired = await repairCliHarnessConfig(input.adapterType, input.config ?? {});
   const config = repaired.config;
+  if (input.adapterType === 'openrouter') await validateOpenRouterConfig(deps.db, deps.vault, input.workspaceId, config);
   const isPaused = input.isPaused ?? false;
   const insertedStatus = isPaused ? 'paused' : 'offline';
 
@@ -246,6 +250,18 @@ export async function registerAdapter(
       payloadTemplate: recordObjectOf(config.payloadTemplate),
       defaultSessionId: stringOf(config.defaultSessionId) ?? undefined,
       logger: deps.logger,
+    });
+    await adapter.connect();
+    deps.adapters.register(agentId, adapter);
+    return;
+  }
+  if (adapterType === 'openrouter') {
+    const model = stringOf(config.model);
+    if (!model) throw new AgentisError('VALIDATION_FAILED', 'Select an OpenRouter model.');
+    const apiKey = openRouterCredential(deps.db, deps.vault, workspaceId, config.authCredentialId);
+    const adapter = new OpenRouterAdapter({ agentId, apiKey, model,
+      timeoutMs: numberOf(config.timeoutMs) ?? OPENROUTER_TIMEOUT_MS,
+      runTask: (runtime, task, signal, progress) => runProviderTask(deps.db, workspaceId, agentId, runtime, task, signal, progress),
     });
     await adapter.connect();
     deps.adapters.register(agentId, adapter);
@@ -468,6 +484,7 @@ export async function switchRuntime(
   const priorConfig = (existing.config ?? {}) as Record<string, unknown>;
   const sameAdapter = existing.adapterType === input.adapterType;
   const mergedConfig = preserveInstructionProtection(priorConfig, sameAdapter ? { ...priorConfig, ...(input.config ?? {}) } : { ...(input.config ?? {}) });
+  if (input.adapterType === 'openrouter') await validateOpenRouterConfig(deps.db, deps.vault, workspaceId, mergedConfig);
   const repaired = await repairCliHarnessConfig(input.adapterType, mergedConfig);
   const rawModel = input.runtimeModel ?? runtimeModelFromConfig(input.adapterType, repaired.config) ?? null;
   const runtimeModel = input.adapterType === 'antigravity' ? normalizeAntigravityModel(rawModel) : rawModel;

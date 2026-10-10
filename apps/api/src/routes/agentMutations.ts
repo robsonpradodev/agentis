@@ -26,12 +26,13 @@ import { requireAuth } from '../middleware/auth.js';
 import { requireWorkspace, getWorkspace } from '../middleware/workspace.js';
 import { defaultInstructionsForRole, isDefaultRoleInstructions } from '../data/playbook-library.js';
 import { testHarnessConfig, type V1HarnessAdapterType } from '../services/harness/harnessProbe.js';
+import { openRouterCredential, testOpenRouter, validateOpenRouterConfig } from '../services/runtime/openRouter.js';
 import { repairCliHarnessConfig } from '../services/harness/harnessConfigRepair.js';
 import type { McpHarnessSessionService } from '../services/mcp/mcpHarnessSession.js';
 import { ORCHESTRATOR_DEFAULT_COLOR, registerAdapter, runtimeModelFromConfig, switchRuntime } from '../services/agent/agentCommission.js';
 import { normalizeAntigravityModel } from '../adapters/antigravityModels.js';
 
-const adapterTypeSchema = z.enum(['openclaw', 'hermes_agent', 'claude_code', 'codex', 'cursor', 'antigravity', 'http']);
+const adapterTypeSchema = z.enum(['openclaw', 'hermes_agent', 'claude_code', 'codex', 'cursor', 'antigravity', 'openrouter', 'http']);
 const agentStatusSchema = z.enum(['online', 'busy', 'offline', 'error', 'paused', 'setting_up']);
 
 const createSchema = z.object({
@@ -302,6 +303,7 @@ export function buildAgentMutationRoutes(deps: AgentRouteDeps) {
     });
     assertProtectedInstructions(existing, nextInstructions ?? null);
     const rawNextConfig = preserveInstructionProtection(existing.config, body.config ?? (existing.config as Record<string, unknown>));
+    if (body.config && existing.adapterType === 'openrouter') await validateOpenRouterConfig(deps.db, deps.vault, ws.workspaceId, rawNextConfig);
     const repairedConfig = await repairCliHarnessConfig(existing.adapterType as V1HarnessAdapterType, rawNextConfig);
     const nextConfig = existing.adapterType === 'antigravity'
       ? { ...repairedConfig.config, ...(normalizeAntigravityModel(String(repairedConfig.config.model ?? body.runtimeModel ?? '')) ? { model: normalizeAntigravityModel(String(repairedConfig.config.model ?? body.runtimeModel ?? '')) } : {}) }
@@ -467,7 +469,9 @@ export function buildAgentMutationRoutes(deps: AgentRouteDeps) {
     if (repaired.changed) {
       deps.db.update(schema.agents).set({ config: repaired.config, updatedAt: new Date().toISOString() }).where(eq(schema.agents.id, id)).run();
     }
-    const result = await testHarnessConfig(parsed.data, repaired.config, { deep: true });
+    const result = parsed.data === 'openrouter'
+      ? await testOpenRouter(openRouterCredential(deps.db, deps.vault, ws.workspaceId, repaired.config.authCredentialId), String(repaired.config.model ?? ''))
+      : await testHarnessConfig(parsed.data, repaired.config, { deep: true });
     return c.json(result);
   });
 

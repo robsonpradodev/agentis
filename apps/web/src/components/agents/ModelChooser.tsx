@@ -5,6 +5,7 @@ import { api } from '../../lib/api';
 import type { AdapterType } from './RuntimePicker';
 
 export interface RuntimeModelOption {
+  free?: boolean;
   id: string;
   label: string;
   provider: string;
@@ -68,7 +69,7 @@ export function ModelChooser({
             adapterType,
             defaultModel: null,
             defaultLabel: 'Runtime default',
-            supportsManual: true,
+            supportsManual: adapterType !== 'openrouter',
             models: [],
           });
         }
@@ -176,7 +177,7 @@ export function ModelChooser({
         <div className="space-y-1.5 rounded-lg border border-line bg-surface-2 p-3">
           <div className="text-xs font-medium uppercase tracking-wider text-text-muted">Model</div>
           {button}
-          <div className="text-[11px] text-text-muted">Choose the LLM for this agent, or keep the runtime default.</div>
+          <div className="text-[11px] text-text-muted">{adapterType === 'openrouter' ? 'Choose a tool-capable model explicitly. No model is selected automatically.' : 'Choose the LLM for this agent, or keep the runtime default.'}</div>
         </div>
       ) : button}
 
@@ -200,13 +201,13 @@ export function ModelChooser({
             />
           </div>
           <div className="max-h-[340px] overflow-y-auto p-1.5">
-            <ModelRow
+            {adapterType !== 'openrouter' && <ModelRow
               selected={!value}
               label="Default"
               detail={defaultModel || catalog?.defaultLabel || 'Runtime default'}
               badge="Auto"
               onClick={() => choose('')}
-            />
+            />}
             {groups.map(([provider, options]) => (
               <div key={provider} className="mt-1">
                 <div className="px-2 py-1 text-[10px] font-semibold uppercase tracking-wider text-text-muted">{provider}</div>
@@ -216,7 +217,7 @@ export function ModelChooser({
                     selected={value === model.id}
                     label={model.label}
                     detail={model.description ?? model.id}
-                    badge={model.recommended ? 'Recommended' : tierLabel(model.tier)}
+                    badge={model.free ? 'Free' : model.recommended ? 'Recommended' : tierLabel(model.tier)}
                     onClick={() => choose(model.id)}
                   />
                 ))}

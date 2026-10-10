@@ -27,14 +27,17 @@ import {
   listHarnessInstallOptions,
 } from '../services/harness/harnessInstall.js';
 import { listRuntimeModels } from '../services/runtime/runtimeModels.js';
+import type { CredentialVault } from '../services/credentialVault.js';
+import { openRouterCredential, testOpenRouter } from '../services/runtime/openRouter.js';
 
 export interface HarnessRoutesDeps {
   db: AgentisSqliteDb;
   auth: AuthService;
+  vault?: CredentialVault;
 }
 
 const HARNESS_ADAPTER_TYPES = new Set<string>([
-  'openclaw', 'hermes_agent', 'claude_code', 'codex', 'cursor', 'antigravity', 'http',
+  'openclaw', 'hermes_agent', 'claude_code', 'codex', 'cursor', 'antigravity', 'openrouter', 'http',
 ]);
 
 // In-memory rate limiter — 2 install attempts per workspace per minute.
@@ -104,6 +107,12 @@ export function buildHarnessRoutes(deps: HarnessRoutesDeps) {
       throw new AgentisError('VALIDATION_FAILED', `'${adapterType ?? 'unknown'}' is not a runtime that can be tested.`);
     }
     const config = body.config && typeof body.config === 'object' ? body.config : {};
+    if (adapterType === 'openrouter') {
+      if (!deps.vault) throw new AgentisError('ADAPTER_UNAVAILABLE', 'Credential vault is unavailable.');
+      const ws = getWorkspace(c);
+      const key = openRouterCredential(deps.db, deps.vault, ws.workspaceId, config.authCredentialId);
+      return c.json(await testOpenRouter(key, typeof config.model === 'string' ? config.model : ''));
+    }
     const result = await testHarnessConfig(adapterType as V1HarnessAdapterType, config, { deep: true });
     return c.json(result);
   });

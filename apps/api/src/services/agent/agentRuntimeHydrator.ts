@@ -11,7 +11,7 @@ import type { SkillMaterializer } from '../skillMaterializer.js';
 import { cliCommandFromConfig, isCliHarnessAdapter, repairCliHarnessConfig } from '../harness/harnessConfigRepair.js';
 import { detectHarnesses, type HarnessDetectionResult, type V1HarnessAdapterType } from '../harness/harnessProbe.js';
 
-const ADAPTER_TYPES = new Set<V1HarnessAdapterType>(['openclaw', 'hermes_agent', 'claude_code', 'codex', 'cursor', 'antigravity', 'http']);
+const ADAPTER_TYPES = new Set<V1HarnessAdapterType>(['openclaw', 'hermes_agent', 'claude_code', 'codex', 'cursor', 'antigravity', 'openrouter', 'http']);
 
 export interface AgentRuntimeHydratorDeps {
   db: AgentisSqliteDb;

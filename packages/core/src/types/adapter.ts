@@ -8,7 +8,7 @@
 
 import type { ChatDelta, ChatMessage, ToolDefinition } from './chat.js';
 
-export type AdapterType = 'openclaw' | 'claude_code' | 'http' | 'codex' | 'cursor' | 'hermes_agent' | 'antigravity' | 'local_llm';
+export type AdapterType = 'openclaw' | 'claude_code' | 'http' | 'codex' | 'cursor' | 'hermes_agent' | 'antigravity' | 'openrouter' | 'local_llm';
 
 /** How much of the provider-native harness environment Agentis preserves. */
 export type RuntimeProfileMode = 'native' | 'hermetic' | 'containerized';
@@ -417,7 +417,15 @@ export type AgentAdapterConfig =
   | CursorAdapterConfig
   | HermesAgentAdapterConfig
   | AntigravityAdapterConfig
-  | HttpAdapterConfig;
+  | HttpAdapterConfig
+  | OpenRouterAdapterConfig;
+
+export interface OpenRouterAdapterConfig {
+  adapterType: 'openrouter';
+  authCredentialId: string;
+  model: string;
+  timeoutMs?: number;
+}
 
 export interface OpenClawAdapterConfig {
   adapterType: 'openclaw';

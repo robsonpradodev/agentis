@@ -7,7 +7,9 @@ export type RuntimeModelField =
   | 'codexModel'
   | 'cursorModel'
   | 'antigravityModel'
-  | 'httpModel';
+  | 'httpModel'
+  | 'openrouterModel';
+// OpenRouter shares the model chooser, but has its own explicit binding.
 
 const RUNTIME_MODEL_FIELDS: Record<AdapterType, RuntimeModelField> = {
   openclaw: 'openclawModel',
@@ -17,6 +19,7 @@ const RUNTIME_MODEL_FIELDS: Record<AdapterType, RuntimeModelField> = {
   cursor: 'cursorModel',
   antigravity: 'antigravityModel',
   http: 'httpModel',
+  openrouter: 'openrouterModel',
 };
 
 export function runtimeModelFieldFor(adapterType: AdapterType): RuntimeModelField {

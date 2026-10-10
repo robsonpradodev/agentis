@@ -10,7 +10,7 @@ import { renderRuntimeRoutingIntelligence, routeModelForTask } from '../modelRou
 import { switchRuntime } from '../agent/agentCommission.js';
 import { detectHarnesses, invalidateHarnessProbeCache, type HarnessDetectionResult, type V1HarnessAdapterType } from '../harness/harnessProbe.js';
 
-const V1_ADAPTERS = new Set<AdapterType>(['openclaw', 'hermes_agent', 'claude_code', 'codex', 'cursor', 'antigravity', 'http']);
+const V1_ADAPTERS = new Set<AdapterType>(['openclaw', 'hermes_agent', 'claude_code', 'codex', 'cursor', 'antigravity', 'openrouter', 'http']);
 
 function inlineAgentDispatchTimeoutMs(): number {
   const configured = Number(process.env.AGENTIS_INLINE_AGENT_DISPATCH_TIMEOUT_MS);
@@ -127,7 +127,7 @@ export function registerAgentTools(registry: AgentisToolRegistry, deps: ToolHand
           type: 'object',
           properties: {
             agentId: { type: 'string' },
-            adapterType: { type: 'string', enum: ['openclaw', 'hermes_agent', 'claude_code', 'codex', 'cursor', 'antigravity', 'http'] },
+            adapterType: { type: 'string', enum: ['openclaw', 'hermes_agent', 'claude_code', 'codex', 'cursor', 'antigravity', 'openrouter', 'http'] },
             runtimeModel: { type: 'string' },
             config: { type: 'object' },
             requiredCapabilities: { type: 'array', items: { type: 'string' } },
@@ -941,7 +941,7 @@ function selectHealthyRuntime(
   const exact = requested ? healthy.find((item) => item.adapterType === requested && supports(item)) : null;
   if (exact) return exact;
   if (requested && !allowFallback) return null;
-  const preference: V1HarnessAdapterType[] = ['codex', 'claude_code', 'hermes_agent', 'antigravity', 'cursor', 'openclaw', 'http'];
+  const preference: V1HarnessAdapterType[] = ['codex', 'claude_code', 'hermes_agent', 'antigravity', 'cursor', 'openclaw', 'openrouter', 'http'];
   return healthy.filter(supports).sort((a, b) => preference.indexOf(a.adapterType) - preference.indexOf(b.adapterType))[0] ?? null;
 }
 

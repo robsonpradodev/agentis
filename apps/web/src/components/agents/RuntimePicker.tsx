@@ -5,9 +5,10 @@ import { AlertTriangle, Check, ExternalLink, Loader2, RefreshCw } from 'lucide-r
 import { api } from '../../lib/api';
 import { AntigravityIcon, ClaudeIcon, CodexIcon, CursorIcon, HermesIcon, HttpIcon, OpenClawIcon } from '../icons';
 import { ModelChooser } from './ModelChooser';
+import { OpenRouterConnectionFields } from './OpenRouterConnectionFields';
 import { runtimeModelValue, withRuntimeModel } from './runtimeModelField';
 
-export type AdapterType = 'openclaw' | 'hermes_agent' | 'claude_code' | 'codex' | 'cursor' | 'antigravity' | 'http';
+export type AdapterType = 'openclaw' | 'hermes_agent' | 'claude_code' | 'codex' | 'cursor' | 'antigravity' | 'openrouter' | 'http';
 
 export interface AdapterModelOption {
   id: string;
@@ -17,6 +18,9 @@ export interface AdapterModelOption {
 }
 
 export interface RuntimeConfig {
+  openrouterAuthCredentialId: string;
+  openrouterModel: string;
+  openrouterTimeoutMs: string;
   runtimeMode: string;
   runtimePermissionProfile: string;
   runtimeProfileName: string;
@@ -88,6 +92,9 @@ export interface RuntimeConfig {
 }
 
 export const DEFAULT_RUNTIME_CONFIG: RuntimeConfig = {
+  openrouterAuthCredentialId: '',
+  openrouterModel: '',
+  openrouterTimeoutMs: '75000',
   runtimeMode: 'native',
   runtimePermissionProfile: 'trusted_local',
   runtimeProfileName: '',
@@ -187,6 +194,7 @@ const ADAPTERS: Array<{
   { id: 'cursor', title: 'Cursor', icon: CursorIcon },
   { id: 'antigravity', title: 'Antigravity', icon: AntigravityIcon, recommended: true },
   { id: 'http', title: 'HTTP', icon: HttpIcon },
+  { id: 'openrouter', title: 'OpenRouter', icon: HttpIcon },
 ];
 
 export function RuntimePicker({
@@ -254,7 +262,7 @@ export function RuntimePicker({
   const activeDetection = detectionByType.get(adapterType);
 
   useEffect(() => {
-    if (editing || userPickedRef.current) return;
+    if (editing || userPickedRef.current || adapterType === 'openrouter') return;
     if (foundDetections.length !== 1) return;
     const detection = foundDetections[0]!;
     if (adapterType !== detection.adapterType) onAdapterChange(detection.adapterType);
@@ -287,7 +295,7 @@ export function RuntimePicker({
               <activeAdapter.icon className="h-4 w-4" />
             </span>
             <div className="min-w-0 flex-1">
-              <div className="text-sm font-medium text-text-primary">Running on {activeAdapter.title}</div>
+              <div className="text-sm font-medium text-text-primary">Selected runtime: {activeAdapter.title}</div>
               <div className="text-xs text-text-muted">Switch runtime below — keeps this agent's identity, memory and abilities. Only the execution backend changes.</div>
             </div>
           </div>
@@ -322,7 +330,7 @@ export function RuntimePicker({
           />
 
           {/* Missing Harness Warning Banner */}
-          {!editing && activeDetection?.status !== 'found' && (
+          {!editing && adapterType !== 'openrouter' && activeDetection?.status !== 'found' && (
             <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 px-3 py-2.5 text-xs text-text-secondary flex items-start gap-2">
               <span className="mt-0.5 shrink-0 text-amber-500">??</span>
               <span>
@@ -376,15 +384,16 @@ export function RuntimePicker({
           />
 
           {/* Connection settings accordion last */}
-          <ConnectionDetailsAccordion
+          {adapterType !== 'openrouter' && <ConnectionDetailsAccordion
             adapterType={adapterType}
             config={runtimeConfig}
             setConfig={setConfig}
             defaultOpen={activeDetection?.status !== 'found' && adapterType !== 'claude_code' && adapterType !== 'codex' && adapterType !== 'antigravity'}
-          />
+          />}
         </div>
       )}
-      {editing && (
+      {adapterType === 'openrouter' && <OpenRouterConnectionFields credentialId={runtimeConfig.openrouterAuthCredentialId} model={runtimeConfig.openrouterModel} onCredentialChange={(id) => setConfig('openrouterAuthCredentialId', id)} />}
+      {editing && adapterType !== 'openrouter' && (
         <div className="rounded-lg border border-line bg-surface-2">
           <button
             type="button"
@@ -529,9 +538,9 @@ function HarnessGrid({
         const selected = adapterType === adapter.id;
         const detection = detectionByType.get(adapter.id);
         const isOnline = detection?.status === 'found';
-        const isChecking = detecting && !detection;
+        const isChecking = adapter.id !== 'openrouter' && detecting && !detection;
 
-        const statusText = isOnline
+        const statusText = adapter.id === 'openrouter' ? 'Connect with an API key and choose a model.' : isOnline
           ? `${adapter.title} harness is detected and ready to use.`
           : `${adapter.title} harness is not detected on this machine.`;
 
@@ -555,7 +564,7 @@ function HarnessGrid({
               {!isChecking && (
                 <span
                   role="status"
-                  aria-label={isOnline ? 'Online' : 'Offline'}
+                  aria-label={adapter.id === 'openrouter' ? 'Remote API' : isOnline ? 'Online' : 'Offline'}
                   title={statusText}
                   className={clsx(
                     'absolute -right-1 -top-1 h-2.5 w-2.5 rounded-full border border-canvas',
@@ -783,6 +792,7 @@ function hermesTransportHint(value: string): string {
 }
 
 export function configToRuntimeConfig(adapterType: AdapterType, stored: Record<string, unknown>): RuntimeConfig {
+  if (adapterType === 'openrouter') return { ...DEFAULT_RUNTIME_CONFIG, openrouterAuthCredentialId: stringOf(stored.authCredentialId), openrouterModel: stringOf(stored.model), openrouterTimeoutMs: stringOf(stored.timeoutMs, '75000') };
   const profile = objectOf(stored.runtimeProfile);
   const base = {
     ...DEFAULT_RUNTIME_CONFIG,
@@ -803,6 +813,7 @@ export function configToRuntimeConfig(adapterType: AdapterType, stored: Record<s
 }
 
 export function runtimeConfigToAdapterConfig(adapterType: AdapterType, config: RuntimeConfig): Record<string, unknown> {
+  if (adapterType === 'openrouter') return compact({ authCredentialId: config.openrouterAuthCredentialId, model: config.openrouterModel, timeoutMs: positiveNumber(config.openrouterTimeoutMs) });
   if (adapterType === 'openclaw') return compact({ gatewayId: config.openclawGatewayId, gatewayUrl: normalizeGatewayUrl(config.openclawGatewayUrl), model: config.openclawModel, agentName: config.openclawAgentName, deviceTokenCredentialId: config.openclawDeviceTokenCredentialId, sessionKeyStrategy: config.openclawSessionKeyStrategy, sessionKey: config.openclawSessionKey, timeoutSec: positiveNumber(config.openclawTimeoutSec), payloadTemplate: jsonObject(config.openclawPayloadTemplate) });
   if (adapterType === 'hermes_agent') return compact({ binaryPath: config.hermesBinaryPath, command: config.hermesBinaryPath, cwd: config.hermesCwd, model: config.hermesModel, chatTransport: config.hermesChatTransport, chatTransportVersion: 2, maxTurns: positiveNumber(config.hermesMaxTurns), extraArgs: splitArgs(config.hermesExtraArgs), env: jsonStringRecord(config.hermesEnv), timeoutSec: positiveNumber(config.hermesTimeoutSec), graceSec: positiveNumber(config.hermesGraceSec) });
   if (adapterType === 'claude_code') return compact({ binaryPath: config.claudeBinaryPath, command: config.claudeBinaryPath, cwd: config.claudeCwd, model: config.claudeModel, maxTurns: positiveNumber(config.claudeMaxTurns), allowedTools: splitCsv(config.claudeAllowedTools), runtimeProfile: runtimeProfileConfig(config, config.claudeCwd, false), dangerouslySkipPermissions: boolValue(config.claudeSkipPermissions), extraArgs: splitArgs(config.claudeExtraArgs), env: jsonStringRecord(config.claudeEnv), timeoutSec: positiveNumber(config.claudeTimeoutSec) });
@@ -813,6 +824,7 @@ export function runtimeConfigToAdapterConfig(adapterType: AdapterType, config: R
 }
 
 export function runtimeModelFor(adapterType: AdapterType, config: RuntimeConfig): string | null {
+  if (adapterType === 'openrouter') return config.openrouterModel || null;
   if (adapterType === 'openclaw') return config.openclawModel || null;
   if (adapterType === 'http') return config.httpModel || null;
   if (adapterType === 'hermes_agent') return config.hermesModel || null;
@@ -824,6 +836,7 @@ export function runtimeModelFor(adapterType: AdapterType, config: RuntimeConfig)
 }
 
 export function runtimeLabelFor(adapterType: AdapterType, config: RuntimeConfig): string {
+  if (adapterType === 'openrouter') return config.openrouterModel || 'OpenRouter';
   if (adapterType === 'openclaw') return config.openclawModel || config.openclawAgentName || 'OpenClaw';
   if (adapterType === 'hermes_agent') return config.hermesModel || 'Hermes Agent';
   if (adapterType === 'claude_code') return config.claudeModel || 'Claude Code';

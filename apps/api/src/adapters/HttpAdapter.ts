@@ -323,7 +323,7 @@ export class HttpAdapter implements AgentAdapter {
   }
 }
 
-function toOpenAiTool(tool: ToolDefinition, wireName: string): Record<string, unknown> {
+export function toOpenAiTool(tool: ToolDefinition, wireName: string): Record<string, unknown> {
   return {
     type: 'function',
     function: {
@@ -334,7 +334,7 @@ function toOpenAiTool(tool: ToolDefinition, wireName: string): Record<string, un
   };
 }
 
-function toOpenAiMessage(message: ChatMessage, originalToWire: Map<string, string>): Record<string, unknown> {
+export function toOpenAiMessage(message: ChatMessage, originalToWire: Map<string, string>): Record<string, unknown> {
   if (message.role === 'assistant' && message.toolCalls?.length) {
     return {
       role: 'assistant',
@@ -359,7 +359,7 @@ function toOpenAiMessage(message: ChatMessage, originalToWire: Map<string, strin
   return { role: message.role, content: message.content };
 }
 
-function buildOpenAiToolNameMaps(tools: ToolDefinition[]): {
+export function buildOpenAiToolNameMaps(tools: ToolDefinition[]): {
   originalToWire: Map<string, string>;
   wireToOriginal: Map<string, string>;
 } {
